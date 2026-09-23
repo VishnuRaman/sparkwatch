@@ -35,6 +35,49 @@ impl Tab {
     }
 }
 
+/// A table cursor that survives the rows being re-sorted underneath it.
+///
+/// `TableState` only knows an index; every poll re-sorts the rows, so we also
+/// remember the *key* of the selected row and re-find it after each update.
+pub struct Cursor<K> {
+    pub state: TableState,
+    key: Option<K>,
+}
+
+impl<K: PartialEq + Clone> Cursor<K> {
+    fn new() -> Self {
+        Self {
+            state: TableState::default().with_selected(Some(0)),
+            key: None,
+        }
+    }
+
+    fn selected(&self) -> usize {
+        self.state.selected().unwrap_or(0)
+    }
+
+    /// Point at `index` and remember which row that is.
+    fn select<T>(&mut self, index: usize, rows: &[T], key_of: impl Fn(&T) -> K) {
+        self.state.select(Some(index));
+        self.key = rows.get(index).map(key_of);
+    }
+
+    /// Rows changed: follow the remembered key, else clamp the index.
+    fn resync<T>(&mut self, rows: &[T], key_of: impl Fn(&T) -> K) {
+        if rows.is_empty() {
+            self.state.select(None);
+            self.key = None;
+            return;
+        }
+        let by_key = self
+            .key
+            .as_ref()
+            .and_then(|k| rows.iter().position(|r| key_of(r) == *k));
+        let index = by_key.unwrap_or_else(|| self.selected().min(rows.len() - 1));
+        self.select(index, rows, key_of);
+    }
+}
+
 pub struct App {
     pub tab: Tab,
     pub snapshot: Option<Snapshot>,
@@ -43,9 +86,9 @@ pub struct App {
     pub interval: Duration,
     pub paused: bool,
     pub should_quit: bool,
-    pub jobs_state: TableState,
-    pub stages_state: TableState,
-    pub executors_state: TableState,
+    pub jobs: Cursor<i64>,
+    pub stages: Cursor<(i64, i64)>,
+    pub executors: Cursor<String>,
     pub endpoint: String,
 }
 
@@ -59,9 +102,9 @@ impl App {
             interval,
             paused: false,
             should_quit: false,
-            jobs_state: TableState::default().with_selected(Some(0)),
-            stages_state: TableState::default().with_selected(Some(0)),
-            executors_state: TableState::default().with_selected(Some(0)),
+            jobs: Cursor::new(),
+            stages: Cursor::new(),
+            executors: Cursor::new(),
             endpoint,
         }
     }
@@ -69,10 +112,12 @@ impl App {
     pub fn apply(&mut self, result: Result<Snapshot, String>) {
         match result {
             Ok(s) => {
+                self.jobs.resync(&s.jobs, |j| j.job_id);
+                self.stages.resync(&s.stages, |st| st.key());
+                self.executors.resync(&s.executors, |e| e.id.clone());
                 self.snapshot = Some(s);
                 self.last_error = None;
                 self.last_update = Some(Instant::now());
-                self.clamp_selection();
             }
             // Keep showing the last good snapshot; surface the error in the header.
             Err(e) => self.last_error = Some(e),
@@ -90,24 +135,22 @@ impl App {
         }
     }
 
-    fn current_state(&mut self) -> Option<&mut TableState> {
+    fn current_index(&self) -> usize {
         match self.tab {
-            Tab::Jobs => Some(&mut self.jobs_state),
-            Tab::Stages => Some(&mut self.stages_state),
-            Tab::Executors => Some(&mut self.executors_state),
-            Tab::Overview => None,
+            Tab::Jobs => self.jobs.selected(),
+            Tab::Stages => self.stages.selected(),
+            Tab::Executors => self.executors.selected(),
+            Tab::Overview => 0,
         }
     }
 
-    fn clamp_selection(&mut self) {
-        let len = self.current_len();
-        if let Some(state) = self.current_state() {
-            let sel = state.selected().unwrap_or(0);
-            state.select(if len == 0 {
-                None
-            } else {
-                Some(sel.min(len - 1))
-            });
+    fn select_index(&mut self, index: usize) {
+        let Some(s) = &self.snapshot else { return };
+        match self.tab {
+            Tab::Jobs => self.jobs.select(index, &s.jobs, |j| j.job_id),
+            Tab::Stages => self.stages.select(index, &s.stages, |st| st.key()),
+            Tab::Executors => self.executors.select(index, &s.executors, |e| e.id.clone()),
+            Tab::Overview => {}
         }
     }
 
@@ -116,11 +159,8 @@ impl App {
         if len == 0 {
             return;
         }
-        if let Some(state) = self.current_state() {
-            let cur = state.selected().unwrap_or(0) as isize;
-            let next = (cur + delta).rem_euclid(len as isize) as usize;
-            state.select(Some(next));
-        }
+        let cur = self.current_index() as isize;
+        self.select_index((cur + delta).rem_euclid(len as isize) as usize);
     }
 
     pub fn select_edge(&mut self, last: bool) {
@@ -128,9 +168,7 @@ impl App {
         if len == 0 {
             return;
         }
-        if let Some(state) = self.current_state() {
-            state.select(Some(if last { len - 1 } else { 0 }));
-        }
+        self.select_index(if last { len - 1 } else { 0 });
     }
 
     pub fn bump_interval(&mut self, up: bool) {
@@ -141,5 +179,32 @@ impl App {
             secs.saturating_sub(1).max(1)
         };
         self.interval = Duration::from_secs(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_follows_row_after_resort() {
+        let mut c: Cursor<i64> = Cursor::new();
+        let rows = vec![10, 20, 30];
+        c.select(1, &rows, |r| *r); // on 20
+        let resorted = vec![30, 20, 10];
+        c.resync(&resorted, |r| *r);
+        assert_eq!(c.state.selected(), Some(1));
+        assert_eq!(c.key, Some(20));
+    }
+
+    #[test]
+    fn cursor_clamps_when_row_disappears() {
+        let mut c: Cursor<i64> = Cursor::new();
+        c.select(2, &[1, 2, 3], |r| *r);
+        c.resync(&[1, 2], |r| *r);
+        assert_eq!(c.state.selected(), Some(1));
+        assert_eq!(c.key, Some(2));
+        c.resync(&[], |r: &i64| *r);
+        assert_eq!(c.state.selected(), None);
     }
 }

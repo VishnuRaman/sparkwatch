@@ -5,6 +5,7 @@
 //! whole deserialization.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -82,6 +83,13 @@ pub struct StageData {
     pub shuffle_write_bytes: i64,
     pub memory_bytes_spilled: i64,
     pub disk_bytes_spilled: i64,
+    pub jvm_gc_time: i64,
+    pub peak_execution_memory: i64,
+    pub description: Option<String>,
+    pub scheduling_pool: String,
+    pub failure_reason: Option<String>,
+    /// Only populated by the single-stage endpoint, keyed by executor id.
+    pub executor_summary: HashMap<String, ExecutorStageSummary>,
 }
 
 impl StageData {
@@ -143,6 +151,184 @@ impl ExecutorSummary {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutorStageSummary {
+    pub task_time: i64,
+    pub failed_tasks: i64,
+    pub succeeded_tasks: i64,
+    pub killed_tasks: i64,
+    pub input_bytes: i64,
+    pub output_bytes: i64,
+    pub shuffle_read: i64,
+    pub shuffle_write: i64,
+    pub memory_bytes_spilled: i64,
+    pub disk_bytes_spilled: i64,
+    // Renamed in Spark 3.1; accept both spellings.
+    pub is_blacklisted_for_stage: bool,
+    pub is_excluded_for_stage: bool,
+}
+
+impl ExecutorStageSummary {
+    pub fn tasks(&self) -> i64 {
+        self.succeeded_tasks + self.failed_tasks + self.killed_tasks
+    }
+
+    pub fn excluded(&self) -> bool {
+        self.is_excluded_for_stage || self.is_blacklisted_for_stage
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TaskData {
+    pub task_id: i64,
+    pub index: i64,
+    pub attempt: i64,
+    pub launch_time: String,
+    pub duration: Option<i64>,
+    pub executor_id: String,
+    pub host: String,
+    /// RUNNING | SUCCESS | FAILED | KILLED | PENDING
+    pub status: String,
+    pub task_locality: String,
+    pub speculative: bool,
+    pub error_message: Option<String>,
+    pub task_metrics: Option<TaskMetrics>,
+    pub scheduler_delay: i64,
+    pub getting_result_time: i64,
+}
+
+impl TaskData {
+    pub fn duration_ms(&self) -> i64 {
+        self.duration.unwrap_or(0)
+    }
+
+    pub fn metrics(&self) -> TaskMetrics {
+        self.task_metrics.clone().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TaskMetrics {
+    pub executor_deserialize_time: i64,
+    pub executor_run_time: i64,
+    pub executor_cpu_time: i64,
+    pub result_size: i64,
+    pub jvm_gc_time: i64,
+    pub result_serialization_time: i64,
+    pub memory_bytes_spilled: i64,
+    pub disk_bytes_spilled: i64,
+    pub peak_execution_memory: i64,
+    pub input_metrics: InputMetrics,
+    pub output_metrics: OutputMetrics,
+    pub shuffle_read_metrics: ShuffleReadMetrics,
+    pub shuffle_write_metrics: ShuffleWriteMetrics,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InputMetrics {
+    pub bytes_read: i64,
+    pub records_read: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OutputMetrics {
+    pub bytes_written: i64,
+    pub records_written: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShuffleReadMetrics {
+    pub remote_blocks_fetched: i64,
+    pub local_blocks_fetched: i64,
+    pub fetch_wait_time: i64,
+    pub remote_bytes_read: i64,
+    pub remote_bytes_read_to_disk: i64,
+    pub local_bytes_read: i64,
+    pub records_read: i64,
+}
+
+impl ShuffleReadMetrics {
+    pub fn bytes(&self) -> i64 {
+        self.remote_bytes_read + self.local_bytes_read
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShuffleWriteMetrics {
+    pub bytes_written: i64,
+    pub write_time: i64,
+    pub records_written: i64,
+}
+
+/// Per-metric quantiles from `taskSummary`. Every vector is parallel to
+/// `quantiles`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TaskMetricDistributions {
+    pub quantiles: Vec<f64>,
+    pub duration: Vec<f64>,
+    pub executor_run_time: Vec<f64>,
+    pub executor_cpu_time: Vec<f64>,
+    pub jvm_gc_time: Vec<f64>,
+    pub scheduler_delay: Vec<f64>,
+    pub peak_execution_memory: Vec<f64>,
+    pub memory_bytes_spilled: Vec<f64>,
+    pub disk_bytes_spilled: Vec<f64>,
+    pub input_metrics: InputMetricDistributions,
+    pub output_metrics: OutputMetricDistributions,
+    pub shuffle_read_metrics: ShuffleReadMetricDistributions,
+    pub shuffle_write_metrics: ShuffleWriteMetricDistributions,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InputMetricDistributions {
+    pub bytes_read: Vec<f64>,
+    pub records_read: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OutputMetricDistributions {
+    pub bytes_written: Vec<f64>,
+    pub records_written: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShuffleReadMetricDistributions {
+    pub read_bytes: Vec<f64>,
+    pub read_records: Vec<f64>,
+    pub fetch_wait_time: Vec<f64>,
+    pub remote_bytes_read: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShuffleWriteMetricDistributions {
+    pub write_bytes: Vec<f64>,
+    pub write_records: Vec<f64>,
+    pub write_time: Vec<f64>,
+}
+
+/// Everything the stage drill-down shows, fetched together.
+#[derive(Debug, Clone, Default)]
+pub struct StageDetail {
+    pub stage: StageData,
+    /// `None` until at least one task has completed (Spark 404s before that).
+    pub summary: Option<TaskMetricDistributions>,
+    /// Longest-running tasks first.
+    pub slowest: Vec<TaskData>,
+    pub failed: Vec<TaskData>,
+}
+
 /// One consistent poll of everything the UI displays.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -186,6 +372,55 @@ mod tests {
         let e: Vec<ExecutorSummary> = serde_json::from_str(EXECS_JSON).unwrap();
         assert_eq!(e[0].total_gc_time, 240_000);
         assert!((e[0].memory_ratio() - 0.375).abs() < 1e-6);
+    }
+
+    const TASKS_JSON: &str = r#"[{
+        "taskId":4021,"index":17,"attempt":0,"launchTime":"2026-09-23T10:05:12.000GMT",
+        "duration":91000,"executorId":"1","host":"10.0.1.9","status":"SUCCESS",
+        "taskLocality":"PROCESS_LOCAL","speculative":false,"accumulatorUpdates":[],
+        "taskMetrics":{"executorRunTime":90200,"jvmGcTime":12000,"memoryBytesSpilled":536870912,
+            "shuffleReadMetrics":{"remoteBytesRead":1073741824,"localBytesRead":1048576,"fetchWaitTime":300}}
+    },{
+        "taskId":4022,"index":18,"attempt":1,"executorId":"2","host":"10.0.1.10","status":"FAILED",
+        "errorMessage":"ExecutorLostFailure (executor 2 exited caused by one of the running tasks)\nReason: Container killed by YARN for exceeding memory limits."
+    }]"#;
+
+    const SUMMARY_JSON: &str = r#"{
+        "quantiles":[0.05,0.25,0.5,0.75,0.95,1.0],
+        "duration":[1000.0,2500.0,8000.0,9500.0,30000.0,91000.0],
+        "jvmGcTime":[0.0,10.0,50.0,100.0,900.0,12000.0],
+        "shuffleReadMetrics":{"readBytes":[1048576.0,2097152.0,4194304.0,8388608.0,33554432.0,1074790400.0],
+            "readRecords":[1.0,2.0,3.0,4.0,5.0,6.0],"fetchWaitTime":[0,0,0,0,0,300]},
+        "shuffleWriteMetrics":{"writeBytes":[0,0,0,0,0,0]}
+    }"#;
+
+    #[test]
+    fn parses_task_list_including_failed_task() {
+        let t: Vec<TaskData> = serde_json::from_str(TASKS_JSON).unwrap();
+        assert_eq!(t[0].duration_ms(), 91_000);
+        assert_eq!(t[0].metrics().shuffle_read_metrics.bytes(), 1073741824 + 1048576);
+        assert_eq!(t[1].duration_ms(), 0);
+        assert!(t[1].error_message.as_deref().unwrap().starts_with("ExecutorLostFailure"));
+    }
+
+    #[test]
+    fn parses_task_summary_quantiles() {
+        let d: TaskMetricDistributions = serde_json::from_str(SUMMARY_JSON).unwrap();
+        assert_eq!(d.quantiles.len(), 6);
+        assert_eq!(d.duration[2], 8000.0);
+        assert_eq!(d.shuffle_read_metrics.read_bytes[5], 1074790400.0);
+        assert!(d.memory_bytes_spilled.is_empty()); // absent -> empty, not an error
+    }
+
+    #[test]
+    fn parses_stage_executor_summary() {
+        let s: StageData = serde_json::from_str(r#"{"stageId":9,"attemptId":0,
+            "failureReason":"Job aborted due to stage failure",
+            "executorSummary":{"1":{"taskTime":1820000,"failedTasks":2,"succeededTasks":98,"isExcludedForStage":true}}}"#).unwrap();
+        assert_eq!(s.failure_reason.as_deref(), Some("Job aborted due to stage failure"));
+        let e = &s.executor_summary["1"];
+        assert_eq!(e.tasks(), 100);
+        assert!(e.excluded());
     }
 
     #[test]

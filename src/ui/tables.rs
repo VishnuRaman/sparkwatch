@@ -3,7 +3,7 @@
 use super::{
     fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style, table_block, warn_if,
 };
-use crate::spark::Snapshot;
+use crate::spark::{Snapshot, StageData};
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Style},
@@ -52,13 +52,17 @@ pub fn draw_jobs(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableState
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_stages(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableState) {
-    let rows: Vec<Row> = s
-        .stages
+pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: String, state: &mut TableState) {
+    let rows: Vec<Row> = stages
         .iter()
         .map(|st| {
             Row::new(vec![
-                Cell::from(format!("{}.{}", st.stage_id, st.attempt_id)),
+                Cell::from(format!(
+                    "{}.{}{}",
+                    st.stage_id,
+                    st.attempt_id,
+                    if st.failure_reason.is_some() { " ✗" } else { "" }
+                )),
                 Cell::from(st.status.clone()).style(status_style(&st.status)),
                 Cell::from(st.name.chars().take(40).collect::<String>()),
                 Cell::from(format!("{}/{}", st.num_complete_tasks, st.num_tasks)),
@@ -78,7 +82,7 @@ pub fn draw_stages(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableSta
     let table = Table::new(
         rows,
         [
-            Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Min(18),
             Constraint::Length(12),
@@ -92,7 +96,7 @@ pub fn draw_stages(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableSta
     .header(header_row(&[
         "STAGE", "STATUS", "NAME", "TASKS", "INPUT", "SHUF R", "SHUF W", "SPILL", "PROGRESS",
     ]))
-    .block(table_block(format!(" Stages ({}) ", s.stages.len())))
+    .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 

@@ -2,9 +2,11 @@
 //! submodule and shares the formatting helpers defined here.
 
 mod overview;
+mod picker;
+mod stage_detail;
 mod tables;
 
-use crate::app::{App, Tab};
+use crate::app::{visible_stages, App, Tab, View};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -119,13 +121,50 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Destructure so the table states and the snapshot borrow disjointly.
     let App {
+        view,
         tab,
+        apps,
+        picker,
         snapshot,
+        history,
         jobs,
         stages,
+        stage_filter,
         executors,
+        stage_detail,
+        detail_error,
+        tasks,
+        show_failed,
         ..
     } = app;
+
+    match *view {
+        View::Picker => {
+            picker::draw(f, body, apps, &mut picker.state);
+            return;
+        }
+        View::Stage => {
+            let detail = stage_detail.as_ref();
+            let rows: &[_] = match detail {
+                Some(d) if *show_failed => &d.failed,
+                Some(d) => &d.slowest,
+                None => &[],
+            };
+            stage_detail::draw(
+                f,
+                body,
+                stage_detail::Props {
+                    detail,
+                    error: detail_error.as_deref(),
+                    tasks: rows,
+                    show_failed: *show_failed,
+                    tasks_state: &mut tasks.state,
+                },
+            );
+            return;
+        }
+        View::Main => {}
+    }
 
     let Some(snap) = snapshot.as_ref() else {
         let msg = Paragraph::new("Connecting to Spark…")
@@ -136,21 +175,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
 
     match *tab {
-        Tab::Overview => overview::draw(f, body, snap),
+        Tab::Overview => overview::draw(f, body, snap, history),
         Tab::Jobs => tables::draw_jobs(f, body, snap, &mut jobs.state),
-        Tab::Stages => tables::draw_stages(f, body, snap, &mut stages.state),
+        Tab::Stages => {
+            let visible = visible_stages(snap, stage_filter);
+            let title = match stage_filter {
+                Some(fl) => format!(
+                    " Stages ({} of {}) · job #{} · Esc to clear ",
+                    visible.len(),
+                    snap.stages.len(),
+                    fl.job_id
+                ),
+                None => format!(" Stages ({}) ", visible.len()),
+            };
+            tables::draw_stages(f, body, &visible, title, &mut stages.state)
+        }
         Tab::Executors => tables::draw_executors(f, body, snap, &mut executors.state),
     }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<Line> = Tab::ALL.iter().map(|t| Line::from(t.title())).collect();
-
-    let (name, id) = match &app.snapshot {
-        Some(s) => (s.app.name.clone(), s.app.id.clone()),
-        None => ("—".into(), "—".into()),
-    };
-
     let age = app
         .last_update
         .map(|t| format!("{}s ago", t.elapsed().as_secs()))
@@ -164,16 +208,34 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" LIVE ", Style::default().fg(Color::Black).bg(Color::Green))
     };
 
-    let title = Line::from(vec![
-        Span::raw(" "),
-        state,
-        Span::raw(format!(
-            " {name} [{id}] @ {} · every {}s · updated {age} ",
+    let what = match (&app.view, &app.snapshot) {
+        (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
+        (View::Main | View::Stage, Some(s)) => format!(
+            "{} [{}] @ {} · every {}s · updated {age}",
+            s.app.name,
+            s.app.id,
             app.endpoint,
             app.interval.as_secs()
-        )),
-    ]);
+        ),
+        (View::Main | View::Stage, None) => format!(
+            "[{}] @ {} · every {}s · updated {age}",
+            app.watching.as_deref().unwrap_or("—"),
+            app.endpoint,
+            app.interval.as_secs()
+        ),
+    };
+    let title = Line::from(vec![Span::raw(" "), state, Span::raw(format!(" {what} "))]);
+    let block = Block::default().borders(Borders::ALL).title(title);
 
+    if app.view == View::Picker {
+        f.render_widget(
+            Paragraph::new(" choose an application").style(Style::default().fg(Color::DarkGray)).block(block),
+            area,
+        );
+        return;
+    }
+
+    let titles: Vec<Line> = Tab::ALL.iter().map(|t| Line::from(t.title())).collect();
     let tabs = Tabs::new(titles)
         .select(app.tab.index())
         .highlight_style(
@@ -183,21 +245,31 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
         .divider("│")
-        .block(Block::default().borders(Borders::ALL).title(title));
-
+        .block(block);
     f.render_widget(tabs, area);
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let text = match &app.last_error {
+    let help = match app.view {
+        View::Picker if app.watching.is_some() => {
+            " q quit · j/k move · Enter watch · Esc back · r refresh "
+        }
+        View::Picker => " q quit · j/k move · Enter watch · r refresh ",
+        View::Main => {
+            " q quit · tab/←→ switch · j/k move · Enter open · a apps · r refresh · p pause · +/- interval "
+        }
+        View::Stage => " Esc back · j/k tasks · f failed/slowest · r refresh · p pause · q quit ",
+    };
+    let error = match app.view {
+        View::Stage => app.detail_error.as_ref().or(app.last_error.as_ref()),
+        _ => app.last_error.as_ref(),
+    };
+    let text = match error {
         Some(e) => Line::from(Span::styled(
             format!(" {} ", e.lines().next().unwrap_or(e)),
             Style::default().fg(Color::Red),
         )),
-        None => Line::from(Span::styled(
-            " q quit · tab/←→ switch · j/k move · g/G top/bottom · r refresh · p pause · +/- interval ",
-            Style::default().fg(Color::DarkGray),
-        )),
+        None => Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
     };
     f.render_widget(Paragraph::new(text), area);
 }

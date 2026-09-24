@@ -1,17 +1,25 @@
-//! Overview tab: application info, cluster totals, one gauge per running job.
+//! Overview tab: application info, cluster totals, throughput sparklines,
+//! one gauge per running job.
 
 use super::{fmt_bytes, fmt_millis};
+use crate::app::Sample;
 use crate::spark::Snapshot;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
     Frame,
 };
+use std::collections::VecDeque;
 
-pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot) {
-    let [top, bottom] = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas(area);
+pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot, history: &VecDeque<Sample>) {
+    let [top, trend, bottom] = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Length(5),
+        Constraint::Min(0),
+    ])
+    .areas(area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(top);
 
     let attempt = s.app.attempts.first().cloned().unwrap_or_default();
@@ -90,7 +98,56 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot) {
         right,
     );
 
+    draw_trends(f, trend, history);
     draw_active_gauges(f, bottom, s);
+}
+
+/// Task completion rate and concurrency over the last few minutes.
+fn draw_trends(f: &mut Frame, area: Rect, history: &VecDeque<Sample>) {
+    let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
+
+    // Completed tasks are cumulative; the rate is the delta between polls.
+    // Stored in tenths so a slow 0.4 tasks/s stage still draws a bar.
+    let rate: Vec<u64> = history
+        .iter()
+        .zip(history.iter().skip(1))
+        .map(|(a, b)| {
+            let dt = b.at.duration_since(a.at).as_secs_f64().max(1e-3);
+            let d = (b.completed_tasks - a.completed_tasks).max(0) as f64;
+            (10.0 * d / dt).round() as u64
+        })
+        .collect();
+    let now_rate = rate.last().copied().unwrap_or(0) as f64 / 10.0;
+    let peak_rate = rate.iter().max().copied().unwrap_or(0) as f64 / 10.0;
+
+    let active: Vec<u64> = history.iter().map(|h| h.active_tasks.max(0) as u64).collect();
+    let now_active = active.last().copied().unwrap_or(0);
+    let peak_active = active.iter().max().copied().unwrap_or(0);
+
+    f.render_widget(
+        Sparkline::default()
+            .data(&fit(&rate, left.width))
+            .style(Style::default().fg(Color::Green))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " Tasks/s: {now_rate:.1} (peak {peak_rate:.1}) "
+            ))),
+        left,
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&fit(&active, right.width))
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " Active tasks: {now_active} (peak {peak_active}) "
+            ))),
+        right,
+    );
+}
+
+/// Sparkline draws from the left, so keep the newest samples that fit.
+fn fit(data: &[u64], width: u16) -> Vec<u64> {
+    let w = width.saturating_sub(2) as usize; // borders
+    data[data.len().saturating_sub(w)..].to_vec()
 }
 
 /// One gauge per running job, showing task completion.

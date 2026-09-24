@@ -1,11 +1,23 @@
-"""Tiny fake of the Spark REST API for smoke-testing sparkwatch."""
+"""Tiny fake of the Spark REST API for running sparkwatch without a cluster.
+
+    python3 dev/mock_spark.py &          # two apps -> picker
+    python3 dev/mock_spark.py --single & # one app  -> straight to the monitor
+    cargo run
+"""
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-APP = [{"id": "app-20260923-0001", "name": "etl-nightly",
-        "attempts": [{"startTime": "2026-09-23T09:00:00.000GMT", "endTime": "",
-                      "lastUpdated": "", "duration": 4200000, "sparkUser": "vishnu",
-                      "completed": False, "appSparkVersion": "3.5.1"}]}]
+ETL = {"id": "app-20260923-0001", "name": "etl-nightly",
+       "attempts": [{"startTime": "2026-09-23T09:00:00.000GMT", "endTime": "",
+                     "lastUpdated": "", "duration": 4200000, "sparkUser": "vishnu",
+                     "completed": False, "appSparkVersion": "3.5.1"}]}
+REPORT = {"id": "app-20260922-0007", "name": "daily-report",
+          "attempts": [{"startTime": "2026-09-22T02:00:00.000GMT", "endTime": "2026-09-22T02:41:00.000GMT",
+                        "lastUpdated": "", "duration": 2460000, "sparkUser": "airflow",
+                        "completed": True, "appSparkVersion": "3.4.2"}]}
+APPS = [ETL] if "--single" in sys.argv else [ETL, REPORT]
+
 JOBS = [{"jobId": 3, "name": "save at Writer.scala:88", "status": "RUNNING",
          "numTasks": 400, "numActiveTasks": 16, "numCompletedTasks": 150,
          "numSkippedTasks": 0, "numFailedTasks": 2, "stageIds": [7, 8, 9],
@@ -16,12 +28,81 @@ JOBS = [{"jobId": 3, "name": "save at Writer.scala:88", "status": "RUNNING",
         {"jobId": 1, "name": "collect at Main.scala:22", "status": "FAILED",
          "numTasks": 50, "numCompletedTasks": 12, "numFailedTasks": 4, "stageIds": [4],
          "submissionTime": "2026-09-23T09:10:00.000GMT"}]
+MiB = 1024 * 1024
 STAGES = [{"status": "ACTIVE", "stageId": 9, "attemptId": 0, "name": "mapPartitions at Writer.scala:88",
            "numTasks": 200, "numActiveTasks": 16, "numCompleteTasks": 97, "numFailedTasks": 2,
            "inputBytes": 5368709120, "shuffleReadBytes": 2147483648, "shuffleWriteBytes": 0,
-           "memoryBytesSpilled": 536870912, "executorRunTime": 900000},
+           "memoryBytesSpilled": 536870912, "executorRunTime": 900000, "jvmGcTime": 120000,
+           "schedulingPool": "default",
+           "executorSummary": {
+               "1": {"taskTime": 700000, "succeededTasks": 60, "failedTasks": 0, "shuffleRead": 1500 * MiB},
+               "2": {"taskTime": 150000, "succeededTasks": 30, "failedTasks": 2, "shuffleRead": 400 * MiB,
+                     "memoryBytesSpilled": 512 * MiB, "isExcludedForStage": True},
+               # Executor 3 is a slow node: 7 tasks in as long as exec 2 took for 32.
+               "3": {"taskTime": 250000, "succeededTasks": 7, "failedTasks": 0, "shuffleRead": 148 * MiB}}},
           {"status": "COMPLETE", "stageId": 8, "attemptId": 0, "name": "exchange at Writer.scala:70",
-           "numTasks": 200, "numCompleteTasks": 200, "shuffleWriteBytes": 2147483648}]
+           "numTasks": 200, "numCompleteTasks": 200, "shuffleWriteBytes": 2147483648, "executorRunTime": 400000,
+           "schedulingPool": "default",
+           "executorSummary": {"1": {"taskTime": 200000, "succeededTasks": 100},
+                               "2": {"taskTime": 200000, "succeededTasks": 100}}},
+          {"status": "FAILED", "stageId": 4, "attemptId": 0, "name": "collect at Main.scala:22",
+           "numTasks": 50, "numCompleteTasks": 12, "numFailedTasks": 4, "executorRunTime": 30000,
+           "schedulingPool": "default",
+           "failureReason": "Job aborted due to stage failure: Task 3 in stage 4.0 failed 4 times, most recent failure: "
+                            "Lost task 3.3 in stage 4.0 (TID 412) (10.0.1.10 executor 2): java.lang.OutOfMemoryError: Java heap space",
+           "executorSummary": {"2": {"taskTime": 30000, "succeededTasks": 12, "failedTasks": 4}}}]
+
+# Task metric quantiles for p5,p25,p50,p75,p95,max. Stage 9 has a badly skewed
+# partition (max 91 s vs median 8 s, and 1 GiB shuffle read vs 4 MiB).
+SUMMARIES = {
+    9: {"quantiles": [0.05, 0.25, 0.5, 0.75, 0.95, 1.0],
+        "duration": [1000, 2500, 8000, 9500, 30000, 91000],
+        "jvmGcTime": [0, 10, 50, 100, 900, 12000],
+        "schedulerDelay": [2, 3, 4, 5, 8, 20],
+        "memoryBytesSpilled": [0, 0, 0, 0, 0, 512 * MiB],
+        "inputMetrics": {"bytesRead": [20 * MiB, 24 * MiB, 26 * MiB, 28 * MiB, 32 * MiB, 40 * MiB]},
+        "shuffleReadMetrics": {"readBytes": [1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 32 * MiB, 1025 * MiB],
+                               "fetchWaitTime": [0, 0, 0, 0, 0, 300]},
+        "shuffleWriteMetrics": {"writeBytes": [0, 0, 0, 0, 0, 0]}},
+    8: {"quantiles": [0.05, 0.25, 0.5, 0.75, 0.95, 1.0],
+        "duration": [1800, 1900, 2000, 2100, 2300, 2600],
+        "jvmGcTime": [0, 5, 10, 15, 30, 60],
+        "shuffleWriteMetrics": {"writeBytes": [9 * MiB, 10 * MiB, 10 * MiB, 11 * MiB, 12 * MiB, 13 * MiB]}},
+}
+
+
+def task(tid, idx, exec_id, host, ms, status="SUCCESS", **kw):
+    t = {"taskId": tid, "index": idx, "attempt": kw.pop("attempt", 0), "executorId": exec_id, "host": host,
+         "status": status, "taskLocality": "PROCESS_LOCAL", "speculative": kw.pop("speculative", False),
+         "launchTime": "2026-09-23T10:05:12.000GMT"}
+    if ms is not None:
+        t["duration"] = ms
+        t["taskMetrics"] = {"executorRunTime": ms - 100, "jvmGcTime": kw.pop("gc", ms // 100),
+                            "memoryBytesSpilled": kw.pop("spill", 0),
+                            "shuffleReadMetrics": {"remoteBytesRead": kw.pop("read", 4 * MiB), "localBytesRead": 0}}
+    t.update(kw)
+    return t
+
+
+OOM = ("java.lang.OutOfMemoryError: Java heap space\n\tat java.util.Arrays.copyOf(Arrays.java:3236)\n"
+       "\tat org.apache.spark.sql.execution.aggregate.HashAggregateExec...")
+LOST = "ExecutorLostFailure (executor 2 exited caused by one of the running tasks) Reason: Container killed on request. Exit code is 137"
+TASKS = {
+    9: {"slowest": [task(4021, 17, "1", "10.0.1.9", 91000, read=1025 * MiB, spill=512 * MiB, gc=12000),
+                    task(4088, 84, "2", "10.0.1.10", 31000),
+                    task(4090, 86, "2", "10.0.1.10", 30000, speculative=True),
+                    task(4011, 7, "1", "10.0.1.9", 9800),
+                    task(4012, 8, "3", "10.0.1.11", 9500),
+                    task(4013, 9, "1", "10.0.1.9", 9100),
+                    task(4014, 10, "3", "10.0.1.11", 8200),
+                    task(4015, 11, "1", "10.0.1.9", 8000)],
+        "failed": [task(4050, 46, "2", "10.0.1.10", 4200, "FAILED", errorMessage=LOST),
+                   task(4051, 46, "2", "10.0.1.10", 3900, "FAILED", attempt=1, errorMessage=LOST)]},
+    8: {"slowest": [task(3000 + i, i, str(1 + i % 2), "10.0.1.%d" % (9 + i % 2), 2600 - i * 40) for i in range(10)],
+        "failed": []},
+    4: {"slowest": [task(400 + i, i, "2", "10.0.1.10", 1000 + i * 10) for i in range(5)],
+        "failed": [task(412, 3, "2", "10.0.1.10", None, "FAILED", attempt=a, errorMessage=OOM) for a in range(4)]},
+}
 EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalCores": 0},
          {"id": "1", "hostPort": "10.0.1.9:7079", "isActive": True, "totalCores": 4,
           "activeTasks": 4, "failedTasks": 2, "completedTasks": 610, "totalDuration": 1820000,
@@ -31,15 +112,61 @@ EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalC
           "completedTasks": 300, "totalDuration": 900000, "totalGCTime": 30000,
           "maxMemory": 4294967296}]
 
-ROUTES = {"/api/v1/applications": APP,
-          "/api/v1/applications/app-20260923-0001/jobs": JOBS,
-          "/api/v1/applications/app-20260923-0001/stages": STAGES,
-          "/api/v1/applications/app-20260923-0001/allexecutors": EXECS}
+# Completed-task counters tick up on every poll so the sparklines move.
+TICK = {"n": 0}
 
 
 class H(BaseHTTPRequestHandler):
+    def route(self, path):
+        query = self.query
+        if path == "/api/v1/applications":
+            return APPS
+        prefix = "/api/v1/applications/"
+        if not path.startswith(prefix):
+            return None
+        app_id, _, rest = path[len(prefix):].partition("/")
+        app = next((a for a in APPS if a["id"] == app_id), None)
+        if app is None:
+            return None
+        if rest == "":
+            return app
+        if rest == "jobs":
+            return JOBS
+        if rest == "stages":
+            return STAGES
+        if rest.startswith("stages/"):
+            return self.stage_route(rest.split("/")[1:], query)
+        if rest == "allexecutors":
+            TICK["n"] += 1
+            execs = json.loads(json.dumps(EXECS))
+            execs[1]["completedTasks"] += TICK["n"] * 7
+            return execs
+        return None
+
+    def stage_route(self, parts, query):
+        # parts: [stage_id, attempt, (taskSummary | taskList)?]
+        if len(parts) < 2:
+            return None
+        sid = int(parts[0])
+        stage = next((s for s in STAGES if s["stageId"] == sid), None)
+        if stage is None:
+            return None
+        if len(parts) == 2:
+            return stage
+        if parts[2] == "taskSummary":
+            return SUMMARIES.get(sid)  # 404 when no completed tasks
+        if parts[2] == "taskList":
+            tasks = TASKS.get(sid, {"slowest": [], "failed": []})
+            if query.get("status") == "failed":
+                return tasks["failed"]
+            return tasks["slowest"]
+        return None
+
     def do_GET(self):
-        body = ROUTES.get(self.path)
+        path, _, qs = self.path.partition("?")
+        query = dict(kv.split("=", 1) for kv in qs.split("&") if "=" in kv)
+        self.query = query
+        body = self.route(path)
         self.send_response(200 if body is not None else 404)
         self.send_header("Content-Type", "application/json")
         self.end_headers()

@@ -91,7 +91,8 @@ impl SparkClient {
             jobs,
             stages,
             executors,
-            sql: None, // filled in by the poller from its SQL cache
+            sql: None,               // filled in by the poller from its SQL cache
+            failed_tasks: Vec::new(), // likewise, once it knows which stages grew
         })
     }
 
@@ -107,8 +108,7 @@ impl SparkClient {
             self.get::<Vec<TaskData>>(&slowest_path),
         )?;
         let failed = if stage.num_failed_tasks > 0 {
-            self.get::<Vec<TaskData>>(&format!("{base}/taskList?status=failed&length={FAILED_TASKS}"))
-                .await?
+            self.failed_tasks(app_id, stage_id, attempt, FAILED_TASKS).await?
         } else {
             Vec::new()
         };
@@ -182,6 +182,16 @@ impl SparkClient {
 const SQL_REFRESH_WINDOW: usize = 100;
 const SQL_PAGE: usize = 500;
 const SQL_MAX_PAGES: usize = 10;
+
+impl SparkClient {
+    /// The failed tasks of a stage attempt, with their error messages.
+    pub async fn failed_tasks(&self, app_id: &str, stage_id: i64, attempt: i64, length: usize) -> Result<Vec<TaskData>> {
+        self.get(&format!(
+            "/applications/{app_id}/stages/{stage_id}/{attempt}/taskList?status=failed&length={length}"
+        ))
+        .await
+    }
+}
 
 /// p5 … p95 for the distribution table, plus 1.0 so we also get the max.
 pub const SUMMARY_QUANTILES: &str = "0.05,0.25,0.5,0.75,0.95,1.0";

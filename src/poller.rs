@@ -8,7 +8,7 @@
 use crate::k8s::{self, PortForward};
 use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail};
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -59,6 +59,52 @@ pub enum DetailData {
     Stage(StageDetail),
     /// `None`: the driver no longer retains this execution.
     Sql(Option<ExecutionData>),
+}
+
+/// Per-app poller state that survives between cycles.
+#[derive(Default)]
+struct AppState {
+    sql: SqlCache,
+    /// Failed-task count already fetched per stage attempt, so the error
+    /// messages are pulled only when a stage gains new failures.
+    failed_seen: HashMap<(i64, i64), i64>,
+}
+
+/// Stages whose failure count grew, capped so a mass failure doesn't turn
+/// one poll into a hundred requests.
+const FAILED_STAGES_PER_CYCLE: usize = 5;
+const FAILED_TASKS_PER_STAGE: usize = 20;
+
+/// Pull error messages for stages with new failures. Errors are skipped:
+/// the count in the memo stays put and the stage is retried next cycle.
+async fn fetch_failed_tasks(
+    client: &SparkClient,
+    spark_id: &str,
+    snapshot: &Snapshot,
+    state: &mut AppState,
+) -> Vec<((i64, i64), Vec<crate::spark::TaskData>)> {
+    let mut candidates: Vec<_> = snapshot
+        .stages
+        .iter()
+        .filter(|st| st.num_failed_tasks > state.failed_seen.get(&st.key()).copied().unwrap_or(0))
+        .collect();
+    candidates.sort_by_key(|st| -st.stage_id);
+    candidates.truncate(FAILED_STAGES_PER_CYCLE);
+
+    let fetches = candidates.iter().map(|st| async move {
+        let tasks = client
+            .failed_tasks(spark_id, st.stage_id, st.attempt_id, FAILED_TASKS_PER_STAGE)
+            .await;
+        (st.key(), st.num_failed_tasks, tasks)
+    });
+    let mut out = Vec::new();
+    for (key, count, tasks) in futures::future::join_all(fetches).await {
+        if let Ok(tasks) = tasks {
+            state.failed_seen.insert(key, count);
+            out.push((key, tasks));
+        }
+    }
+    out
 }
 
 /// SQL executions seen so far for the watched app. `sql_tail` only fetches
@@ -210,12 +256,12 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
         let mut period = interval;
         let mut watch = watch;
         let mut detail: Option<Detail> = None;
-        let mut sql = SqlCache::default();
+        let mut state = AppState::default();
 
         loop {
             match &watch {
                 Some(key) => {
-                    let msgs = fetch(&mut source, key, detail, &mut sql).await;
+                    let msgs = fetch(&mut source, key, detail, &mut state).await;
                     for msg in msgs {
                         if msg_tx.send(msg).await.is_err() {
                             return; // UI is gone
@@ -240,11 +286,11 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
                 _ = tokio::time::sleep(sleep_for) => {}
                 first = req_rx.recv() => {
                     let Some(first) = first else { break };
-                    let mut stop = apply(first, &mut source, &mut period, &mut watch, &mut detail, &mut sql);
+                    let mut stop = apply(first, &mut source, &mut period, &mut watch, &mut detail, &mut state);
                     // Requests often arrive in bursts (interval change + refresh);
                     // apply them all before the next fetch.
                     while let Ok(more) = req_rx.try_recv() {
-                        stop |= apply(more, &mut source, &mut period, &mut watch, &mut detail, &mut sql);
+                        stop |= apply(more, &mut source, &mut period, &mut watch, &mut detail, &mut state);
                     }
                     if stop {
                         break;
@@ -264,7 +310,7 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
 
 /// One cycle for a watched app: the snapshot, plus the open detail view if
 /// any, fetched concurrently.
-async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, sql: &mut SqlCache) -> Vec<Message> {
+async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &mut AppState) -> Vec<Message> {
     let err = |e: anyhow::Error| format!("{e:#}");
     let (client, spark_id) = match source.resolve(key).await {
         Ok(c) => c,
@@ -278,7 +324,7 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, sql: &mut
     };
 
     let snapshot = client.poll(&spark_id);
-    let sql_tail = client.sql_tail(&spark_id, sql.max_id());
+    let sql_tail = client.sql_tail(&spark_id, state.sql.max_id());
     let detail_fut = async {
         match detail {
             Some(d @ Detail::Stage { id, attempt }) => Some((
@@ -304,12 +350,17 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, sql: &mut
     // A failed SQL fetch keeps the cached list rather than failing the whole
     // snapshot: jobs/stages/executors are still good and more important.
     if let Ok(tail) = sql_tail {
-        sql.merge(tail);
+        state.sql.merge(tail);
     }
-    let snapshot = snapshot.map(|mut s| {
-        s.sql = sql.view();
-        s
-    });
+    let snapshot = match snapshot {
+        Ok(mut s) => {
+            s.sql = state.sql.view();
+            // Needs the stage list, so it runs after the snapshot, not with it.
+            s.failed_tasks = fetch_failed_tasks(&client, &spark_id, &s, state).await;
+            Ok(s)
+        }
+        Err(e) => Err(e),
+    };
     let mut msgs = vec![Message::Snapshot {
         app_id: key.to_string(),
         result: snapshot.map_err(err),
@@ -327,7 +378,7 @@ fn apply(
     period: &mut Duration,
     watch: &mut Option<String>,
     detail: &mut Option<Detail>,
-    sql: &mut SqlCache,
+    state: &mut AppState,
 ) -> bool {
     match req {
         Request::SetInterval(d) => *period = d,
@@ -335,14 +386,14 @@ fn apply(
         Request::WatchApp(id) => {
             if watch.as_deref() != Some(id.as_str()) {
                 *detail = None;
-                *sql = SqlCache::default();
+                *state = AppState::default();
             }
             *watch = Some(id);
         }
         Request::ListApps => {
             *watch = None;
             *detail = None;
-            *sql = SqlCache::default();
+            *state = AppState::default();
             source.unwatch();
         }
         Request::SetDetail(d) => *detail = d,

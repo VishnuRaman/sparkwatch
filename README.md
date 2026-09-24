@@ -75,11 +75,13 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`5` | Jump to Overview / Jobs / Stages / Executors / SQL |
+| `1`–`6` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures |
 | `j` `k` `↓` `↑` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
 | `g` `G` `Home` `End` | First / last row |
-| `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down · SQL: open the query's plan |
+| `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down · SQL: open the query's plan · Failures: full error text |
+| `x` | Acknowledge new failures (clears the red strip; the log is kept) |
+| `s` | Failures: open the stage the selected failure belongs to, on its failed tasks |
 | `f` | Stage drill-down: switch between slowest and failed tasks |
 | `Tab` / `p` | SQL drill-down: switch scrolling between plan and nodes / plan-only view |
 | `a` | Open the application picker |
@@ -103,6 +105,12 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
   streaming query), newest first: status, query text / call site, submitted,
   duration, job counts (`▶` running `✓` succeeded `✗` failed), error. On an app
   without `/sql` (RDD-only, or Spark < 3.0) the tab says so instead of erroring.
+- **Failures** — everything that went wrong since sparkwatch started, newest
+  first, and it stays even after Spark forgets it. See below.
+
+Dead executors show their `removeReason` next to the host on the Executors
+tab, executors the scheduler has excluded show `excl`, and failed stages carry
+a `✗` on the Stages tab.
 
 The header shows `LIVE`, `PAUSED` or `ERROR`; on an error the last good data
 stays on screen and the message appears in the footer.
@@ -128,6 +136,27 @@ else, so it is fine to leave open on a running stage.
   its failures directly.
 
 `Enter` on a job narrows the Stages tab to that job's stages; `Esc` clears it.
+
+## Failures
+
+The Spark UI only shows a failure where it happened, and only while the API
+still retains it. sparkwatch derives an alert from every poll for:
+
+- a stage in `FAILED` (with its `failureReason`),
+- a job in `FAILED`,
+- an executor that is gone with a `removeReason` (`Container killed…`,
+  `OOMKilled…`, decommission),
+- an executor the scheduler has excluded,
+- a SQL execution in `FAILED` (with its error),
+- every failed task, with its full error message — pulled from
+  `taskList?status=failed` whenever a stage's failure count grows (at most 5
+  stages × 20 tasks per poll, so a mass failure can't flood the driver).
+
+Alerts are deduplicated and kept for the life of the process (last 1000).
+While there are new ones a red strip sits under the header with the count
+and the latest one; `x` acknowledges. The **Failures** tab lists them all;
+`Enter` shows the full text (stack frames dimmed), `s` opens the stage the
+failure belongs to, straight on its failed tasks.
 
 ## SQL drill-down
 
@@ -158,3 +187,13 @@ cargo test
 ```
 
 The mock serves on `localhost:4040` and never needs a cluster.
+
+Headless smoke test (no tmux needed): give the binary a pty with `script`,
+feed it keystrokes, then replay the capture through a terminal emulator and
+assert on the reconstructed screens:
+
+```bash
+pip install pyte
+(sleep 3; printf '6'; sleep 1; printf 'q') | script -q out.txt sh -c 'stty cols 170 rows 50; ./target/debug/sparkwatch'
+python3 dev/screens.py out.txt 170 50 'Failures (11, 11 new)' '!ERROR'   # '!' = must be absent
+```

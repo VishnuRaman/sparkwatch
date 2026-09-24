@@ -1,3 +1,4 @@
+use crate::alerts::{Alert, AlertLog};
 use crate::poller::{Detail, DetailData};
 use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData};
 use crate::ui::sql_detail::Pane;
@@ -12,10 +13,18 @@ pub enum Tab {
     Stages,
     Executors,
     Sql,
+    Failures,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Overview, Tab::Jobs, Tab::Stages, Tab::Executors, Tab::Sql];
+    pub const ALL: [Tab; 6] = [
+        Tab::Overview,
+        Tab::Jobs,
+        Tab::Stages,
+        Tab::Executors,
+        Tab::Sql,
+        Tab::Failures,
+    ];
 
     pub fn title(&self) -> &'static str {
         match self {
@@ -24,6 +33,7 @@ impl Tab {
             Tab::Stages => "Stages",
             Tab::Executors => "Executors",
             Tab::Sql => "SQL",
+            Tab::Failures => "Failures",
         }
     }
 
@@ -51,6 +61,8 @@ pub enum View {
     Stage,
     /// Drill-down into one SQL execution.
     Sql,
+    /// Full text of one alert.
+    Alert,
 }
 
 /// A table cursor that survives the rows being re-sorted underneath it.
@@ -162,6 +174,10 @@ pub struct App {
     pub nodes_scroll: u16,
     pub sql_focus: Pane,
     pub plan_only: bool,
+
+    pub alerts: AlertLog,
+    pub alerts_cursor: Cursor<String>,
+    pub alert_scroll: u16,
 }
 
 impl App {
@@ -195,6 +211,9 @@ impl App {
             nodes_scroll: 0,
             sql_focus: Pane::Plan,
             plan_only: false,
+            alerts: AlertLog::default(),
+            alerts_cursor: Cursor::new(),
+            alert_scroll: 0,
         }
     }
 
@@ -235,6 +254,9 @@ impl App {
                     .resync(&visible_stages(&s, &self.stage_filter), |st| st.key());
                 self.executors.resync(&s.executors, |e| e.id.clone());
                 self.sql.resync(s.sql.as_deref().unwrap_or(&[]), |e| e.id);
+                self.alerts.ingest(&s);
+                let keys: Vec<&Alert> = self.alerts.newest_first().collect();
+                self.alerts_cursor.resync(&keys, |a| a.key.clone());
                 self.record_sample(&s);
                 self.snapshot = Some(s);
                 self.last_error = None;
@@ -292,6 +314,8 @@ impl App {
             self.stage_filter = None;
             self.executors = Cursor::new();
             self.sql = Cursor::new();
+            self.alerts.clear();
+            self.alerts_cursor = Cursor::new();
             self.close_detail();
         }
         self.watching = Some(id);
@@ -320,12 +344,14 @@ impl App {
     /// Returns the detail the poller should start fetching.
     pub fn open_stage_detail(&mut self) -> Option<Detail> {
         let st = self.selected_stage()?;
-        let target = Detail::Stage {
-            id: st.stage_id,
-            attempt: st.attempt_id,
-        };
+        let (id, attempt) = st.key();
         // A failed stage is opened on its failures; a live one on its stragglers.
         let start_on_failed = st.num_failed_tasks > 0 && st.status == "FAILED";
+        Some(self.open_stage(id, attempt, start_on_failed))
+    }
+
+    fn open_stage(&mut self, id: i64, attempt: i64, start_on_failed: bool) -> Detail {
+        let target = Detail::Stage { id, attempt };
         if self.detail_target != Some(target) {
             self.stage_detail = None;
             self.detail_error = None;
@@ -334,7 +360,40 @@ impl App {
         }
         self.detail_target = Some(target);
         self.view = View::Stage;
-        Some(target)
+        target
+    }
+
+    // ---------------------------------------------------------------- alerts
+
+    pub fn selected_alert(&self) -> Option<&Alert> {
+        self.alerts.get_newest(self.alerts_cursor.selected())
+    }
+
+    pub fn open_alert(&mut self) {
+        if self.selected_alert().is_some() {
+            self.alert_scroll = 0;
+            self.view = View::Alert;
+        }
+    }
+
+    pub fn close_alert(&mut self) {
+        if self.view == View::Alert {
+            self.view = View::Main;
+        }
+    }
+
+    /// `s` on an alert: jump into the stage it concerns, on its failures.
+    pub fn open_alert_stage(&mut self) -> Option<Detail> {
+        let (id, attempt) = self.selected_alert()?.stage?;
+        Some(self.open_stage(id, attempt, true))
+    }
+
+    fn alert_scroll_max(&self) -> u16 {
+        let lines = self
+            .selected_alert()
+            .and_then(|a| a.detail.as_ref())
+            .map_or(0, |d| d.lines().count() + 2);
+        lines.saturating_sub(1).min(u16::MAX as usize) as u16
     }
 
     /// The SQL execution under the cursor on the SQL tab.
@@ -395,7 +454,7 @@ impl App {
         self.stage_detail = None;
         self.sql_detail = None;
         self.detail_error = None;
-        if matches!(self.view, View::Stage | View::Sql) {
+        if matches!(self.view, View::Stage | View::Sql | View::Alert) {
             self.view = View::Main;
         }
     }
@@ -461,14 +520,18 @@ impl App {
             View::Picker => self.apps.len(),
             View::Stage => self.visible_tasks().len(),
             View::Sql => self.sql_scroll_max() as usize + 1,
+            View::Alert => self.alert_scroll_max() as usize + 1,
             View::Main => {
+                if self.tab == Tab::Failures {
+                    return self.alerts.len();
+                }
                 let Some(s) = &self.snapshot else { return 0 };
                 match self.tab {
                     Tab::Jobs => s.jobs.len(),
                     Tab::Stages => visible_stages(s, &self.stage_filter).len(),
                     Tab::Executors => s.executors.len(),
                     Tab::Sql => s.sql.as_ref().map_or(0, Vec::len),
-                    Tab::Overview => 0,
+                    Tab::Overview | Tab::Failures => 0,
                 }
             }
         }
@@ -482,11 +545,13 @@ impl App {
                 Pane::Plan => self.plan_scroll as usize,
                 Pane::Nodes => self.nodes_scroll as usize,
             },
+            View::Alert => self.alert_scroll as usize,
             View::Main => match self.tab {
                 Tab::Jobs => self.jobs.selected(),
                 Tab::Stages => self.stages.selected(),
                 Tab::Executors => self.executors.selected(),
                 Tab::Sql => self.sql.selected(),
+                Tab::Failures => self.alerts_cursor.selected(),
                 Tab::Overview => 0,
             },
         }
@@ -503,6 +568,9 @@ impl App {
                     Pane::Nodes => self.nodes_scroll = v,
                 }
             }
+            View::Alert => {
+                self.alert_scroll = index.min(self.alert_scroll_max() as usize) as u16;
+            }
             View::Stage => {
                 let Self {
                     stage_detail,
@@ -518,6 +586,10 @@ impl App {
                 tasks.select(index, rows, |t| t.task_id);
             }
             View::Main => {
+                if self.tab == Tab::Failures {
+                    let keys: Vec<&Alert> = self.alerts.newest_first().collect();
+                    return self.alerts_cursor.select(index, &keys, |a| a.key.clone());
+                }
                 let Self {
                     snapshot,
                     tab,
@@ -534,7 +606,7 @@ impl App {
                     Tab::Stages => stages.select(index, &visible_stages(s, stage_filter), |st| st.key()),
                     Tab::Executors => executors.select(index, &s.executors, |e| e.id.clone()),
                     Tab::Sql => sql.select(index, s.sql.as_deref().unwrap_or(&[]), |e| e.id),
-                    Tab::Overview => {}
+                    Tab::Overview | Tab::Failures => {}
                 }
             }
         }
@@ -544,6 +616,11 @@ impl App {
         // Scrolling text doesn't wrap around like a table cursor does.
         if self.view == View::Sql {
             return self.sql_scroll_by(delta);
+        }
+        if self.view == View::Alert {
+            let max = self.alert_scroll_max() as isize;
+            self.alert_scroll = (self.alert_scroll as isize + delta).clamp(0, max) as u16;
+            return;
         }
         let len = self.current_len();
         if len == 0 {
@@ -675,6 +752,34 @@ mod tests {
         assert!(!app.clear_stage_filter());
         // Cursor followed stage 7 into the unfiltered list.
         assert_eq!(app.selected_stage().unwrap().stage_id, 7);
+    }
+
+    #[test]
+    fn failures_tab_lists_alerts_and_jumps_to_stage() {
+        let mut app = watched_app();
+        let snap = Snapshot {
+            stages: vec![StageData {
+                stage_id: 4,
+                status: "FAILED".into(),
+                failure_reason: Some("boom\n\tat X".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.apply_snapshot("a", Ok(snap));
+        assert_eq!(app.alerts.unacked(), 1);
+        app.tab = Tab::Failures;
+        assert_eq!(app.selected_alert().unwrap().stage, Some((4, 0)));
+        app.open_alert();
+        assert_eq!(app.view, View::Alert);
+        app.move_selection(5);
+        assert!(app.alert_scroll > 0);
+        let target = app.open_alert_stage().unwrap();
+        assert_eq!(target, Detail::Stage { id: 4, attempt: 0 });
+        assert_eq!(app.view, View::Stage);
+        assert!(app.show_failed);
+        app.alerts.acknowledge();
+        assert_eq!(app.alerts.unacked(), 0);
     }
 
     #[test]

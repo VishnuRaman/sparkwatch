@@ -1,6 +1,7 @@
 //! Rendering. `draw` is the single entry point; each view lives in its own
 //! submodule and shares the formatting helpers defined here.
 
+mod failures;
 mod overview;
 mod picker;
 pub mod sql_detail;
@@ -110,14 +111,20 @@ pub fn header_row(cols: &[&'static str]) -> Row<'static> {
 // -------------------------------------------------------------------- layout
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
+    // The alert strip only takes a line while there is something new.
+    let strip_h = if app.view != View::Picker && app.alerts.unacked() > 0 { 1 } else { 0 };
+    let [header, strip, body, footer] = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(strip_h),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(f.area());
 
     draw_header(f, header, app);
+    if strip_h > 0 {
+        failures::draw_strip(f, strip, &app.alerts);
+    }
     draw_footer(f, footer, app);
 
     // Destructure so the table states and the snapshot borrow disjointly.
@@ -142,6 +149,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         nodes_scroll,
         sql_focus,
         plan_only,
+        alerts,
+        alerts_cursor,
+        alert_scroll,
         ..
     } = app;
 
@@ -185,7 +195,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             );
             return;
         }
+        View::Alert => {
+            if let Some(a) = alerts.get_newest(alerts_cursor.state.selected().unwrap_or(0)) {
+                failures::draw_detail(f, body, a, *alert_scroll);
+            }
+            return;
+        }
         View::Main => {}
+    }
+
+    // Failures come from the alert log, not the snapshot, so they show even
+    // while the endpoint is unreachable.
+    if *tab == Tab::Failures {
+        failures::draw_table(f, body, alerts, &mut alerts_cursor.state);
+        return;
     }
 
     let Some(snap) = snapshot.as_ref() else {
@@ -214,6 +237,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Tab::Executors => tables::draw_executors(f, body, snap, &mut executors.state),
         Tab::Sql => tables::draw_sql(f, body, snap.sql.as_deref(), &mut sql.state),
+        Tab::Failures => unreachable!("handled above"),
     }
 }
 
@@ -233,14 +257,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let what = match (&app.view, &app.snapshot) {
         (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
-        (View::Main | View::Stage | View::Sql, Some(s)) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert, Some(s)) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
             s.app.name,
             s.app.id,
             app.endpoint,
             app.interval.as_secs()
         ),
-        (View::Main | View::Stage | View::Sql, None) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert, None) => format!(
             "[{}] @ {} · every {}s · updated {age}",
             app.watching.as_deref().unwrap_or("—"),
             app.endpoint,
@@ -258,7 +282,21 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let titles: Vec<Line> = Tab::ALL.iter().map(|t| Line::from(t.title())).collect();
+    let titles: Vec<Line> = Tab::ALL
+        .iter()
+        .map(|t| match t {
+            // The failures tab carries its count, red while any are new.
+            Tab::Failures if app.alerts.len() > 0 => Line::from(Span::styled(
+                format!("Failures ({})", app.alerts.len()),
+                if app.alerts.unacked() > 0 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )),
+            t => Line::from(t.title()),
+        })
+        .collect();
     let tabs = Tabs::new(titles)
         .select(app.tab.index())
         .highlight_style(
@@ -278,14 +316,19 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             " q quit · j/k move · Enter watch · Esc back · r refresh "
         }
         View::Picker => " q quit · j/k move · Enter watch · r refresh ",
+        View::Main if app.tab == Tab::Failures => {
+            " q quit · tab/←→ switch · j/k move · Enter full text · s open stage · x acknowledge · a apps "
+        }
         View::Main => {
-            " q quit · tab/←→ switch · j/k move · Enter open · a apps · r refresh · p pause · +/- interval "
+            " q quit · tab/←→ switch · j/k move · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
         }
         View::Stage => " Esc back · j/k tasks · f failed/slowest · r refresh · p pause · q quit ",
         View::Sql => " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit ",
+        View::Alert => " Esc back · j/k scroll · s open stage · x acknowledge · q quit ",
     };
     let error = match app.view {
         View::Stage | View::Sql => app.detail_error.as_ref().or(app.last_error.as_ref()),
+        View::Alert => None,
         _ => app.last_error.as_ref(),
     };
     let text = match error {

@@ -166,8 +166,12 @@ EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalC
           "totalGCTime": 240000, "memoryUsed": 1610612736, "maxMemory": 4294967296,
           "totalShuffleRead": 1073741824},
          {"id": "2", "hostPort": "10.0.1.10:7079", "isActive": False, "totalCores": 4,
-          "completedTasks": 300, "totalDuration": 900000, "totalGCTime": 30000,
-          "maxMemory": 4294967296}]
+          "completedTasks": 300, "failedTasks": 6, "totalDuration": 900000, "totalGCTime": 30000,
+          "maxMemory": 4294967296, "removeTime": "2026-09-23T10:20:00.000GMT",
+          "removeReason": "Container killed on request. Exit code is 137 (OOMKilled by the kubelet: memory limit exceeded)"},
+         {"id": "3", "hostPort": "10.0.1.11:7079", "isActive": True, "totalCores": 4,
+          "activeTasks": 1, "completedTasks": 40, "totalDuration": 250000, "totalGCTime": 90000,
+          "memoryUsed": 536870912, "maxMemory": 4294967296, "isExcluded": True}]
 
 # Completed-task counters tick up on every poll so the sparklines move.
 TICK = {"n": 0}

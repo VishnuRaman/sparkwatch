@@ -1,3 +1,4 @@
+mod alerts;
 mod analysis;
 mod app;
 mod k8s;
@@ -193,6 +194,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             KeyCode::Char('p') => app.toggle_plan_only(),
             _ => {}
         },
+        View::Alert => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_alert(),
+            KeyCode::Char('s') => open_alert_stage(app, req_tx).await,
+            KeyCode::Char('x') => app.alerts.acknowledge(),
+            _ => {}
+        },
         View::Main => match key.code {
             // Esc peels back one layer: a stage filter first, then the app.
             KeyCode::Esc => {
@@ -214,11 +221,16 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                     }
                 }
                 app::Tab::Jobs => app.filter_stages_by_selected_job(),
+                app::Tab::Failures => app.open_alert(),
                 _ => {}
             },
+            KeyCode::Char('x') => app.alerts.acknowledge(),
+            KeyCode::Char('s') if app.tab == app::Tab::Failures => {
+                open_alert_stage(app, req_tx).await;
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
             }
             KeyCode::Char('a') => {
@@ -236,6 +248,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             }
             _ => {}
         },
+    }
+}
+
+async fn open_alert_stage(app: &mut App, req_tx: &mpsc::Sender<Request>) {
+    if let Some(target) = app.open_alert_stage() {
+        send(req_tx, Request::SetDetail(Some(target))).await;
+        send(req_tx, Request::RefreshNow).await;
     }
 }
 

@@ -140,9 +140,20 @@ pub struct ExecutorSummary {
     pub total_shuffle_write: i64,
     pub max_memory: i64,
     pub add_time: String,
+    pub remove_time: Option<String>,
+    /// Why the executor went away ("Container killed by YARN…", "Executor
+    /// decommission", …). Only set once it is gone.
+    pub remove_reason: Option<String>,
+    // Renamed in Spark 3.1; accept both spellings.
+    pub is_excluded: bool,
+    pub is_blacklisted: bool,
 }
 
 impl ExecutorSummary {
+    pub fn excluded(&self) -> bool {
+        self.is_excluded || self.is_blacklisted
+    }
+
     pub fn memory_ratio(&self) -> f64 {
         if self.max_memory <= 0 {
             return 0.0;
@@ -384,6 +395,9 @@ pub struct Snapshot {
     /// Newest first. `None` when the endpoint has no `/sql` (not a SQL app,
     /// or a Spark too old to serve it).
     pub sql: Option<Vec<ExecutionData>>,
+    /// Failed tasks fetched this cycle for stages whose failure count grew,
+    /// keyed by `(stage_id, attempt_id)`. Feeds the alert log.
+    pub failed_tasks: Vec<((i64, i64), Vec<TaskData>)>,
 }
 
 #[cfg(test)]
@@ -420,6 +434,19 @@ mod tests {
         let e: Vec<ExecutorSummary> = serde_json::from_str(EXECS_JSON).unwrap();
         assert_eq!(e[0].total_gc_time, 240_000);
         assert!((e[0].memory_ratio() - 0.375).abs() < 1e-6);
+        assert!(e[0].remove_reason.is_none());
+    }
+
+    #[test]
+    fn parses_removed_and_excluded_executors() {
+        let e: Vec<ExecutorSummary> = serde_json::from_str(r#"[
+            {"id":"2","isActive":false,"removeTime":"2026-09-23T10:20:00.000GMT",
+             "removeReason":"Container killed by YARN for exceeding memory limits. 5.5 GB of 5.5 GB physical memory used."},
+            {"id":"3","isActive":true,"isBlacklisted":true},
+            {"id":"4","isActive":true,"isExcluded":true}
+        ]"#).unwrap();
+        assert!(e[0].remove_reason.as_deref().unwrap().starts_with("Container killed"));
+        assert!(e[1].excluded() && e[2].excluded());
     }
 
     const TASKS_JSON: &str = r#"[{

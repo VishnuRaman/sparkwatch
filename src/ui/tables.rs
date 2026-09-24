@@ -115,14 +115,30 @@ pub fn draw_executors(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut Table
             } else {
                 0.0
             };
+            let (state, state_style) = if !e.is_active {
+                ("dead", Style::default().fg(Color::Red))
+            } else if e.excluded() {
+                ("excl", Style::default().fg(Color::Magenta))
+            } else {
+                ("up", Style::default().fg(Color::Green))
+            };
+            // A dead executor's row says why, right where you're looking.
+            let host = match (&e.remove_reason, e.is_active) {
+                (Some(r), false) => format!(
+                    "{} · {}",
+                    e.host_port,
+                    r.lines().next().unwrap_or(r).chars().take(48).collect::<String>()
+                ),
+                _ => e.host_port.clone(),
+            };
             Row::new(vec![
                 Cell::from(e.id.clone()),
-                Cell::from(if e.is_active { "up" } else { "dead" }).style(if e.is_active {
-                    Style::default().fg(Color::Green)
+                Cell::from(state).style(state_style),
+                Cell::from(host).style(if e.is_active {
+                    Style::default()
                 } else {
                     Style::default().fg(Color::Red)
                 }),
-                Cell::from(e.host_port.clone()),
                 Cell::from(format!("{}/{}", e.active_tasks, e.total_cores)),
                 Cell::from(e.failed_tasks.to_string()).style(warn_if(e.failed_tasks)),
                 Cell::from(format!("{} / {}", fmt_bytes(e.memory_used), fmt_bytes(e.max_memory))),

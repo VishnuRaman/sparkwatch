@@ -2,11 +2,13 @@
 //! submodule and shares the formatting helpers defined here.
 
 mod failures;
+mod logs;
 mod overview;
 mod picker;
 pub mod sql_detail;
 mod stage_detail;
 mod tables;
+mod threads;
 
 use crate::app::{visible_stages, App, Tab, View};
 use ratatui::{
@@ -152,6 +154,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         alerts,
         alerts_cursor,
         alert_scroll,
+        logs,
+        logs_rows,
+        threads,
+        threads_lines,
         ..
     } = app;
 
@@ -199,6 +205,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             if let Some(a) = alerts.get_newest(alerts_cursor.state.selected().unwrap_or(0)) {
                 failures::draw_detail(f, body, a, *alert_scroll);
             }
+            return;
+        }
+        View::Logs => {
+            logs::draw(f, body, logs, logs_rows);
+            return;
+        }
+        View::Threads => {
+            threads::draw(f, body, threads, threads_lines);
             return;
         }
         View::Main => {}
@@ -257,14 +271,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let what = match (&app.view, &app.snapshot) {
         (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
-        (View::Main | View::Stage | View::Sql | View::Alert, Some(s)) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads, Some(s)) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
             s.app.name,
             s.app.id,
             app.endpoint,
             app.interval.as_secs()
         ),
-        (View::Main | View::Stage | View::Sql | View::Alert, None) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads, None) => format!(
             "[{}] @ {} · every {}s · updated {age}",
             app.watching.as_deref().unwrap_or("—"),
             app.endpoint,
@@ -317,18 +331,25 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         View::Picker => " q quit · j/k move · Enter watch · r refresh ",
         View::Main if app.tab == Tab::Failures => {
-            " q quit · tab/←→ switch · j/k move · Enter full text · s open stage · x acknowledge · a apps "
+            " q quit · tab/←→ switch · j/k move · Enter full text · s open stage · L logs · x acknowledge · a apps "
+        }
+        View::Main if app.tab == Tab::Executors => {
+            " q quit · tab/←→ switch · j/k move · L logs · t threads · x ack failures · a apps · r refresh · p pause "
         }
         View::Main => {
             " q quit · tab/←→ switch · j/k move · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
         }
-        View::Stage => " Esc back · j/k tasks · f failed/slowest · r refresh · p pause · q quit ",
+        View::Stage => " Esc back · j/k tasks · f failed/slowest · L logs of task's executor · r refresh · p pause · q quit ",
+        View::Logs => {
+            " Esc back · j/k PgUp/PgDn scroll · g/G · F follow · / filter · c clear filter · w wrap · P previous · o stdout/stderr · t threads · q quit "
+        }
+        View::Threads => " Esc back · j/k scroll · e expand · / filter · r refresh · L logs · q quit ",
         View::Sql => " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit ",
-        View::Alert => " Esc back · j/k scroll · s open stage · x acknowledge · q quit ",
+        View::Alert => " Esc back · j/k scroll · s open stage · L logs · x acknowledge · q quit ",
     };
     let error = match app.view {
         View::Stage | View::Sql => app.detail_error.as_ref().or(app.last_error.as_ref()),
-        View::Alert => None,
+        View::Alert | View::Logs | View::Threads => None,
         _ => app.last_error.as_ref(),
     };
     let text = match error {

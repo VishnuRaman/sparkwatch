@@ -92,7 +92,7 @@ Added because the real deployment is Spark Operator on Kubernetes, where "run `k
 
 *As built:* `src/alerts.rs` (`AlertLog`, keyed dedup, bounded at 1000, `acknowledge()` marks everything so far as seen; a `failureReason` that Spark fills in after the FAILED status updates the existing alert rather than adding one). Failed-task fetching lives in the poller's per-app `AppState.failed_seen` memo: only stages whose `numFailedTasks` grew since the last fetch are queried, newest 5 per cycle, 20 tasks each; results ride on `Snapshot.failed_tasks` as a delta and the log dedups by `task:{id}.{attempt}`. The Failures tab renders from the log, not the snapshot, so it works while the endpoint is down. `s` on an alert (tab or full-text view) opens its stage on the failed-tasks list via the Phase 2 drill-down. Excluded executors show `excl` in the STATE column.
 
-## Phase 5 — logs and thread dumps ⬜
+## Phase 5 — logs and thread dumps ✅ done
 
 The Spark UI's other weak spot: executor logs are links to a NodeManager page, and on Kubernetes they are not linked at all. `executorLogs` in the REST API is a `Map<String, String>` of `stdout`/`stderr` URLs per executor (the `driver` row too, on YARN); it is empty on Kubernetes unless `spark.executorEnv.SPARK_LOG_URL_*` is configured. The History Server has no stdout/stderr at all (only event logs as a zip via `/logs`).
 
@@ -127,6 +127,14 @@ The driver log is the important one for Structured Streaming: each micro-batch's
 
 - In the stage drill-down's failed-tasks table, `L` opens the logs of the executor the task ran on with the filter pre-set to the first token of the error (e.g. `OutOfMemoryError`); on a dead executor in k8s mode it tries `--previous` first. This is the workflow the whole phase exists for: see the OOM in the task table → one key → that executor's stderr at that moment.
 - Same key on the Failures tab (Phase 4) for task and executor alerts.
+
+### As built
+
+- `src/logview.rs` (model: bounded buffer, follow, filter with `/` input mode, `filter_from_error`), `src/threads.rs` (grouping/ordering), `src/spark/logs.rs` (NodeManager/worker HTML → text, `?start=-N` tail), `src/ui/logs.rs`, `src/ui/threads.rs`. All unit-tested.
+- Poller: became a `Poller` struct; `Request::{OpenLogs(LogTarget), CloseLogs, FetchThreads(id)}`, `Message::{Log(LogEvent::{Lines, Replace, Status}), Threads}`. The log stream is its own tokio task (`run_logs`), aborted on close / app switch / shutdown; kubectl lines are batched every 100 ms (max 500) so the UI isn't woken per line. `Source::log_source()` yields `LogSource::{Kube{namespace, spark_app_id, driver_pod}, Http(client)}`.
+- k8s: `find_executor_pod` by `spark-role=executor,spark-exec-id,spark-app-selector`; `LogStream` (`kubectl logs -f --tail=2000 [--previous] [-c …] pod/…`, `kill_on_drop`). First attempt names no container; if kubectl answers "a container name must be specified" (sidecars) it retries with `spark-kubernetes-driver` / `spark-kubernetes-executor`.
+- `App.return_view` remembers where `L`/`t` was pressed so `Esc` goes back there (stage drill-down, Failures tab…). `open_logs` marks `previous: true` when the executor is dead in the snapshot. `t` from the log view and `L` from the thread view swap between the two for the same executor.
+- HTTP mode: `stderr` by default (`o` toggles), page re-fetched every 3 s and the buffer replaced; no URL → "no log URLs reported … run with --k8s".
 
 ### Tests / verification
 

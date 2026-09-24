@@ -147,9 +147,15 @@ pub struct ExecutorSummary {
     // Renamed in Spark 3.1; accept both spellings.
     pub is_excluded: bool,
     pub is_blacklisted: bool,
+    /// `stdout` / `stderr` → URL, on YARN and standalone. Empty on Kubernetes.
+    pub executor_logs: HashMap<String, String>,
 }
 
 impl ExecutorSummary {
+    pub fn log_url(&self, stream: &str) -> Option<String> {
+        self.executor_logs.get(stream).cloned()
+    }
+
     pub fn excluded(&self) -> bool {
         self.is_excluded || self.is_blacklisted
     }
@@ -329,6 +335,54 @@ pub struct ShuffleWriteMetricDistributions {
     pub write_time: Vec<f64>,
 }
 
+/// One thread from `executors/{id}/threads`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ThreadStackTrace {
+    pub thread_id: i64,
+    pub thread_name: String,
+    /// NEW | RUNNABLE | BLOCKED | WAITING | TIMED_WAITING | TERMINATED
+    pub thread_state: String,
+    pub stack_trace: StackTrace,
+    pub blocked_by_thread_id: Option<i64>,
+    pub blocked_by_lock: String,
+    pub holding_locks: Vec<String>,
+    pub lock_name: Option<String>,
+    pub lock_owner_name: Option<String>,
+    pub is_daemon: bool,
+}
+
+impl ThreadStackTrace {
+    pub fn frames(&self) -> Vec<&str> {
+        match &self.stack_trace {
+            StackTrace::Elems(v) => v.iter().map(String::as_str).collect(),
+            StackTrace::Wrapped { elems } => elems.iter().map(String::as_str).collect(),
+            StackTrace::Text(t) => t.lines().map(str::trim).filter(|l| !l.is_empty()).collect(),
+        }
+    }
+
+    /// Doing something for a task, as opposed to idling in a pool.
+    pub fn is_spark_work(&self) -> bool {
+        self.frames().iter().any(|f| f.starts_with("org.apache.spark"))
+    }
+}
+
+/// Spark 3.x serialises `StackTrace(elems)` as `{"elems": [...]}`; some
+/// builds flatten it to an array, and 2.x sent one string. Accept all three.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StackTrace {
+    Wrapped { elems: Vec<String> },
+    Elems(Vec<String>),
+    Text(String),
+}
+
+impl Default for StackTrace {
+    fn default() -> Self {
+        StackTrace::Elems(Vec::new())
+    }
+}
+
 /// One Spark SQL execution (a query, or a micro-batch of a streaming query).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -496,6 +550,33 @@ mod tests {
         let e = &s.executor_summary["1"];
         assert_eq!(e.tasks(), 100);
         assert!(e.excluded());
+    }
+
+    #[test]
+    fn parses_thread_dump_in_all_stack_shapes() {
+        let ts: Vec<ThreadStackTrace> = serde_json::from_str(r#"[
+            {"threadId":45,"threadName":"Executor task launch worker for task 3.0","threadState":"BLOCKED",
+             "stackTrace":{"elems":["org.apache.spark.x(A.scala:1)","java.lang.Thread.run(Thread.java:750)"]},
+             "blockedByThreadId":12,"blockedByLock":"java.lang.Object@1a2b","holdingLocks":[],
+             "lockName":"java.lang.Object@1a2b","lockOwnerName":"shuffle-client-2"},
+            {"threadId":12,"threadName":"shuffle-client-2","threadState":"RUNNABLE",
+             "stackTrace":["io.netty.channel.x(Y.java:1)"]},
+            {"threadId":3,"threadName":"old","threadState":"WAITING","stackTrace":"a.b(C.java:1)\n\td.e(F.java:2)"}
+        ]"#).unwrap();
+        assert_eq!(ts[0].frames().len(), 2);
+        assert!(ts[0].is_spark_work());
+        assert_eq!(ts[0].blocked_by_thread_id, Some(12));
+        assert_eq!(ts[1].frames(), ["io.netty.channel.x(Y.java:1)"]);
+        assert_eq!(ts[2].frames(), ["a.b(C.java:1)", "d.e(F.java:2)"]);
+    }
+
+    #[test]
+    fn parses_executor_log_urls() {
+        let e: Vec<ExecutorSummary> = serde_json::from_str(r#"[{"id":"1",
+            "executorLogs":{"stdout":"http://nm:8042/node/containerlogs/c/u/stdout?start=-4096",
+                            "stderr":"http://nm:8042/node/containerlogs/c/u/stderr?start=-4096"}}]"#).unwrap();
+        assert!(e[0].log_url("stderr").unwrap().ends_with("stderr?start=-4096"));
+        assert!(e[0].log_url("nope").is_none());
     }
 
     #[test]

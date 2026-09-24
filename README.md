@@ -82,6 +82,8 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 | `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down · SQL: open the query's plan · Failures: full error text |
 | `x` | Acknowledge new failures (clears the red strip; the log is kept) |
 | `s` | Failures: open the stage the selected failure belongs to, on its failed tasks |
+| `L` | Logs of the selected executor (Executors tab), of the executor a failed task ran on (stage drill-down, filtered to the error), or of the executor an alert concerns (Failures) |
+| `t` | Thread dump of the selected executor (Executors tab, or from the log view) |
 | `f` | Stage drill-down: switch between slowest and failed tasks |
 | `Tab` / `p` | SQL drill-down: switch scrolling between plan and nodes / plan-only view |
 | `a` | Open the application picker |
@@ -158,6 +160,46 @@ and the latest one; `x` acknowledges. The **Failures** tab lists them all;
 `Enter` shows the full text (stack frames dimmed), `s` opens the stage the
 failure belongs to, straight on its failed tasks.
 
+## Logs
+
+`L` on an executor (the `driver` row too) opens its log, following the tail
+as lines arrive. Scrolling up stops following; `F` (or scrolling back to the
+end) resumes. `/` types a case-insensitive filter — `ERROR`, `OutOfMemory`,
+a task id — applied to the whole buffer (last 20 000 lines); `c` clears it,
+`w` toggles wrapping, `Esc` goes back to where you were. ERROR/exception
+lines are red, WARN yellow.
+
+Where the lines come from depends on how sparkwatch reached the app:
+
+- **`--k8s`** — `kubectl logs -f --tail=2000` on the driver pod, or on the
+  executor's pod (found by its `spark-exec-id` / `spark-app-selector`
+  labels). Pods with sidecars are handled (it retries naming Spark's
+  container). `P` switches to `--previous`, the container before the last
+  restart — which is where the reason for a crash is; a dead executor opens
+  on `--previous` straight away. If the executor's pod is gone the view says
+  so: executor pods are deleted on exit unless the app sets
+  `spark.kubernetes.executor.deleteOnTermination=false`, which is worth
+  doing for anything long-running.
+- **YARN / standalone** — the `executorLogs` URLs Spark reports (NodeManager
+  or worker log pages), re-fetched every 3 s as a 256 KiB tail. `o` switches
+  between `stderr` (Spark's own logging) and `stdout`.
+- **History Server** — no logs are available; the view says so.
+
+From a **failed task** in the stage drill-down, `L` opens the executor it
+ran on with the filter pre-set to the exception name, so the OOM you just saw
+in the task table is one key away from its context in the log. Same from a
+task or executor alert on the Failures tab.
+
+## Thread dump
+
+`t` on an executor fetches a live thread dump (`/executors/{id}/threads`)
+and groups it: **BLOCKED** threads first, with which thread holds the lock
+they want, then threads **waiting on a lock**, then **RUNNABLE**, with the
+ones inside Spark code (cyan frames) ahead of idle pool threads. Eight
+frames per thread; `e` expands to all. `/` filters by thread name or frame
+(`HashAggregate`, `BlockManager`…), `r` refreshes, `L` jumps to that
+executor's log. Not available through the History Server.
+
 ## SQL drill-down
 
 `Enter` on a SQL execution opens it: status, submission time, duration, the
@@ -197,3 +239,8 @@ pip install pyte
 (sleep 3; printf '6'; sleep 1; printf 'q') | script -q out.txt sh -c 'stty cols 170 rows 50; ./target/debug/sparkwatch'
 python3 dev/screens.py out.txt 170 50 'Failures (11, 11 new)' '!ERROR'   # '!' = must be absent
 ```
+
+Give the app a few seconds before the first key — until the first poll lands
+it is on the picker / "Connecting" screen, where tab keys do nothing.
+`SPARKWATCH_KEYLOG=/path` appends every key press it receives, with a
+timestamp, which tells "key ignored" from "key never arrived" apart.

@@ -5,8 +5,9 @@
 //! is sequential: one fetch per cycle, then sleep until the interval elapses
 //! or a request wakes it early.
 
-use crate::k8s::{self, PortForward};
-use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail};
+use crate::k8s::{self, LogStream, PortForward};
+use crate::logview::LogTarget;
+use crate::spark::{logs, ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail, ThreadStackTrace};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -26,6 +27,11 @@ pub enum Request {
     ListApps,
     /// Also fetch this detail view on every cycle (`None` to stop).
     SetDetail(Option<Detail>),
+    /// Start streaming an executor's logs (replaces any open stream).
+    OpenLogs(LogTarget),
+    CloseLogs,
+    /// One-shot thread dump.
+    FetchThreads(String),
     /// Tear down (kills any port-forward) and exit.
     Shutdown,
 }
@@ -52,6 +58,21 @@ pub enum Message {
         detail: Detail,
         result: Result<DetailData, String>,
     },
+    Log(LogEvent),
+    Threads {
+        executor_id: String,
+        result: Result<Option<Vec<ThreadStackTrace>>, String>,
+    },
+}
+
+#[derive(Debug)]
+pub enum LogEvent {
+    /// New lines from a stream (kubectl).
+    Lines(Vec<String>),
+    /// A fresh tail from a page fetch (HTTP): replaces the buffer.
+    Replace(Vec<String>),
+    /// What the source is doing, or why it stopped.
+    Status(String),
 }
 
 #[derive(Debug)]
@@ -166,11 +187,22 @@ pub enum Source {
 
 pub struct KubeConn {
     app_name: String,
+    driver_pod: String,
     _forward: PortForward,
     client: SparkClient,
     /// The driver reports its own Spark application id; that is what the
     /// REST paths need, not the SparkApplication name.
     spark_app_id: String,
+}
+
+/// What a log stream needs to know about where the app runs.
+enum LogSource {
+    Kube {
+        namespace: Option<String>,
+        spark_app_id: String,
+        driver_pod: String,
+    },
+    Http(SparkClient),
 }
 
 impl Source {
@@ -205,6 +237,20 @@ impl Source {
         }
     }
 
+    fn log_source(&self) -> Result<LogSource> {
+        match self {
+            Source::Http(client) => Ok(LogSource::Http(client.clone())),
+            Source::Kube { namespace, conn, .. } => {
+                let c = conn.as_ref().context("not connected to a driver yet")?;
+                Ok(LogSource::Kube {
+                    namespace: namespace.clone(),
+                    spark_app_id: c.spark_app_id.clone(),
+                    driver_pod: c.driver_pod.clone(),
+                })
+            }
+        }
+    }
+
     /// A dead forward (pod gone, kubectl exited) shows up as a connection
     /// error; drop it so the next cycle reconnects.
     fn poll_failed(&mut self) {
@@ -232,6 +278,7 @@ async fn connect(namespace: Option<&str>, app_name: &str, timeout: Duration) -> 
         .id;
     Ok(KubeConn {
         app_name: app_name.to_string(),
+        driver_pod: driver.pod,
         _forward: forward,
         client,
         spark_app_id,
@@ -248,49 +295,54 @@ pub struct Handle {
     pub task: JoinHandle<()>,
 }
 
-pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> Handle {
+pub fn spawn(source: Source, watch: Option<String>, interval: Duration) -> Handle {
     let (req_tx, mut req_rx) = mpsc::channel::<Request>(16);
-    let (msg_tx, msg_rx) = mpsc::channel::<Message>(16);
+    let (msg_tx, msg_rx) = mpsc::channel::<Message>(64);
 
     let task = tokio::spawn(async move {
-        let mut period = interval;
-        let mut watch = watch;
-        let mut detail: Option<Detail> = None;
-        let mut state = AppState::default();
+        let mut p = Poller {
+            source,
+            period: interval,
+            watch,
+            detail: None,
+            state: AppState::default(),
+            logs: None,
+            msg_tx,
+        };
 
         loop {
-            match &watch {
+            match p.watch.clone() {
                 Some(key) => {
-                    let msgs = fetch(&mut source, key, detail, &mut state).await;
+                    let msgs = fetch(&mut p.source, &key, p.detail, &mut p.state).await;
                     for msg in msgs {
-                        if msg_tx.send(msg).await.is_err() {
+                        if p.msg_tx.send(msg).await.is_err() {
                             return; // UI is gone
                         }
                     }
                 }
                 None => {
-                    let msg = Message::Apps(source.list().await.map_err(|e| format!("{e:#}")));
-                    if msg_tx.send(msg).await.is_err() {
+                    let msg = Message::Apps(p.source.list().await.map_err(|e| format!("{e:#}")));
+                    if p.msg_tx.send(msg).await.is_err() {
                         return;
                     }
                 }
             }
 
-            let sleep_for = if watch.is_none() {
-                period.max(LIST_APPS_MIN_INTERVAL)
+            let sleep_for = if p.watch.is_none() {
+                p.period.max(LIST_APPS_MIN_INTERVAL)
             } else {
-                period
+                p.period
             };
 
             tokio::select! {
                 _ = tokio::time::sleep(sleep_for) => {}
                 first = req_rx.recv() => {
                     let Some(first) = first else { break };
-                    let mut stop = apply(first, &mut source, &mut period, &mut watch, &mut detail, &mut state);
+                    let mut stop = p.apply(first).await;
                     // Requests often arrive in bursts (interval change + refresh);
                     // apply them all before the next fetch.
                     while let Ok(more) = req_rx.try_recv() {
-                        stop |= apply(more, &mut source, &mut period, &mut watch, &mut detail, &mut state);
+                        stop |= p.apply(more).await;
                     }
                     if stop {
                         break;
@@ -298,13 +350,200 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
                 }
             }
         }
-        // `source` drops here, which kills any kubectl port-forward.
+        // `p` drops here: the port-forward and any log stream are killed.
     });
 
     Handle {
         req_tx,
         msg_rx,
         task,
+    }
+}
+
+struct Poller {
+    source: Source,
+    period: Duration,
+    watch: Option<String>,
+    detail: Option<Detail>,
+    state: AppState,
+    /// The running log stream task, if a log view is open.
+    logs: Option<JoinHandle<()>>,
+    msg_tx: mpsc::Sender<Message>,
+}
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        self.close_logs();
+    }
+}
+
+impl Poller {
+    fn close_logs(&mut self) {
+        if let Some(h) = self.logs.take() {
+            h.abort(); // drops the kubectl child (kill_on_drop)
+        }
+    }
+
+    /// Returns true when the poller should exit.
+    async fn apply(&mut self, req: Request) -> bool {
+        match req {
+            Request::SetInterval(d) => self.period = d,
+            Request::RefreshNow => {}
+            Request::WatchApp(id) => {
+                if self.watch.as_deref() != Some(id.as_str()) {
+                    self.detail = None;
+                    self.state = AppState::default();
+                    self.close_logs();
+                }
+                self.watch = Some(id);
+            }
+            Request::ListApps => {
+                self.watch = None;
+                self.detail = None;
+                self.state = AppState::default();
+                self.close_logs();
+                self.source.unwatch();
+            }
+            Request::SetDetail(d) => self.detail = d,
+            Request::OpenLogs(target) => {
+                self.close_logs();
+                let tx = self.msg_tx.clone();
+                match self.source.log_source() {
+                    Ok(src) => self.logs = Some(tokio::spawn(run_logs(src, target, tx))),
+                    Err(e) => {
+                        let _ = tx.send(Message::Log(LogEvent::Status(format!("{e:#}")))).await;
+                    }
+                }
+            }
+            Request::CloseLogs => self.close_logs(),
+            Request::FetchThreads(executor_id) => {
+                let result = match &self.watch {
+                    Some(key) => match self.source.resolve(key).await {
+                        Ok((client, spark_id)) => client
+                            .threads(&spark_id, &executor_id)
+                            .await
+                            .map_err(|e| format!("{e:#}")),
+                        Err(e) => Err(format!("{e:#}")),
+                    },
+                    None => Err("no application is being watched".into()),
+                };
+                let _ = self.msg_tx.send(Message::Threads { executor_id, result }).await;
+            }
+            Request::Shutdown => return true,
+        }
+        false
+    }
+}
+
+// -------------------------------------------------------------- log streams
+
+/// Lines a kubectl stream keeps before the viewer gets its first batch.
+const LOG_TAIL: usize = 2000;
+/// Batch lines so the UI wakes ~10×/s at most, not once per line.
+const LOG_BATCH_EVERY: Duration = Duration::from_millis(100);
+const LOG_BATCH_MAX: usize = 500;
+/// HTTP sources have no follow; re-fetch the tail this often.
+const HTTP_LOG_REFRESH: Duration = Duration::from_secs(3);
+
+async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) {
+    let status = |s: String| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Message::Log(LogEvent::Status(s))).await;
+        }
+    };
+    match src {
+        LogSource::Kube {
+            namespace,
+            spark_app_id,
+            driver_pod,
+        } => {
+            let ns = namespace.as_deref();
+            let (pod, default_container) = if target.executor_id == "driver" {
+                (driver_pod, k8s::DRIVER_CONTAINER)
+            } else {
+                match k8s::find_executor_pod(ns, &spark_app_id, &target.executor_id).await {
+                    Ok(Some(p)) => (p, k8s::EXECUTOR_CONTAINER),
+                    Ok(None) => {
+                        return status(
+                            "pod gone — set spark.kubernetes.executor.deleteOnTermination=false to keep executor logs"
+                                .into(),
+                        )
+                        .await;
+                    }
+                    Err(e) => return status(format!("{e:#}")).await,
+                }
+            };
+            // First without -c; a pod with sidecars makes kubectl refuse,
+            // and then we name Spark's container.
+            let mut container: Option<&str> = None;
+            loop {
+                let mut stream = match LogStream::start(ns, &pod, container, target.previous, LOG_TAIL).await {
+                    Ok(s) => s,
+                    Err(e) => return status(format!("{e:#}")).await,
+                };
+                status(format!(
+                    "streaming pod/{pod}{}{}",
+                    container.map(|c| format!(" -c {c}")).unwrap_or_default(),
+                    if target.previous { " --previous" } else { "" }
+                ))
+                .await;
+                let ended = pump(&mut stream, &tx).await;
+                let reason = stream.exit_reason().await;
+                if ended && container.is_none() && k8s::needs_container_name(&reason) {
+                    container = Some(default_container);
+                    continue;
+                }
+                let why = if reason.is_empty() { "stream ended".to_string() } else { reason };
+                return status(format!("kubectl logs ended: {why}")).await;
+            }
+        }
+        LogSource::Http(client) => {
+            let Some(url) = &target.http_url else {
+                return status(
+                    "no log URLs reported by this executor (on Kubernetes, run with --k8s to stream pod logs)".into(),
+                )
+                .await;
+            };
+            let url = logs::with_tail(url);
+            loop {
+                match client.fetch_text(&url).await {
+                    Ok(body) => {
+                        let lines: Vec<String> = logs::extract_log_text(&body).lines().map(str::to_string).collect();
+                        if tx.send(Message::Log(LogEvent::Replace(lines))).await.is_err() {
+                            return;
+                        }
+                        status(format!("tail of {url} · refreshed every {}s", HTTP_LOG_REFRESH.as_secs())).await;
+                    }
+                    Err(e) => status(format!("fetch failed: {e:#}")).await,
+                }
+                tokio::time::sleep(HTTP_LOG_REFRESH).await;
+            }
+        }
+    }
+}
+
+/// Forward lines in batches until the stream ends. Returns true on a clean
+/// EOF (as opposed to the UI having gone away).
+async fn pump(stream: &mut LogStream, tx: &mpsc::Sender<Message>) -> bool {
+    let mut batch: Vec<String> = Vec::new();
+    loop {
+        let (eof, timer) = match tokio::time::timeout(LOG_BATCH_EVERY, stream.lines.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                batch.push(line);
+                (false, false)
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => (true, false),
+            Err(_) => (false, true), // batch timer fired
+        };
+        if !batch.is_empty() && (eof || timer || batch.len() >= LOG_BATCH_MAX) {
+            if tx.send(Message::Log(LogEvent::Lines(std::mem::take(&mut batch)))).await.is_err() {
+                return false;
+            }
+        }
+        if eof {
+            return true;
+        }
     }
 }
 
@@ -369,35 +608,4 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &m
         msgs.push(Message::Detail { detail, result });
     }
     msgs
-}
-
-/// Returns true when the poller should exit.
-fn apply(
-    req: Request,
-    source: &mut Source,
-    period: &mut Duration,
-    watch: &mut Option<String>,
-    detail: &mut Option<Detail>,
-    state: &mut AppState,
-) -> bool {
-    match req {
-        Request::SetInterval(d) => *period = d,
-        Request::RefreshNow => {}
-        Request::WatchApp(id) => {
-            if watch.as_deref() != Some(id.as_str()) {
-                *detail = None;
-                *state = AppState::default();
-            }
-            *watch = Some(id);
-        }
-        Request::ListApps => {
-            *watch = None;
-            *detail = None;
-            *state = AppState::default();
-            source.unwatch();
-        }
-        Request::SetDetail(d) => *detail = d,
-        Request::Shutdown => return true,
-    }
-    false
 }

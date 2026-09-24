@@ -3,6 +3,7 @@
 //! Works against both a live driver (`http://<driver>:4040`) and the
 //! History Server (`http://<host>:18080`).
 
+pub mod logs;
 mod types;
 
 pub use types::*;
@@ -184,6 +185,28 @@ const SQL_PAGE: usize = 500;
 const SQL_MAX_PAGES: usize = 10;
 
 impl SparkClient {
+    /// Live thread dump of an executor. `None` where it is not served (the
+    /// History Server, or an executor that is gone).
+    pub async fn threads(&self, app_id: &str, executor_id: &str) -> Result<Option<Vec<ThreadStackTrace>>> {
+        self.get_opt(&format!("/applications/{app_id}/executors/{executor_id}/threads"))
+            .await
+    }
+
+    /// A raw GET of any URL (executor log pages live outside `/api/v1`).
+    pub async fn fetch_text(&self, url: &str) -> Result<String> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("GET {url} -> {status}");
+        }
+        resp.text().await.with_context(|| format!("reading {url}"))
+    }
+
     /// The failed tasks of a stage attempt, with their error messages.
     pub async fn failed_tasks(&self, app_id: &str, stage_id: i64, attempt: i64, length: usize) -> Result<Vec<TaskData>> {
         self.get(&format!(

@@ -112,6 +112,87 @@ pub async fn find_driver(namespace: Option<&str>, name: &str) -> Result<Driver> 
     })
 }
 
+/// The pod running executor `exec_id` of Spark application `spark_app_id`,
+/// if it still exists. Spark labels executor pods with `spark-exec-id` and
+/// `spark-app-selector` (= the Spark app id); the operator keeps those.
+pub async fn find_executor_pod(namespace: Option<&str>, spark_app_id: &str, exec_id: &str) -> Result<Option<String>> {
+    let selector = format!("spark-role=executor,spark-exec-id={exec_id},spark-app-selector={spark_app_id}");
+    let out = kubectl(namespace)
+        .args(["get", "pods", "-l", &selector, "-o", "json"])
+        .output()
+        .await
+        .context("running kubectl (is it on PATH?)")?;
+    if !out.status.success() {
+        anyhow::bail!("kubectl get pods: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let json: Value = serde_json::from_slice(&out.stdout).context("parsing kubectl output")?;
+    Ok(json["items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|pod| pod["metadata"]["name"].as_str())
+        .map(str::to_string))
+}
+
+/// Container names spark-submit gives the driver and executor containers,
+/// used when a pod has sidecars and kubectl insists on `-c`.
+pub const DRIVER_CONTAINER: &str = "spark-kubernetes-driver";
+pub const EXECUTOR_CONTAINER: &str = "spark-kubernetes-executor";
+
+/// A `kubectl logs -f` child process with its stdout as a line stream.
+/// Killed when dropped.
+pub struct LogStream {
+    _child: Child,
+    pub lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr: Option<tokio::process::ChildStderr>,
+}
+
+impl LogStream {
+    pub async fn start(
+        namespace: Option<&str>,
+        pod: &str,
+        container: Option<&str>,
+        previous: bool,
+        tail: usize,
+    ) -> Result<Self> {
+        let mut cmd = kubectl(namespace);
+        cmd.args(["logs", "-f", &format!("--tail={tail}")]);
+        if previous {
+            cmd.arg("--previous");
+        }
+        if let Some(c) = container {
+            cmd.args(["-c", c]);
+        }
+        let mut child = cmd
+            .arg(format!("pod/{pod}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning kubectl logs (is kubectl on PATH?)")?;
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take();
+        Ok(Self {
+            _child: child,
+            lines: BufReader::new(stdout).lines(),
+            stderr,
+        })
+    }
+
+    /// After stdout closes: whatever kubectl complained about.
+    pub async fn exit_reason(&mut self) -> String {
+        let mut err = String::new();
+        if let Some(mut e) = self.stderr.take() {
+            e.read_to_string(&mut err).await.ok();
+        }
+        err.trim().to_string()
+    }
+}
+
+/// kubectl's message when a pod has several containers and none was named.
+pub fn needs_container_name(err: &str) -> bool {
+    err.contains("a container name must be specified")
+}
+
 /// A `kubectl port-forward` child process. Killed when dropped.
 pub struct PortForward {
     _child: Child,

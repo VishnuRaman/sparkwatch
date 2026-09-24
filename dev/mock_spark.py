@@ -160,8 +160,13 @@ SQL = [
 ]
 SQL_ENABLED = "--no-sql" not in sys.argv
 
-EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalCores": 0},
-         {"id": "1", "hostPort": "10.0.1.9:7079", "isActive": True, "totalCores": 4,
+def logs_for(eid):
+    return {"stdout": "http://127.0.0.1:4040/node/containerlogs/container_%s/vishnu/stdout?start=-4096" % eid,
+            "stderr": "http://127.0.0.1:4040/node/containerlogs/container_%s/vishnu/stderr?start=-4096" % eid}
+
+
+EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalCores": 0, "executorLogs": logs_for("driver")},
+         {"id": "1", "hostPort": "10.0.1.9:7079", "isActive": True, "totalCores": 4, "executorLogs": logs_for("1"),
           "activeTasks": 4, "failedTasks": 2, "completedTasks": 610, "totalDuration": 1820000,
           "totalGCTime": 240000, "memoryUsed": 1610612736, "maxMemory": 4294967296,
           "totalShuffleRead": 1073741824},
@@ -172,6 +177,38 @@ EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalC
          {"id": "3", "hostPort": "10.0.1.11:7079", "isActive": True, "totalCores": 4,
           "activeTasks": 1, "completedTasks": 40, "totalDuration": 250000, "totalGCTime": 90000,
           "memoryUsed": 536870912, "maxMemory": 4294967296, "isExcluded": True}]
+
+THREADS = [
+    {"threadId": 45, "threadName": "Executor task launch worker for task 3.0 in stage 9.0 (TID 4088)",
+     "threadState": "BLOCKED", "blockedByThreadId": 12, "blockedByLock": "java.lang.Object@1a2b3c",
+     "lockName": "java.lang.Object@1a2b3c", "lockOwnerName": "shuffle-client-2", "holdingLocks": [],
+     "stackTrace": {"elems": ["org.apache.spark.storage.BlockManager.getRemoteBytes(BlockManager.scala:1032)",
+                              "org.apache.spark.shuffle.BlockStoreShuffleReader.read(BlockStoreShuffleReader.scala:88)",
+                              "org.apache.spark.sql.execution.ShuffledRowRDD.compute(ShuffledRowRDD.scala:210)",
+                              "org.apache.spark.scheduler.Task.run(Task.scala:141)",
+                              "java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)",
+                              "java.lang.Thread.run(Thread.java:750)"]}},
+    {"threadId": 12, "threadName": "shuffle-client-2", "threadState": "RUNNABLE", "holdingLocks": ["java.lang.Object@1a2b3c"],
+     "stackTrace": {"elems": ["sun.nio.ch.EPoll.wait(Native Method)", "io.netty.channel.epoll.EpollEventLoop.run(EpollEventLoop.java:364)"]}},
+    {"threadId": 46, "threadName": "Executor task launch worker for task 8.0 in stage 9.0 (TID 4090)",
+     "threadState": "RUNNABLE",
+     "stackTrace": {"elems": ["org.apache.spark.sql.execution.aggregate.HashAggregateExec.doExecute(HashAggregateExec.scala:120)",
+                              "org.apache.spark.scheduler.Task.run(Task.scala:141)"]}},
+    {"threadId": 7, "threadName": "dispatcher-Executor", "threadState": "WAITING", "lockName": "java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject@77",
+     "stackTrace": {"elems": ["sun.misc.Unsafe.park(Native Method)", "java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)"]}},
+    {"threadId": 2, "threadName": "Reference Handler", "threadState": "TIMED_WAITING",
+     "stackTrace": {"elems": ["java.lang.Object.wait(Native Method)"]}},
+]
+
+
+def log_page(eid, stream):
+    lines = ["26/09/24 10:05:%02d %s Executor: %s line %d on executor %s" % (i, "ERROR" if i == 5 else "INFO",
+             stream, i, eid) for i in range(40)]
+    if stream == "stderr":
+        lines[5] = "26/09/24 10:05:05 ERROR Executor: Exception in task 3.0: java.lang.OutOfMemoryError: Java heap space"
+    body = "\n".join(lines).replace("<", "&lt;")
+    return "<html><body><h1>Logs for container_%s</h1><pre>%s</pre></body></html>" % (eid, body)
+
 
 # Completed-task counters tick up on every poll so the sparklines move.
 TICK = {"n": 0}
@@ -210,6 +247,9 @@ class H(BaseHTTPRequestHandler):
                 e["planDescription"] = PLAN
                 e["nodes"] = SQL_NODES
             return e
+        if rest.startswith("executors/") and rest.endswith("/threads"):
+            eid = rest.split("/")[1]
+            return THREADS if eid in ("1", "3", "driver") else None
         if rest == "allexecutors":
             TICK["n"] += 1
             execs = json.loads(json.dumps(EXECS))
@@ -240,6 +280,15 @@ class H(BaseHTTPRequestHandler):
         path, _, qs = self.path.partition("?")
         query = dict(kv.split("=", 1) for kv in qs.split("&") if "=" in kv)
         self.query = query
+        if path.startswith("/node/containerlogs/"):
+            # Fake YARN NodeManager log page.
+            parts = path.split("/")
+            eid, stream = parts[3].replace("container_", ""), parts[5]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(log_page(eid, stream).encode())
+            return
         body = self.route(path)
         self.send_response(200 if body is not None else 404)
         self.send_header("Content-Type", "application/json")

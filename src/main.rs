@@ -2,8 +2,10 @@ mod alerts;
 mod analysis;
 mod app;
 mod k8s;
+mod logview;
 mod poller;
 mod spark;
+mod threads;
 mod ui;
 
 use anyhow::Result;
@@ -11,6 +13,7 @@ use app::{App, View};
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
+use logview::LogTarget;
 use poller::{Message, Request, Source};
 use spark::SparkClient;
 use std::time::Duration;
@@ -117,6 +120,7 @@ async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        keylog(&key);
                         handle_key(app, key, req_tx).await;
                     }
                     Some(Ok(_)) => {}          // resize, mouse, focus: just redraw
@@ -140,6 +144,8 @@ async fn run(
                         app.apply_detail(detail, result);
                     }
                 }
+                Message::Log(event) => app.apply_log(event),
+                Message::Threads { executor_id, result } => app.apply_threads(&executor_id, result),
             },
             _ = tick.tick() => {}
         }
@@ -147,6 +153,11 @@ async fn run(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>) {
+    // Typing a filter: every key is text until Enter/Esc.
+    if app.filter_input_key(key.code) {
+        return;
+    }
+
     // Keys that mean the same thing on every screen.
     match key.code {
         KeyCode::Char('q') => return app.should_quit = true,
@@ -160,7 +171,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
         KeyCode::Char('g') | KeyCode::Home => return app.select_edge(false),
         KeyCode::Char('G') | KeyCode::End => return app.select_edge(true),
         // Waking the poller early: it is parked in a select! on this channel.
-        KeyCode::Char('r') => return send(req_tx, Request::RefreshNow).await,
+        KeyCode::Char('r') => {
+            if app.view == View::Threads {
+                app.threads.error = None;
+                send(req_tx, Request::FetchThreads(app.threads.executor_id.clone())).await;
+            }
+            return send(req_tx, Request::RefreshNow).await;
+        }
         _ => {}
     }
 
@@ -182,6 +199,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 send(req_tx, Request::SetDetail(None)).await;
             }
             KeyCode::Char('f') => app.toggle_failed_tasks(),
+            KeyCode::Char('L') => open_logs(app, req_tx, App::open_logs_selected_task).await,
             KeyCode::Char('p') => app.paused = !app.paused,
             _ => {}
         },
@@ -197,7 +215,42 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
         View::Alert => match key.code {
             KeyCode::Esc | KeyCode::Backspace => app.close_alert(),
             KeyCode::Char('s') => open_alert_stage(app, req_tx).await,
+            KeyCode::Char('L') => open_logs(app, req_tx, App::open_logs_selected_alert).await,
             KeyCode::Char('x') => app.alerts.acknowledge(),
+            _ => {}
+        },
+        View::Logs => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.close_logs();
+                send(req_tx, Request::CloseLogs).await;
+            }
+            KeyCode::Char('/') => app.logs.start_filter(),
+            KeyCode::Char('c') => app.logs.clear_filter(),
+            KeyCode::Char('w') => app.logs.wrap = !app.logs.wrap,
+            KeyCode::Char('F') => app.logs.scroll_to_end(),
+            KeyCode::Char('P') => open_logs(app, req_tx, App::logs_toggle_previous).await,
+            KeyCode::Char('o') => open_logs(app, req_tx, App::logs_toggle_stream).await,
+            KeyCode::Char('t') => {
+                if let Some(t) = app.logs.target.clone() {
+                    send(req_tx, Request::CloseLogs).await;
+                    app.logs.close();
+                    let id = app.open_threads(t.executor_id);
+                    send(req_tx, Request::FetchThreads(id)).await;
+                }
+            }
+            _ => {}
+        },
+        View::Threads => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_threads(),
+            KeyCode::Char('/') => app.threads.filter_input = Some(app.threads.filter.clone().unwrap_or_default()),
+            KeyCode::Char('c') => app.threads.filter = None,
+            KeyCode::Char('e') => app.threads.expanded = !app.threads.expanded,
+            KeyCode::Char('L') => {
+                let id = app.threads.executor_id.clone();
+                app.threads = app::ThreadsView::default();
+                let target = app.open_logs(id, None);
+                send(req_tx, Request::OpenLogs(target)).await;
+            }
             _ => {}
         },
         View::Main => match key.code {
@@ -228,6 +281,17 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             KeyCode::Char('s') if app.tab == app::Tab::Failures => {
                 open_alert_stage(app, req_tx).await;
             }
+            KeyCode::Char('L') if app.tab == app::Tab::Failures => {
+                open_logs(app, req_tx, App::open_logs_selected_alert).await;
+            }
+            KeyCode::Char('L') if app.tab == app::Tab::Executors => {
+                open_logs(app, req_tx, App::open_logs_selected_executor).await;
+            }
+            KeyCode::Char('t') if app.tab == app::Tab::Executors => {
+                if let Some(id) = app.open_threads_selected_executor() {
+                    send(req_tx, Request::FetchThreads(id)).await;
+                }
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
             KeyCode::Char(c @ '1'..='6') => {
@@ -251,10 +315,31 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
     }
 }
 
+/// Open the log view via one of `App`'s `open_logs_*` helpers and start the
+/// stream for whatever target it chose.
+async fn open_logs(app: &mut App, req_tx: &mpsc::Sender<Request>, pick: fn(&mut App) -> Option<LogTarget>) {
+    if let Some(target) = pick(app) {
+        send(req_tx, Request::OpenLogs(target)).await;
+    }
+}
+
 async fn open_alert_stage(app: &mut App, req_tx: &mpsc::Sender<Request>) {
     if let Some(target) = app.open_alert_stage() {
         send(req_tx, Request::SetDetail(Some(target))).await;
         send(req_tx, Request::RefreshNow).await;
+    }
+}
+
+/// Debug aid for headless runs: `SPARKWATCH_KEYLOG=/path` appends every key
+/// press received, so "key ignored" and "key never arrived" can be told apart.
+fn keylog(key: &KeyEvent) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t0 = START.get_or_init(std::time::Instant::now);
+    if let Ok(path) = std::env::var("SPARKWATCH_KEYLOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "+{}ms {:?} {:?}", t0.elapsed().as_millis(), key.code, key.modifiers);
+        }
     }
 }
 

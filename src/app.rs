@@ -1,6 +1,7 @@
-use crate::alerts::{Alert, AlertLog};
-use crate::poller::{Detail, DetailData};
-use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData};
+use crate::alerts::{Alert, AlertLog, Kind};
+use crate::logview::{filter_from_error, LogTarget, LogView, Stream};
+use crate::poller::{Detail, DetailData, LogEvent};
+use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData, ThreadStackTrace};
 use crate::ui::sql_detail::Pane;
 use ratatui::widgets::TableState;
 use std::collections::VecDeque;
@@ -63,6 +64,21 @@ pub enum View {
     Sql,
     /// Full text of one alert.
     Alert,
+    /// An executor's log stream.
+    Logs,
+    /// An executor's thread dump.
+    Threads,
+}
+
+#[derive(Default)]
+pub struct ThreadsView {
+    pub executor_id: String,
+    pub threads: Option<Vec<ThreadStackTrace>>,
+    pub error: Option<String>,
+    pub scroll: u16,
+    pub expanded: bool,
+    pub filter: Option<String>,
+    pub filter_input: Option<String>,
 }
 
 /// A table cursor that survives the rows being re-sorted underneath it.
@@ -178,6 +194,15 @@ pub struct App {
     pub alerts: AlertLog,
     pub alerts_cursor: Cursor<String>,
     pub alert_scroll: u16,
+
+    pub logs: LogView,
+    /// Rows the log viewport had at the last draw; paging uses it.
+    pub logs_rows: usize,
+    pub threads: ThreadsView,
+    /// Lines the thread view rendered at the last draw; scroll bound.
+    pub threads_lines: usize,
+    /// Where Esc from the logs / threads view goes back to.
+    pub return_view: View,
 }
 
 impl App {
@@ -214,6 +239,11 @@ impl App {
             alerts: AlertLog::default(),
             alerts_cursor: Cursor::new(),
             alert_scroll: 0,
+            logs: LogView::default(),
+            logs_rows: 20,
+            threads: ThreadsView::default(),
+            threads_lines: 0,
+            return_view: View::Main,
         }
     }
 
@@ -316,6 +346,8 @@ impl App {
             self.sql = Cursor::new();
             self.alerts.clear();
             self.alerts_cursor = Cursor::new();
+            self.logs.close();
+            self.threads = ThreadsView::default();
             self.close_detail();
         }
         self.watching = Some(id);
@@ -386,6 +418,169 @@ impl App {
     pub fn open_alert_stage(&mut self) -> Option<Detail> {
         let (id, attempt) = self.selected_alert()?.stage?;
         Some(self.open_stage(id, attempt, true))
+    }
+
+    // ------------------------------------------------------- logs & threads
+
+    fn executor(&self, id: &str) -> Option<&crate::spark::ExecutorSummary> {
+        self.snapshot.as_ref()?.executors.iter().find(|e| e.id == id)
+    }
+
+    /// Open the log viewer on an executor. Returns the target to stream.
+    pub fn open_logs(&mut self, executor_id: String, filter: Option<String>) -> LogTarget {
+        let exec = self.executor(&executor_id);
+        let target = LogTarget {
+            // A dead executor's container has restarted or gone; on k8s the
+            // previous container is the one with the reason.
+            previous: exec.is_some_and(|e| !e.is_active),
+            stream: Stream::Stderr,
+            http_url: exec.and_then(|e| e.log_url("stderr")),
+            executor_id,
+        };
+        if !matches!(self.view, View::Logs | View::Threads) {
+            self.return_view = self.view;
+        }
+        self.logs.open(target.clone(), filter);
+        self.view = View::Logs;
+        target
+    }
+
+    /// `L` on the Executors tab.
+    pub fn open_logs_selected_executor(&mut self) -> Option<LogTarget> {
+        let id = self.snapshot.as_ref()?.executors.get(self.executors.selected())?.id.clone();
+        Some(self.open_logs(id, None))
+    }
+
+    /// `L` on a task in the stage drill-down: that executor's logs, filtered
+    /// to the error when the task failed.
+    pub fn open_logs_selected_task(&mut self) -> Option<LogTarget> {
+        let t = self.visible_tasks().get(self.tasks.selected())?;
+        let id = t.executor_id.clone();
+        let filter = t.error_message.as_deref().and_then(filter_from_error);
+        Some(self.open_logs(id, filter))
+    }
+
+    /// `L` on an alert: the executor it concerns.
+    pub fn open_logs_selected_alert(&mut self) -> Option<LogTarget> {
+        let a = self.selected_alert()?;
+        let id = a.executor_id.clone()?;
+        let filter = if a.kind == Kind::Task {
+            a.detail.as_deref().and_then(filter_from_error)
+        } else {
+            None
+        };
+        Some(self.open_logs(id, filter))
+    }
+
+    /// Re-open the same executor with `previous` flipped (`P`).
+    pub fn logs_toggle_previous(&mut self) -> Option<LogTarget> {
+        let mut t = self.logs.target.clone()?;
+        t.previous = !t.previous;
+        let filter = self.logs.filter.clone();
+        self.logs.open(t.clone(), filter);
+        Some(t)
+    }
+
+    /// Re-open on the other stream (`o`, HTTP sources).
+    pub fn logs_toggle_stream(&mut self) -> Option<LogTarget> {
+        let mut t = self.logs.target.clone()?;
+        t.stream = t.stream.other();
+        t.http_url = self.executor(&t.executor_id).and_then(|e| e.log_url(t.stream.name()));
+        let filter = self.logs.filter.clone();
+        self.logs.open(t.clone(), filter);
+        Some(t)
+    }
+
+    pub fn close_logs(&mut self) {
+        self.logs.close();
+        self.view = self.return_view;
+    }
+
+    pub fn apply_log(&mut self, event: LogEvent) {
+        if !self.logs.is_open() {
+            return;
+        }
+        match event {
+            LogEvent::Lines(l) => self.logs.append(l),
+            LogEvent::Replace(l) => self.logs.replace(l),
+            LogEvent::Status(s) => self.logs.status = Some(s),
+        }
+    }
+
+    /// Open the thread dump view. Returns the executor to fetch.
+    pub fn open_threads(&mut self, executor_id: String) -> String {
+        if !matches!(self.view, View::Logs | View::Threads) {
+            self.return_view = self.view;
+        }
+        self.threads = ThreadsView {
+            executor_id: executor_id.clone(),
+            ..Default::default()
+        };
+        self.view = View::Threads;
+        executor_id
+    }
+
+    pub fn open_threads_selected_executor(&mut self) -> Option<String> {
+        let id = self.snapshot.as_ref()?.executors.get(self.executors.selected())?.id.clone();
+        Some(self.open_threads(id))
+    }
+
+    pub fn close_threads(&mut self) {
+        self.threads = ThreadsView::default();
+        self.view = self.return_view;
+    }
+
+    pub fn apply_threads(&mut self, executor_id: &str, result: Result<Option<Vec<ThreadStackTrace>>, String>) {
+        if self.view != View::Threads || self.threads.executor_id != executor_id {
+            return;
+        }
+        match result {
+            Ok(Some(t)) => {
+                self.threads.threads = Some(t);
+                self.threads.error = None;
+            }
+            Ok(None) => {
+                self.threads.error = Some(
+                    "no thread dump served for this executor (History Server, or the executor is gone)".into(),
+                );
+            }
+            Err(e) => self.threads.error = Some(e),
+        }
+    }
+
+    /// Text input for the `/` filter in the logs or threads view. Returns
+    /// true if the key was consumed as text.
+    pub fn filter_input_key(&mut self, key: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode::*;
+        match self.view {
+            View::Logs if self.logs.filter_input.is_some() => {
+                match key {
+                    Char(c) => self.logs.filter_push(c),
+                    Backspace => self.logs.filter_pop(),
+                    Enter => self.logs.filter_commit(),
+                    Esc => self.logs.filter_cancel(),
+                    _ => {}
+                }
+                true
+            }
+            View::Threads if self.threads.filter_input.is_some() => {
+                match key {
+                    Char(c) => self.threads.filter_input.as_mut().unwrap().push(c),
+                    Backspace => {
+                        self.threads.filter_input.as_mut().unwrap().pop();
+                    }
+                    Enter => {
+                        let f = self.threads.filter_input.take().unwrap().trim().to_lowercase();
+                        self.threads.filter = if f.is_empty() { None } else { Some(f) };
+                        self.threads.scroll = 0;
+                    }
+                    Esc => self.threads.filter_input = None,
+                    _ => {}
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn alert_scroll_max(&self) -> u16 {
@@ -521,6 +716,8 @@ impl App {
             View::Stage => self.visible_tasks().len(),
             View::Sql => self.sql_scroll_max() as usize + 1,
             View::Alert => self.alert_scroll_max() as usize + 1,
+            View::Logs => self.logs.visible().len(),
+            View::Threads => self.threads_lines,
             View::Main => {
                 if self.tab == Tab::Failures {
                     return self.alerts.len();
@@ -546,6 +743,8 @@ impl App {
                 Pane::Nodes => self.nodes_scroll as usize,
             },
             View::Alert => self.alert_scroll as usize,
+            View::Logs => self.logs.scroll,
+            View::Threads => self.threads.scroll as usize,
             View::Main => match self.tab {
                 Tab::Jobs => self.jobs.selected(),
                 Tab::Stages => self.stages.selected(),
@@ -570,6 +769,16 @@ impl App {
             }
             View::Alert => {
                 self.alert_scroll = index.min(self.alert_scroll_max() as usize) as u16;
+            }
+            View::Logs => {
+                if index == 0 {
+                    self.logs.scroll_to_start();
+                } else {
+                    self.logs.scroll_to_end();
+                }
+            }
+            View::Threads => {
+                self.threads.scroll = index.min(self.threads_lines.saturating_sub(1)) as u16;
             }
             View::Stage => {
                 let Self {
@@ -620,6 +829,14 @@ impl App {
         if self.view == View::Alert {
             let max = self.alert_scroll_max() as isize;
             self.alert_scroll = (self.alert_scroll as isize + delta).clamp(0, max) as u16;
+            return;
+        }
+        if self.view == View::Logs {
+            return self.logs.scroll_by(delta, self.logs_rows.max(1));
+        }
+        if self.view == View::Threads {
+            let max = self.threads_lines.saturating_sub(1) as isize;
+            self.threads.scroll = (self.threads.scroll as isize + delta).clamp(0, max) as u16;
             return;
         }
         let len = self.current_len();
@@ -780,6 +997,48 @@ mod tests {
         assert!(app.show_failed);
         app.alerts.acknowledge();
         assert_eq!(app.alerts.unacked(), 0);
+    }
+
+    #[test]
+    fn logs_open_from_failed_task_with_error_filter_and_return() {
+        let mut app = watched_app();
+        app.apply_snapshot(
+            "a",
+            Ok(Snapshot {
+                executors: vec![crate::spark::ExecutorSummary {
+                    id: "2".into(),
+                    is_active: false,
+                    ..Default::default()
+                }],
+                stages: vec![stage(9, "ACTIVE")],
+                ..Default::default()
+            }),
+        );
+        app.tab = Tab::Stages;
+        let target = app.open_stage_detail().unwrap();
+        app.apply_detail(
+            target,
+            Ok(DetailData::Stage(StageDetail {
+                failed: vec![TaskData {
+                    task_id: 4050,
+                    executor_id: "2".into(),
+                    error_message: Some("ExecutorLostFailure (executor 2 exited)".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        );
+        app.toggle_failed_tasks();
+        let lt = app.open_logs_selected_task().unwrap();
+        assert_eq!(lt.executor_id, "2");
+        assert!(lt.previous, "dead executor → previous container");
+        assert_eq!(app.logs.filter.as_deref(), Some("executorlostfailure"));
+        assert_eq!(app.view, View::Logs);
+
+        app.apply_log(LogEvent::Lines(vec!["INFO ok".into(), "ERROR ExecutorLostFailure boom".into()]));
+        assert_eq!(app.logs.visible(), ["ERROR ExecutorLostFailure boom"]);
+        app.close_logs();
+        assert_eq!(app.view, View::Stage, "Esc returns to where L was pressed");
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! or a request wakes it early.
 
 use crate::k8s::{self, PortForward};
-use crate::spark::{ApplicationInfo, Snapshot, SparkClient, StageDetail};
+use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail};
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,6 +35,7 @@ pub enum Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     Stage { id: i64, attempt: i64 },
+    Sql(i64),
 }
 
 /// Poller → UI.
@@ -55,6 +57,52 @@ pub enum Message {
 #[derive(Debug)]
 pub enum DetailData {
     Stage(StageDetail),
+    /// `None`: the driver no longer retains this execution.
+    Sql(Option<ExecutionData>),
+}
+
+/// SQL executions seen so far for the watched app. `sql_tail` only fetches
+/// what is new or recent; this holds the rest so the tab shows a stable list.
+#[derive(Default)]
+struct SqlCache {
+    by_id: BTreeMap<i64, ExecutionData>,
+    /// `None` until the first fetch; `Some(false)` when there is no `/sql`.
+    available: Option<bool>,
+}
+
+/// More than this and the tab is a scroll of ancient micro-batches anyway.
+const SQL_KEEP: usize = 500;
+
+impl SqlCache {
+    fn max_id(&self) -> Option<i64> {
+        self.by_id.keys().next_back().copied()
+    }
+
+    fn merge(&mut self, tail: Option<Vec<ExecutionData>>) {
+        match tail {
+            None => {
+                self.available = Some(false);
+                self.by_id.clear();
+            }
+            Some(execs) => {
+                self.available = Some(true);
+                for e in execs {
+                    self.by_id.insert(e.id, e);
+                }
+                while self.by_id.len() > SQL_KEEP {
+                    self.by_id.pop_first();
+                }
+            }
+        }
+    }
+
+    /// Newest first, or `None` when the endpoint has no `/sql`.
+    fn view(&self) -> Option<Vec<ExecutionData>> {
+        match self.available {
+            Some(true) => Some(self.by_id.values().rev().cloned().collect()),
+            _ => None,
+        }
+    }
 }
 
 /// Where applications come from and how to reach one.
@@ -162,11 +210,12 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
         let mut period = interval;
         let mut watch = watch;
         let mut detail: Option<Detail> = None;
+        let mut sql = SqlCache::default();
 
         loop {
             match &watch {
                 Some(key) => {
-                    let msgs = fetch(&mut source, key, detail).await;
+                    let msgs = fetch(&mut source, key, detail, &mut sql).await;
                     for msg in msgs {
                         if msg_tx.send(msg).await.is_err() {
                             return; // UI is gone
@@ -191,11 +240,11 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
                 _ = tokio::time::sleep(sleep_for) => {}
                 first = req_rx.recv() => {
                     let Some(first) = first else { break };
-                    let mut stop = apply(first, &mut source, &mut period, &mut watch, &mut detail);
+                    let mut stop = apply(first, &mut source, &mut period, &mut watch, &mut detail, &mut sql);
                     // Requests often arrive in bursts (interval change + refresh);
                     // apply them all before the next fetch.
                     while let Ok(more) = req_rx.try_recv() {
-                        stop |= apply(more, &mut source, &mut period, &mut watch, &mut detail);
+                        stop |= apply(more, &mut source, &mut period, &mut watch, &mut detail, &mut sql);
                     }
                     if stop {
                         break;
@@ -215,7 +264,7 @@ pub fn spawn(mut source: Source, watch: Option<String>, interval: Duration) -> H
 
 /// One cycle for a watched app: the snapshot, plus the open detail view if
 /// any, fetched concurrently.
-async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>) -> Vec<Message> {
+async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, sql: &mut SqlCache) -> Vec<Message> {
     let err = |e: anyhow::Error| format!("{e:#}");
     let (client, spark_id) = match source.resolve(key).await {
         Ok(c) => c,
@@ -229,6 +278,7 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>) -> Vec<Me
     };
 
     let snapshot = client.poll(&spark_id);
+    let sql_tail = client.sql_tail(&spark_id, sql.max_id());
     let detail_fut = async {
         match detail {
             Some(d @ Detail::Stage { id, attempt }) => Some((
@@ -239,14 +289,27 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>) -> Vec<Me
                     .map(DetailData::Stage)
                     .map_err(err),
             )),
+            Some(d @ Detail::Sql(id)) => Some((
+                d,
+                client.sql_detail(&spark_id, id).await.map(DetailData::Sql).map_err(err),
+            )),
             None => None,
         }
     };
-    let (snapshot, detail) = tokio::join!(snapshot, detail_fut);
+    let (snapshot, sql_tail, detail) = tokio::join!(snapshot, sql_tail, detail_fut);
 
     if snapshot.is_err() {
         source.poll_failed();
     }
+    // A failed SQL fetch keeps the cached list rather than failing the whole
+    // snapshot: jobs/stages/executors are still good and more important.
+    if let Ok(tail) = sql_tail {
+        sql.merge(tail);
+    }
+    let snapshot = snapshot.map(|mut s| {
+        s.sql = sql.view();
+        s
+    });
     let mut msgs = vec![Message::Snapshot {
         app_id: key.to_string(),
         result: snapshot.map_err(err),
@@ -264,6 +327,7 @@ fn apply(
     period: &mut Duration,
     watch: &mut Option<String>,
     detail: &mut Option<Detail>,
+    sql: &mut SqlCache,
 ) -> bool {
     match req {
         Request::SetInterval(d) => *period = d,
@@ -271,12 +335,14 @@ fn apply(
         Request::WatchApp(id) => {
             if watch.as_deref() != Some(id.as_str()) {
                 *detail = None;
+                *sql = SqlCache::default();
             }
             *watch = Some(id);
         }
         Request::ListApps => {
             *watch = None;
             *detail = None;
+            *sql = SqlCache::default();
             source.unwatch();
         }
         Request::SetDetail(d) => *detail = d,

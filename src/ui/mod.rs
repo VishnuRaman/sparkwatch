@@ -3,6 +3,7 @@
 
 mod overview;
 mod picker;
+pub mod sql_detail;
 mod stage_detail;
 mod tables;
 
@@ -69,7 +70,7 @@ pub fn short_time(ts: &Option<String>) -> String {
 pub fn status_style(status: &str) -> Style {
     match status {
         "RUNNING" | "ACTIVE" => Style::default().fg(Color::Yellow),
-        "SUCCEEDED" | "COMPLETE" => Style::default().fg(Color::Green),
+        "SUCCEEDED" | "COMPLETE" | "COMPLETED" | "SUCCESS" => Style::default().fg(Color::Green),
         "FAILED" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         "PENDING" => Style::default().fg(Color::Blue),
         "SKIPPED" => Style::default().fg(Color::DarkGray),
@@ -131,10 +132,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         stages,
         stage_filter,
         executors,
+        sql,
         stage_detail,
         detail_error,
         tasks,
         show_failed,
+        sql_detail: sql_exec,
+        plan_scroll,
+        nodes_scroll,
+        sql_focus,
+        plan_only,
         ..
     } = app;
 
@@ -159,6 +166,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     tasks: rows,
                     show_failed: *show_failed,
                     tasks_state: &mut tasks.state,
+                },
+            );
+            return;
+        }
+        View::Sql => {
+            sql_detail::draw(
+                f,
+                body,
+                sql_detail::Props {
+                    exec: sql_exec.as_ref(),
+                    error: detail_error.as_deref(),
+                    plan_scroll: *plan_scroll,
+                    nodes_scroll: *nodes_scroll,
+                    focus: *sql_focus,
+                    plan_only: *plan_only,
                 },
             );
             return;
@@ -191,6 +213,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             tables::draw_stages(f, body, &visible, title, &mut stages.state)
         }
         Tab::Executors => tables::draw_executors(f, body, snap, &mut executors.state),
+        Tab::Sql => tables::draw_sql(f, body, snap.sql.as_deref(), &mut sql.state),
     }
 }
 
@@ -210,14 +233,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let what = match (&app.view, &app.snapshot) {
         (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
-        (View::Main | View::Stage, Some(s)) => format!(
+        (View::Main | View::Stage | View::Sql, Some(s)) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
             s.app.name,
             s.app.id,
             app.endpoint,
             app.interval.as_secs()
         ),
-        (View::Main | View::Stage, None) => format!(
+        (View::Main | View::Stage | View::Sql, None) => format!(
             "[{}] @ {} · every {}s · updated {age}",
             app.watching.as_deref().unwrap_or("—"),
             app.endpoint,
@@ -259,9 +282,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             " q quit · tab/←→ switch · j/k move · Enter open · a apps · r refresh · p pause · +/- interval "
         }
         View::Stage => " Esc back · j/k tasks · f failed/slowest · r refresh · p pause · q quit ",
+        View::Sql => " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit ",
     };
     let error = match app.view {
-        View::Stage => app.detail_error.as_ref().or(app.last_error.as_ref()),
+        View::Stage | View::Sql => app.detail_error.as_ref().or(app.last_error.as_ref()),
         _ => app.last_error.as_ref(),
     };
     let text = match error {

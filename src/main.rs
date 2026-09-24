@@ -184,6 +184,15 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             KeyCode::Char('p') => app.paused = !app.paused,
             _ => {}
         },
+        View::Sql => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.close_detail();
+                send(req_tx, Request::SetDetail(None)).await;
+            }
+            KeyCode::Tab | KeyCode::BackTab => app.toggle_sql_focus(),
+            KeyCode::Char('p') => app.toggle_plan_only(),
+            _ => {}
+        },
         View::Main => match key.code {
             // Esc peels back one layer: a stage filter first, then the app.
             KeyCode::Esc => {
@@ -198,12 +207,18 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                         send(req_tx, Request::RefreshNow).await;
                     }
                 }
+                app::Tab::Sql => {
+                    if let Some(target) = app.open_sql_detail() {
+                        send(req_tx, Request::SetDetail(Some(target))).await;
+                        send(req_tx, Request::RefreshNow).await;
+                    }
+                }
                 app::Tab::Jobs => app.filter_stages_by_selected_job(),
                 _ => {}
             },
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
-            KeyCode::Char(c @ '1'..='4') => {
+            KeyCode::Char(c @ '1'..='5') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
             }
             KeyCode::Char('a') => {

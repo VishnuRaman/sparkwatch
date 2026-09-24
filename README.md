@@ -75,12 +75,13 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`4` | Jump to Overview / Jobs / Stages / Executors |
+| `1`–`5` | Jump to Overview / Jobs / Stages / Executors / SQL |
 | `j` `k` `↓` `↑` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
 | `g` `G` `Home` `End` | First / last row |
-| `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down |
+| `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down · SQL: open the query's plan |
 | `f` | Stage drill-down: switch between slowest and failed tasks |
+| `Tab` / `p` | SQL drill-down: switch scrolling between plan and nodes / plan-only view |
 | `a` | Open the application picker |
 | `Esc` | Back: closes the drill-down, then the job filter, then the picker |
 | `r` | Refresh now |
@@ -98,6 +99,10 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
   spill (highlighted), progress.
 - **Executors** — up/dead, host, running tasks vs cores, failed tasks, storage
   memory, GC share, shuffle read.
+- **SQL** — one row per Spark SQL execution (a query, or a micro-batch of a
+  streaming query), newest first: status, query text / call site, submitted,
+  duration, job counts (`▶` running `✓` succeeded `✗` failed), error. On an app
+  without `/sql` (RDD-only, or Spark < 3.0) the tab says so instead of erroring.
 
 The header shows `LIVE`, `PAUSED` or `ERROR`; on an error the last good data
 stays on screen and the message appears in the footer.
@@ -123,6 +128,25 @@ else, so it is fine to leave open on a running stage.
   its failures directly.
 
 `Enter` on a job narrows the Stages tab to that job's stages; `Esc` clears it.
+
+## SQL drill-down
+
+`Enter` on a SQL execution opens it: status, submission time, duration, the
+job ids it ran (running / succeeded / failed) and the error if it failed.
+Below, side by side (stacked on a narrow terminal):
+
+- **Physical plan** — the `planDescription` Spark reports, operators
+  highlighted, scrollable with `j`/`k`/`PgUp`/`PgDn`/`g`/`G`. `p` gives it the
+  whole screen.
+- **Nodes** — every plan node with its three most telling metrics (output
+  rows, spill, peak memory, time, bytes…), spill in magenta when non-zero.
+  `Tab` moves scrolling focus between the two panes.
+
+The list is fetched incrementally: Spark's `/sql` endpoint is oldest-first
+with no sort, and a streaming app retains up to 1000 micro-batches, so
+sparkwatch asks only for what is new or recent each poll and keeps the last
+500 in memory. A query evicted by the driver since you listed it says so when
+opened.
 
 ## Development
 

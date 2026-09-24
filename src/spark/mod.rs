@@ -91,6 +91,7 @@ impl SparkClient {
             jobs,
             stages,
             executors,
+            sql: None, // filled in by the poller from its SQL cache
         })
     }
 
@@ -119,6 +120,68 @@ impl SparkClient {
         })
     }
 }
+
+/// The `/sql` list is oldest-first, has no sort parameter, and a streaming
+/// app retains up to 1000 micro-batches with multi-KB descriptions — so we
+/// never fetch it whole on every poll. Instead:
+///
+/// * execution ids are dense and the list is id-ordered, so `index = id -
+///   min_id` where `min_id` is the first retained execution (one tiny GET);
+/// * `after` is the highest id already known: fetch from a little before it,
+///   which refreshes the status of recent executions and picks up new ones.
+///
+/// The first call (`after == None`) pages through everything once.
+impl SparkClient {
+    /// `Ok(None)` when the endpoint has no `/sql` at all.
+    pub async fn sql_tail(&self, app_id: &str, after: Option<i64>) -> Result<Option<Vec<ExecutionData>>> {
+        let list = |offset: usize, length: usize| {
+            let path = format!(
+                "/applications/{app_id}/sql?details=false&planDescription=false&offset={offset}&length={length}"
+            );
+            async move { self.get_opt::<Vec<ExecutionData>>(&path).await }
+        };
+
+        let Some(first) = list(0, 1).await? else {
+            return Ok(None);
+        };
+        let Some(min_id) = first.first().map(|e| e.id) else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let mut out = Vec::new();
+        let mut offset = match after {
+            Some(max) => (max - min_id + 1 - SQL_REFRESH_WINDOW as i64).max(0) as usize,
+            None => 0,
+        };
+        // Bounded: the driver retains at most spark.sql.ui.retainedExecutions
+        // (default 1000), so this is a handful of pages at worst, once.
+        for _ in 0..SQL_MAX_PAGES {
+            let page = list(offset, SQL_PAGE).await?.unwrap_or_default();
+            let n = page.len();
+            out.extend(page);
+            if n < SQL_PAGE {
+                break;
+            }
+            offset += n;
+        }
+        Ok(Some(out))
+    }
+
+    /// Full execution with plan and node metrics. `None` if it has been
+    /// evicted from the driver's retained set since we listed it.
+    pub async fn sql_detail(&self, app_id: &str, id: i64) -> Result<Option<ExecutionData>> {
+        self.get_opt(&format!(
+            "/applications/{app_id}/sql/{id}?details=true&planDescription=true"
+        ))
+        .await
+    }
+}
+
+/// How many already-known executions to re-fetch each poll so their status
+/// (RUNNING → COMPLETED/FAILED) stays current.
+const SQL_REFRESH_WINDOW: usize = 100;
+const SQL_PAGE: usize = 500;
+const SQL_MAX_PAGES: usize = 10;
 
 /// p5 … p95 for the distribution table, plus 1.0 so we also get the max.
 pub const SUMMARY_QUANTILES: &str = "0.05,0.25,0.5,0.75,0.95,1.0";

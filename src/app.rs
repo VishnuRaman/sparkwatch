@@ -1,5 +1,6 @@
 use crate::poller::{Detail, DetailData};
-use crate::spark::{ApplicationInfo, Snapshot, StageData, StageDetail, TaskData};
+use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData};
+use crate::ui::sql_detail::Pane;
 use ratatui::widgets::TableState;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -10,10 +11,11 @@ pub enum Tab {
     Jobs,
     Stages,
     Executors,
+    Sql,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Jobs, Tab::Stages, Tab::Executors];
+    pub const ALL: [Tab; 5] = [Tab::Overview, Tab::Jobs, Tab::Stages, Tab::Executors, Tab::Sql];
 
     pub fn title(&self) -> &'static str {
         match self {
@@ -21,6 +23,7 @@ impl Tab {
             Tab::Jobs => "Jobs",
             Tab::Stages => "Stages",
             Tab::Executors => "Executors",
+            Tab::Sql => "SQL",
         }
     }
 
@@ -46,6 +49,8 @@ pub enum View {
     Main,
     /// Drill-down into one stage.
     Stage,
+    /// Drill-down into one SQL execution.
+    Sql,
 }
 
 /// A table cursor that survives the rows being re-sorted underneath it.
@@ -141,14 +146,22 @@ pub struct App {
     pub stages: Cursor<(i64, i64)>,
     pub stage_filter: Option<StageFilter>,
     pub executors: Cursor<String>,
+    pub sql: Cursor<i64>,
 
     /// The drill-down that is open (and being refreshed by the poller).
     pub detail_target: Option<Detail>,
-    pub stage_detail: Option<StageDetail>,
     pub detail_error: Option<String>,
+
+    pub stage_detail: Option<StageDetail>,
     pub tasks: Cursor<i64>,
     /// Task table shows failed tasks instead of the slowest ones.
     pub show_failed: bool,
+
+    pub sql_detail: Option<ExecutionData>,
+    pub plan_scroll: u16,
+    pub nodes_scroll: u16,
+    pub sql_focus: Pane,
+    pub plan_only: bool,
 }
 
 impl App {
@@ -171,11 +184,17 @@ impl App {
             stages: Cursor::new(),
             stage_filter: None,
             executors: Cursor::new(),
+            sql: Cursor::new(),
             detail_target: None,
-            stage_detail: None,
             detail_error: None,
+            stage_detail: None,
             tasks: Cursor::new(),
             show_failed: false,
+            sql_detail: None,
+            plan_scroll: 0,
+            nodes_scroll: 0,
+            sql_focus: Pane::Plan,
+            plan_only: false,
         }
     }
 
@@ -215,6 +234,7 @@ impl App {
                 self.stages
                     .resync(&visible_stages(&s, &self.stage_filter), |st| st.key());
                 self.executors.resync(&s.executors, |e| e.id.clone());
+                self.sql.resync(s.sql.as_deref().unwrap_or(&[]), |e| e.id);
                 self.record_sample(&s);
                 self.snapshot = Some(s);
                 self.last_error = None;
@@ -235,6 +255,13 @@ impl App {
                 self.stage_detail = Some(d);
                 self.detail_error = None;
                 self.resync_tasks();
+            }
+            Ok(DetailData::Sql(Some(e))) => {
+                self.sql_detail = Some(e);
+                self.detail_error = None;
+            }
+            Ok(DetailData::Sql(None)) => {
+                self.detail_error = Some("this execution is no longer retained by the driver".into());
             }
             Err(e) => self.detail_error = Some(e),
         }
@@ -264,6 +291,7 @@ impl App {
             self.stages = Cursor::new();
             self.stage_filter = None;
             self.executors = Cursor::new();
+            self.sql = Cursor::new();
             self.close_detail();
         }
         self.watching = Some(id);
@@ -309,11 +337,65 @@ impl App {
         Some(target)
     }
 
+    /// The SQL execution under the cursor on the SQL tab.
+    pub fn selected_sql(&self) -> Option<&ExecutionData> {
+        self.snapshot.as_ref()?.sql.as_ref()?.get(self.sql.selected())
+    }
+
+    /// Enter on the SQL tab: open the plan/metrics view for the selection.
+    pub fn open_sql_detail(&mut self) -> Option<Detail> {
+        let target = Detail::Sql(self.selected_sql()?.id);
+        if self.detail_target != Some(target) {
+            self.sql_detail = None;
+            self.detail_error = None;
+            self.plan_scroll = 0;
+            self.nodes_scroll = 0;
+            self.sql_focus = Pane::Plan;
+        }
+        self.detail_target = Some(target);
+        self.view = View::Sql;
+        Some(target)
+    }
+
+    pub fn toggle_sql_focus(&mut self) {
+        self.sql_focus = match self.sql_focus {
+            Pane::Plan => Pane::Nodes,
+            Pane::Nodes => Pane::Plan,
+        };
+    }
+
+    pub fn toggle_plan_only(&mut self) {
+        self.plan_only = !self.plan_only;
+        if self.plan_only {
+            self.sql_focus = Pane::Plan;
+        }
+    }
+
+    /// Scroll range of the focused SQL pane (last line index).
+    fn sql_scroll_max(&self) -> u16 {
+        let Some(e) = &self.sql_detail else { return 0 };
+        let lines = match self.sql_focus {
+            Pane::Plan => e.plan_description.lines().count(),
+            Pane::Nodes => e.nodes.iter().map(|n| crate::ui::sql_detail::node_lines(n).len()).sum(),
+        };
+        lines.saturating_sub(1).min(u16::MAX as usize) as u16
+    }
+
+    fn sql_scroll_by(&mut self, delta: isize) {
+        let max = self.sql_scroll_max();
+        let cur = match self.sql_focus {
+            Pane::Plan => &mut self.plan_scroll,
+            Pane::Nodes => &mut self.nodes_scroll,
+        };
+        *cur = (*cur as isize + delta).clamp(0, max as isize) as u16;
+    }
+
     pub fn close_detail(&mut self) {
         self.detail_target = None;
         self.stage_detail = None;
+        self.sql_detail = None;
         self.detail_error = None;
-        if self.view == View::Stage {
+        if matches!(self.view, View::Stage | View::Sql) {
             self.view = View::Main;
         }
     }
@@ -378,12 +460,14 @@ impl App {
         match self.view {
             View::Picker => self.apps.len(),
             View::Stage => self.visible_tasks().len(),
+            View::Sql => self.sql_scroll_max() as usize + 1,
             View::Main => {
                 let Some(s) = &self.snapshot else { return 0 };
                 match self.tab {
                     Tab::Jobs => s.jobs.len(),
                     Tab::Stages => visible_stages(s, &self.stage_filter).len(),
                     Tab::Executors => s.executors.len(),
+                    Tab::Sql => s.sql.as_ref().map_or(0, Vec::len),
                     Tab::Overview => 0,
                 }
             }
@@ -394,10 +478,15 @@ impl App {
         match self.view {
             View::Picker => self.picker.selected(),
             View::Stage => self.tasks.selected(),
+            View::Sql => match self.sql_focus {
+                Pane::Plan => self.plan_scroll as usize,
+                Pane::Nodes => self.nodes_scroll as usize,
+            },
             View::Main => match self.tab {
                 Tab::Jobs => self.jobs.selected(),
                 Tab::Stages => self.stages.selected(),
                 Tab::Executors => self.executors.selected(),
+                Tab::Sql => self.sql.selected(),
                 Tab::Overview => 0,
             },
         }
@@ -406,6 +495,14 @@ impl App {
     fn select_index(&mut self, index: usize) {
         match self.view {
             View::Picker => self.picker.select(index, &self.apps, |a| a.id.clone()),
+            View::Sql => {
+                let max = self.sql_scroll_max();
+                let v = (index.min(max as usize)) as u16;
+                match self.sql_focus {
+                    Pane::Plan => self.plan_scroll = v,
+                    Pane::Nodes => self.nodes_scroll = v,
+                }
+            }
             View::Stage => {
                 let Self {
                     stage_detail,
@@ -428,6 +525,7 @@ impl App {
                     stages,
                     stage_filter,
                     executors,
+                    sql,
                     ..
                 } = self;
                 let Some(s) = snapshot else { return };
@@ -435,6 +533,7 @@ impl App {
                     Tab::Jobs => jobs.select(index, &s.jobs, |j| j.job_id),
                     Tab::Stages => stages.select(index, &visible_stages(s, stage_filter), |st| st.key()),
                     Tab::Executors => executors.select(index, &s.executors, |e| e.id.clone()),
+                    Tab::Sql => sql.select(index, s.sql.as_deref().unwrap_or(&[]), |e| e.id),
                     Tab::Overview => {}
                 }
             }
@@ -442,6 +541,10 @@ impl App {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        // Scrolling text doesn't wrap around like a table cursor does.
+        if self.view == View::Sql {
+            return self.sql_scroll_by(delta);
+        }
         let len = self.current_len();
         if len == 0 {
             return;
@@ -572,6 +675,37 @@ mod tests {
         assert!(!app.clear_stage_filter());
         // Cursor followed stage 7 into the unfiltered list.
         assert_eq!(app.selected_stage().unwrap().stage_id, 7);
+    }
+
+    #[test]
+    fn sql_detail_scrolls_focused_pane_within_bounds() {
+        let mut app = watched_app();
+        let snap = Snapshot {
+            sql: Some(vec![ExecutionData { id: 12, ..Default::default() }]),
+            ..Default::default()
+        };
+        app.apply_snapshot("a", Ok(snap));
+        app.tab = Tab::Sql;
+        let target = app.open_sql_detail().unwrap();
+        assert_eq!(target, Detail::Sql(12));
+        assert_eq!(app.view, View::Sql);
+
+        let exec = ExecutionData {
+            id: 12,
+            plan_description: "a\nb\nc\nd".into(),
+            ..Default::default()
+        };
+        app.apply_detail(target, Ok(DetailData::Sql(Some(exec))));
+        app.move_selection(10);
+        assert_eq!(app.plan_scroll, 3); // clamped to last line
+        app.move_selection(-10);
+        assert_eq!(app.plan_scroll, 0);
+        app.select_edge(true);
+        assert_eq!(app.plan_scroll, 3);
+
+        app.apply_detail(target, Ok(DetailData::Sql(None)));
+        assert!(app.detail_error.as_deref().unwrap().contains("no longer retained"));
+        assert!(app.sql_detail.is_some()); // last good data stays
     }
 
     #[test]

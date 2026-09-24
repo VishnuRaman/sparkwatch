@@ -73,12 +73,14 @@ Added because the real deployment is Spark Operator on Kubernetes, where "run `k
     - Bottom: slowest tasks table (task, index, executor, duration, GC, shuffle r, spill, status) with stragglers in yellow; `f` toggles to the failed-tasks list showing `errorMessage` first line. `j/k` scroll this table.
 - Enter on the **Jobs** tab jumps to the Stages tab with the job's `stage_ids` filtered (small: `App.stage_filter: Option<Vec<i64>>`, cleared with `Esc`). Cheap and makes the jobs table useful.
 
-## Phase 3 — SQL tab ⬜
+## Phase 3 — SQL tab ✅ done
 
 - Types: `ExecutionData`, `SqlNode`, `SqlMetric` (`metrics: Vec<{name, value: String}>` — values are pre-formatted strings from Spark).
 - Client: `sql_list(offset, length)` (`details=false&planDescription=false`; 404 → empty list and a `sql_available: bool` flag so the tab shows "no SQL executions / not a SQL app" instead of an error); `sql_detail(id)`. `sql_list` is part of the periodic snapshot; `sql_detail` is a `Focus::Sql(id)` detail fetch.
 - `Tab::Sql` added to `Tab::ALL` (key `5`). Table: id, status (RUNNING/COMPLETED/FAILED styled via existing `status_style`), description (truncated), submitted, duration, jobs (`✓n ✗n ▶n`), error (first line, red).
 - Detail (`src/ui/sql_detail.rs`, `Enter`/`Esc`): header (description, status, duration, job ids, `errorMessage`); body split: left = scrollable `planDescription` `Paragraph` (`j/k`, `PgUp/PgDn`); right = node list (`nodeName` + up to 3 most useful metrics: prefer names containing `output rows`, `spill`, `peak memory`, `time`, `bytes`). `p` toggles plan-only fullscreen.
+
+*As built — the list fetch is not "part of the snapshot" as planned:* `/sql` is oldest-first, has no sort parameter, defaults to 20 rows, and a streaming app retains up to `spark.sql.ui.retainedExecutions` (1000) micro-batches with multi-KB descriptions, so fetching it whole every 2 s over a port-forward is not on. `SparkClient::sql_tail(app, after)` uses two facts — execution ids are dense and the list is id-ordered — so `index = id − min_id`, where `min_id` comes from one `offset=0&length=1` GET. It then fetches from `after − 100` (refreshing recent statuses and picking up new executions); the first call pages through everything once (bounded by 10 × 500). The poller holds a `SqlCache` (`BTreeMap<id, ExecutionData>`, last 500, reset on app switch) and fills `Snapshot.sql` from it; a failed SQL fetch keeps the cached list rather than failing the whole snapshot. `sql_detail(id)` is a `Detail::Sql(id)` fetch, `None` (404) → "no longer retained by the driver" while the last good plan stays on screen. `Tab` switches which pane `j/k` scroll; `Esc` closes.
 
 ## Phase 4 — failures surfaced ⬜
 

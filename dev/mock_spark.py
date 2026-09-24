@@ -2,6 +2,7 @@
 
     python3 dev/mock_spark.py &          # two apps -> picker
     python3 dev/mock_spark.py --single & # one app  -> straight to the monitor
+    python3 dev/mock_spark.py --no-sql & # no /sql endpoint (non-SQL app / old Spark)
     cargo run
 """
 import json
@@ -103,6 +104,62 @@ TASKS = {
     4: {"slowest": [task(400 + i, i, "2", "10.0.1.10", 1000 + i * 10) for i in range(5)],
         "failed": [task(412, 3, "2", "10.0.1.10", None, "FAILED", attempt=a, errorMessage=OOM) for a in range(4)]},
 }
+PLAN = """*(3) HashAggregate(keys=[customer_id#12L], functions=[sum(amount#15)])
++- Exchange hashpartitioning(customer_id#12L, 200), ENSURE_REQUIREMENTS, [plan_id=88]
+   +- *(2) HashAggregate(keys=[customer_id#12L], functions=[partial_sum(amount#15)])
+      +- *(2) Project [customer_id#12L, amount#15]
+         +- *(2) BroadcastHashJoin [customer_id#12L], [id#40L], Inner, BuildRight, false
+            :- *(2) Filter isnotnull(customer_id#12L)
+            :  +- *(2) ColumnarToRow
+            :     +- FileScan parquet events[customer_id#12L,amount#15] Batched: true, DataFilters: [isnotnull(customer_id#12L)], Format: Parquet, Location: InMemoryFileIndex(1 paths)[s3://bucket/events/dt=2026-09-23], PartitionFilters: [], PushedFilters: [IsNotNull(customer_id)], ReadSchema: struct<customer_id:bigint,amount:double>
+            +- BroadcastExchange HashedRelationBroadcastMode(List(input[0, bigint, false]),false), [plan_id=84]
+               +- *(1) Filter isnotnull(id#40L)
+                  +- *(1) ColumnarToRow
+                     +- FileScan parquet customers[id#40L] Batched: true, Format: Parquet, Location: InMemoryFileIndex(1 paths)[s3://bucket/customers]"""
+
+
+def node(nid, name, codegen, **metrics):
+    return {"nodeId": nid, "nodeName": name, "wholeStageCodegenId": codegen,
+            "metrics": [{"name": k.replace("_", " "), "value": v} for k, v in metrics.items()]}
+
+
+SQL_NODES = [
+    node(0, "HashAggregate", 3, number_of_output_rows="1,204", spill_size="0.0 B", peak_memory="16.0 MiB",
+         time_in_aggregation_build="2.1 s"),
+    node(1, "Exchange", None, number_of_partitions="200", shuffle_bytes_written="2.0 GiB",
+         shuffle_records_written="41,000,000", fetch_wait_time="18.3 s", spill_size="512.0 MiB"),
+    node(2, "HashAggregate", 2, number_of_output_rows="41,000,000", spill_size="512.0 MiB", peak_memory="2.0 GiB"),
+    node(3, "Project", 2),
+    node(4, "BroadcastHashJoin", 2, number_of_output_rows="98,000,000"),
+    node(5, "Filter", 2, number_of_output_rows="98,000,000"),
+    node(6, "Scan parquet events", None, number_of_output_rows="98,000,000", number_of_files_read="1,200",
+         size_of_files_read="5.0 GiB", scan_time="41.0 s"),
+    node(7, "BroadcastExchange", None, number_of_output_rows="50,000", data_size="1.2 MiB", time_to_build="0.4 s"),
+    node(8, "Scan parquet customers", None, number_of_output_rows="50,000", size_of_files_read="1.1 MiB"),
+]
+
+
+def execution(eid, status, desc, ms, running=(), ok=(), failed=(), error=None, submitted="2026-09-23T10:05:11.000GMT"):
+    e = {"id": eid, "status": status, "description": desc, "planDescription": "", "submissionTime": submitted,
+         "duration": ms, "runningJobIds": list(running), "successJobIds": list(ok), "failedJobIds": list(failed),
+         "nodes": [], "edges": []}
+    if error:
+        e["errorMessage"] = error
+    return e
+
+
+SQL_ERROR = ("org.apache.spark.SparkException: Job aborted due to stage failure: Task 3 in stage 4.0 failed 4 times\n"
+             "\tat org.apache.spark.scheduler.DAGScheduler.failJobAndIndependentStages(DAGScheduler.scala:2856)")
+SQL = [
+    execution(10, "COMPLETED", "count at Main.scala:40", 12300, ok=[2], submitted="2026-09-23T09:50:00.000GMT"),
+    execution(11, "FAILED", "collect at Main.scala:22\n== Physical Plan ==\n...", 8100, failed=[1], error=SQL_ERROR,
+              submitted="2026-09-23T09:10:00.000GMT"),
+    execution(12, "COMPLETED", "SELECT customer_id, sum(amount) FROM events e JOIN customers c ON e.customer_id = c.id GROUP BY customer_id",
+              41200, ok=[3, 4], submitted="2026-09-23T10:00:00.000GMT"),
+    execution(13, "RUNNING", "save at Writer.scala:88", 95000, running=[3], ok=[]),
+]
+SQL_ENABLED = "--no-sql" not in sys.argv
+
 EXECS = [{"id": "driver", "hostPort": "10.0.1.1:7078", "isActive": True, "totalCores": 0},
          {"id": "1", "hostPort": "10.0.1.9:7079", "isActive": True, "totalCores": 4,
           "activeTasks": 4, "failedTasks": 2, "completedTasks": 610, "totalDuration": 1820000,
@@ -136,6 +193,19 @@ class H(BaseHTTPRequestHandler):
             return STAGES
         if rest.startswith("stages/"):
             return self.stage_route(rest.split("/")[1:], query)
+        if rest == "sql" and SQL_ENABLED:
+            offset, length = int(query.get("offset", 0)), int(query.get("length", 20))
+            return [e for e in SQL[offset:offset + length]]
+        if rest.startswith("sql/") and SQL_ENABLED:
+            eid = int(rest.split("/")[1])
+            e = next((e for e in SQL if e["id"] == eid), None)
+            if e is None:
+                return None
+            e = dict(e)
+            if e["id"] in (12, 13):
+                e["planDescription"] = PLAN
+                e["nodes"] = SQL_NODES
+            return e
         if rest == "allexecutors":
             TICK["n"] += 1
             execs = json.loads(json.dumps(EXECS))

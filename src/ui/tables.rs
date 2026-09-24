@@ -3,11 +3,13 @@
 use super::{
     fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style, table_block, warn_if,
 };
-use crate::spark::{Snapshot, StageData};
+use super::fmt_millis;
+use crate::spark::{ExecutionData, Snapshot, StageData};
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Style},
-    widgets::{Cell, Row, Table, TableState},
+    text::{Line, Span},
+    widgets::{Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -153,6 +155,74 @@ pub fn draw_executors(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut Table
         "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R",
     ]))
     .block(table_block(format!(" Executors ({}) ", s.executors.len())))
+    .row_highlight_style(selected_style())
+    .highlight_symbol("▌");
+
+    f.render_stateful_widget(table, area, state);
+}
+
+pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[ExecutionData]>, state: &mut TableState) {
+    let Some(execs) = sql else {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from("  This endpoint has no /sql."),
+                Line::from(Span::styled(
+                    "  Not a Spark SQL / DataFrame application, or Spark older than 3.0.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(table_block(" SQL ".into())),
+            area,
+        );
+        return;
+    };
+
+    let rows: Vec<Row> = execs
+        .iter()
+        .map(|e| {
+            let jobs = format!(
+                "▶{} ✓{} ✗{}",
+                e.running_job_ids.len(),
+                e.success_job_ids.len(),
+                e.failed_job_ids.len()
+            );
+            let error = e
+                .error_message
+                .as_deref()
+                .and_then(|m| m.lines().next())
+                .unwrap_or("")
+                .to_string();
+            Row::new(vec![
+                Cell::from(e.id.to_string()),
+                Cell::from(e.status.clone()).style(status_style(&e.status)),
+                Cell::from(e.title().chars().take(70).collect::<String>()),
+                Cell::from(short_time(&Some(e.submission_time.clone()))),
+                Cell::from(fmt_millis(e.duration)),
+                Cell::from(jobs).style(if e.failed_job_ids.is_empty() {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Red)
+                }),
+                Cell::from(error).style(Style::default().fg(Color::Red)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Min(30),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Min(16),
+        ],
+    )
+    .header(header_row(&["ID", "STATUS", "QUERY", "SUBMITTED", "DURATION", "JOBS", "ERROR"]))
+    .block(table_block(format!(" SQL executions ({}) · Enter for plan ", execs.len())))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 

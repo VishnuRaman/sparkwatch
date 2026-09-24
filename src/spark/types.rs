@@ -318,6 +318,51 @@ pub struct ShuffleWriteMetricDistributions {
     pub write_time: Vec<f64>,
 }
 
+/// One Spark SQL execution (a query, or a micro-batch of a streaming query).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutionData {
+    pub id: i64,
+    /// RUNNING | COMPLETED | FAILED
+    pub status: String,
+    pub description: String,
+    /// The physical plan, only when asked for with `planDescription=true`.
+    pub plan_description: String,
+    pub submission_time: String,
+    pub duration: i64,
+    pub running_job_ids: Vec<i64>,
+    pub success_job_ids: Vec<i64>,
+    pub failed_job_ids: Vec<i64>,
+    /// Plan nodes with their metrics, only with `details=true`.
+    pub nodes: Vec<SqlNode>,
+    pub error_message: Option<String>,
+}
+
+impl ExecutionData {
+    /// First line of the description, which for DataFrame code is the call
+    /// site and for SQL the start of the statement.
+    pub fn title(&self) -> &str {
+        self.description.lines().next().unwrap_or("").trim()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SqlNode {
+    pub node_id: i64,
+    pub node_name: String,
+    pub whole_stage_codegen_id: Option<i64>,
+    pub metrics: Vec<SqlMetric>,
+}
+
+/// Values arrive pre-formatted by Spark ("1,234,567", "2.1 GiB", "12.3 s").
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SqlMetric {
+    pub name: String,
+    pub value: String,
+}
+
 /// Everything the stage drill-down shows, fetched together.
 #[derive(Debug, Clone, Default)]
 pub struct StageDetail {
@@ -336,6 +381,9 @@ pub struct Snapshot {
     pub jobs: Vec<JobData>,
     pub stages: Vec<StageData>,
     pub executors: Vec<ExecutorSummary>,
+    /// Newest first. `None` when the endpoint has no `/sql` (not a SQL app,
+    /// or a Spark too old to serve it).
+    pub sql: Option<Vec<ExecutionData>>,
 }
 
 #[cfg(test)]
@@ -421,6 +469,25 @@ mod tests {
         let e = &s.executor_summary["1"];
         assert_eq!(e.tasks(), 100);
         assert!(e.excluded());
+    }
+
+    #[test]
+    fn parses_sql_execution_with_nodes() {
+        let e: ExecutionData = serde_json::from_str(r#"{
+            "id":12,"status":"COMPLETED","description":"save at Writer.scala:88\n== Physical Plan ==",
+            "planDescription":"*(2) HashAggregate(keys=[k#1], functions=[count(1)])\n+- Exchange hashpartitioning(k#1, 200)",
+            "submissionTime":"2026-09-23T10:05:11.000GMT","duration":41200,
+            "runningJobIds":[],"successJobIds":[3,4],"failedJobIds":[],
+            "nodes":[{"nodeId":2,"nodeName":"HashAggregate","wholeStageCodegenId":2,
+                      "metrics":[{"name":"number of output rows","value":"1,204"},
+                                 {"name":"spill size","value":"0.0 B"}]}],
+            "edges":[{"fromId":3,"toId":2}]
+        }"#).unwrap();
+        assert_eq!(e.title(), "save at Writer.scala:88");
+        assert_eq!(e.success_job_ids, [3, 4]);
+        assert_eq!(e.nodes[0].metrics[0].value, "1,204");
+        assert_eq!(e.nodes[0].whole_stage_codegen_id, Some(2));
+        assert!(e.error_message.is_none());
     }
 
     #[test]

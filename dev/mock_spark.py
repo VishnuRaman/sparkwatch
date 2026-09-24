@@ -157,6 +157,13 @@ SQL = [
     execution(12, "COMPLETED", "SELECT customer_id, sum(amount) FROM events e JOIN customers c ON e.customer_id = c.id GROUP BY customer_id",
               41200, ok=[3, 4], submitted="2026-09-23T10:00:00.000GMT"),
     execution(13, "RUNNING", "save at Writer.scala:88", 95000, running=[3], ok=[]),
+    # Micro-batches of a streaming query: the description carries ids.
+    execution(14, "COMPLETED", "orders-agg\nid = 3b8f1e2c-0000-4000-8000-000000000001\nrunId = 9c0d2a11-0000-4000-8000-000000000002\nbatch = 4121",
+              1650, ok=[5], submitted="2026-09-25T10:08:41.000GMT"),
+    execution(15, "COMPLETED", "orders-agg\nid = 3b8f1e2c-0000-4000-8000-000000000001\nrunId = 9c0d2a11-0000-4000-8000-000000000002\nbatch = 4122",
+              1500, ok=[6], submitted="2026-09-25T10:08:42.000GMT"),
+    execution(16, "RUNNING", "orders-agg\nid = 3b8f1e2c-0000-4000-8000-000000000001\nrunId = 9c0d2a11-0000-4000-8000-000000000002\nbatch = 4124",
+              400, running=[7], submitted="2026-09-25T10:08:44.000GMT"),
 ]
 SQL_ENABLED = "--no-sql" not in sys.argv
 
@@ -201,11 +208,55 @@ THREADS = [
 ]
 
 
+PROGRESS = """26/09/25 10:00:05 INFO MicroBatchExecution: Streaming query made progress: {
+  "id" : "3b8f1e2c-0000-4000-8000-000000000001",
+  "runId" : "9c0d2a11-0000-4000-8000-000000000002",
+  "name" : "orders-agg",
+  "timestamp" : "2026-09-25T10:%(m)02d:%(s)02d.000Z",
+  "batchId" : %(batch)d,
+  "batchDuration" : %(trig)d,
+  "numInputRows" : 12400,
+  "inputRowsPerSecond" : 10300.0,
+  "processedRowsPerSecond" : %(out).1f,
+  "durationMs" : {
+    "addBatch" : %(trig)d,
+    "getBatch" : 10,
+    "queryPlanning" : 30,
+    "triggerExecution" : %(trig)d,
+    "walCommit" : 15
+  },
+  "eventTime" : {
+    "watermark" : "2026-09-25T09:56:53.000Z"
+  },
+  "stateOperators" : [ {
+    "operatorName" : "stateStoreSave",
+    "numRowsTotal" : 1500000,
+    "numRowsUpdated" : 12000,
+    "memoryUsedBytes" : 209715200
+  } ],
+  "sources" : [ {
+    "description" : "KafkaV2[Subscribe[orders]]",
+    "numInputRows" : 12400,
+    "inputRowsPerSecond" : 10300.0,
+    "processedRowsPerSecond" : %(out).1f
+  } ],
+  "sink" : {
+    "description" : "DeltaSink[s3://bucket/orders_agg]",
+    "numOutputRows" : 3100
+  }
+}"""
+
+
 def log_page(eid, stream):
     lines = ["26/09/24 10:05:%02d %s Executor: %s line %d on executor %s" % (i, "ERROR" if i == 5 else "INFO",
              stream, i, eid) for i in range(40)]
     if stream == "stderr":
         lines[5] = "26/09/24 10:05:05 ERROR Executor: Exception in task 3.0: java.lang.OutOfMemoryError: Java heap space"
+    if eid == "driver" and stream == "stderr":
+        # Six micro-batches of progress; the last three fall behind.
+        for b in range(4118, 4124):
+            lines.append(PROGRESS % {"batch": b, "m": b // 60 % 60, "s": b % 60,
+                                     "trig": 1200 + (b % 5) * 150, "out": 9000.0 if b >= 4121 else 12800.0})
     body = "\n".join(lines).replace("<", "&lt;")
     return "<html><body><h1>Logs for container_%s</h1><pre>%s</pre></body></html>" % (eid, body)
 

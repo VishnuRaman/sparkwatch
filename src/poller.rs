@@ -7,6 +7,7 @@
 
 use crate::k8s::{self, LogStream, PortForward};
 use crate::logview::LogTarget;
+use crate::streaming::{Progress, ProgressParser};
 use crate::spark::{logs, ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail, ThreadStackTrace};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -32,6 +33,8 @@ pub enum Request {
     CloseLogs,
     /// One-shot thread dump.
     FetchThreads(String),
+    /// Start following the driver log for streaming progress (idempotent).
+    TapProgress,
     /// Tear down (kills any port-forward) and exit.
     Shutdown,
 }
@@ -63,6 +66,10 @@ pub enum Message {
         executor_id: String,
         result: Result<Option<Vec<ThreadStackTrace>>, String>,
     },
+    /// A micro-batch's progress from the driver log tap.
+    Progress(Progress),
+    /// What the tap is doing, or why it can't.
+    ProgressStatus(String),
 }
 
 #[derive(Debug)]
@@ -86,6 +93,8 @@ pub enum DetailData {
 #[derive(Default)]
 struct AppState {
     sql: SqlCache,
+    /// The driver's stderr `executorLogs` URL (YARN/standalone), for the tap.
+    driver_log_url: Option<String>,
     /// Failed-task count already fetched per stage attempt, so the error
     /// messages are pulled only when a stage gains new failures.
     failed_seen: HashMap<(i64, i64), i64>,
@@ -307,6 +316,7 @@ pub fn spawn(source: Source, watch: Option<String>, interval: Duration) -> Handl
             detail: None,
             state: AppState::default(),
             logs: None,
+            tap: None,
             msg_tx,
         };
 
@@ -368,12 +378,15 @@ struct Poller {
     state: AppState,
     /// The running log stream task, if a log view is open.
     logs: Option<JoinHandle<()>>,
+    /// The driver log tap feeding the Streaming tab, for the app's lifetime.
+    tap: Option<JoinHandle<()>>,
     msg_tx: mpsc::Sender<Message>,
 }
 
 impl Drop for Poller {
     fn drop(&mut self) {
         self.close_logs();
+        self.close_tap();
     }
 }
 
@@ -381,6 +394,12 @@ impl Poller {
     fn close_logs(&mut self) {
         if let Some(h) = self.logs.take() {
             h.abort(); // drops the kubectl child (kill_on_drop)
+        }
+    }
+
+    fn close_tap(&mut self) {
+        if let Some(h) = self.tap.take() {
+            h.abort();
         }
     }
 
@@ -394,6 +413,7 @@ impl Poller {
                     self.detail = None;
                     self.state = AppState::default();
                     self.close_logs();
+                    self.close_tap();
                 }
                 self.watch = Some(id);
             }
@@ -402,6 +422,7 @@ impl Poller {
                 self.detail = None;
                 self.state = AppState::default();
                 self.close_logs();
+                self.close_tap();
                 self.source.unwatch();
             }
             Request::SetDetail(d) => self.detail = d,
@@ -416,6 +437,23 @@ impl Poller {
                 }
             }
             Request::CloseLogs => self.close_logs(),
+            Request::TapProgress => {
+                if self.tap.as_ref().is_some_and(|h| !h.is_finished()) {
+                    return false; // already tapping
+                }
+                let tx = self.msg_tx.clone();
+                // The driver's log URL comes from the snapshot's `driver` row
+                // in HTTP mode; the UI passes it along in the target it built.
+                match self.source.log_source() {
+                    Ok(src) => {
+                        let driver_url = self.state.driver_log_url.clone();
+                        self.tap = Some(tokio::spawn(run_tap(src, driver_url, tx)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Message::ProgressStatus(format!("{e:#}"))).await;
+                    }
+                }
+            }
             Request::FetchThreads(executor_id) => {
                 let result = match &self.watch {
                     Some(key) => match self.source.resolve(key).await {
@@ -523,6 +561,85 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
     }
 }
 
+/// How far back the tap reads on start: enough for a few hundred batches
+/// of pretty-printed progress.
+const TAP_TAIL: usize = 10_000;
+const TAP_HTTP_REFRESH: Duration = Duration::from_secs(5);
+
+/// Follow the driver log and forward only parsed progress events.
+async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Message>) {
+    let status = |s: String| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Message::ProgressStatus(s)).await;
+        }
+    };
+    let mut parser = ProgressParser::new();
+    match src {
+        LogSource::Kube {
+            namespace,
+            driver_pod,
+            ..
+        } => {
+            let ns = namespace.as_deref();
+            let mut container: Option<&str> = None;
+            loop {
+                let mut stream = match LogStream::start(ns, &driver_pod, container, false, TAP_TAIL).await {
+                    Ok(s) => s,
+                    Err(e) => return status(format!("{e:#}")).await,
+                };
+                status(format!("following pod/{driver_pod}")).await;
+                loop {
+                    match stream.lines.next_line().await {
+                        Ok(Some(line)) => {
+                            if let Some(p) = parser.feed(&line) {
+                                if tx.send(Message::Progress(p)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let reason = stream.exit_reason().await;
+                if container.is_none() && k8s::needs_container_name(&reason) {
+                    container = Some(k8s::DRIVER_CONTAINER);
+                    continue;
+                }
+                return status(format!("driver log ended: {reason}")).await;
+            }
+        }
+        LogSource::Http(client) => {
+            let Some(url) = driver_url else {
+                return status("no driver log URL (History Server?) — batch durations from SQL executions only".into()).await;
+            };
+            let url = logs::with_tail(&url);
+            loop {
+                match client.fetch_text(&url).await {
+                    Ok(body) => {
+                        let mut n = 0;
+                        for line in logs::extract_log_text(&body).lines() {
+                            if let Some(p) = parser.feed(line) {
+                                n += 1;
+                                if tx.send(Message::Progress(p)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        status(format!(
+                            "driver stderr page · {n} progress events in the tail · refreshed every {}s",
+                            TAP_HTTP_REFRESH.as_secs()
+                        ))
+                        .await;
+                    }
+                    Err(e) => status(format!("fetch failed: {e:#}")).await,
+                }
+                tokio::time::sleep(TAP_HTTP_REFRESH).await;
+            }
+        }
+    }
+}
+
 /// Forward lines in batches until the stream ends. Returns true on a clean
 /// EOF (as opposed to the UI having gone away).
 async fn pump(stream: &mut LogStream, tx: &mpsc::Sender<Message>) -> bool {
@@ -594,6 +711,11 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &m
     let snapshot = match snapshot {
         Ok(mut s) => {
             s.sql = state.sql.view();
+            state.driver_log_url = s
+                .executors
+                .iter()
+                .find(|e| e.id == "driver")
+                .and_then(|e| e.log_url("stderr"));
             // Needs the stage list, so it runs after the snapshot, not with it.
             s.failed_tasks = fetch_failed_tasks(&client, &spark_id, &s, state).await;
             Ok(s)

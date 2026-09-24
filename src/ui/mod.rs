@@ -7,6 +7,7 @@ mod overview;
 mod picker;
 pub mod sql_detail;
 mod stage_detail;
+mod streaming;
 mod tables;
 mod threads;
 
@@ -158,6 +159,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         logs_rows,
         threads,
         threads_lines,
+        streaming: streaming_state,
+        streaming_status,
+        streaming_sel,
         ..
     } = app;
 
@@ -224,6 +228,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         failures::draw_table(f, body, alerts, &mut alerts_cursor.state);
         return;
     }
+    if *tab == Tab::Streaming {
+        streaming::draw(f, body, streaming_state, streaming_status.as_deref(), *streaming_sel);
+        return;
+    }
 
     let Some(snap) = snapshot.as_ref() else {
         let msg = Paragraph::new("Connecting to Spark…")
@@ -251,7 +259,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Tab::Executors => tables::draw_executors(f, body, snap, &mut executors.state),
         Tab::Sql => tables::draw_sql(f, body, snap.sql.as_deref(), &mut sql.state),
-        Tab::Failures => unreachable!("handled above"),
+        Tab::Failures | Tab::Streaming => unreachable!("handled above"),
     }
 }
 
@@ -308,6 +316,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                 },
             )),
+            // Red while any query is falling behind.
+            Tab::Streaming
+                if app
+                    .streaming
+                    .queries
+                    .values()
+                    .any(|q| crate::streaming::QueryStats::of(q).behind) =>
+            {
+                Line::from(Span::styled(
+                    "Streaming ▲",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))
+            }
             t => Line::from(t.title()),
         })
         .collect();
@@ -332,6 +353,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         View::Picker => " q quit · j/k move · Enter watch · r refresh ",
         View::Main if app.tab == Tab::Failures => {
             " q quit · tab/←→ switch · j/k move · Enter full text · s open stage · L logs · x acknowledge · a apps "
+        }
+        View::Main if app.tab == Tab::Streaming => {
+            " q quit · tab/←→ switch · j/k select query · x ack failures · a apps · r refresh · p pause "
         }
         View::Main if app.tab == Tab::Executors => {
             " q quit · tab/←→ switch · j/k move · L logs · t threads · x ack failures · a apps · r refresh · p pause "

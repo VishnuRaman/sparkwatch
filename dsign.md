@@ -155,10 +155,50 @@ The driver log is the important one for Structured Streaming: each micro-batch's
 - Smoke run per phase, as done for v1: `script -q out.txt sh -c 'stty cols 150 rows 45; ./target/debug/sparkwatch'` with scripted keys, then grep the de-ANSI'd frames for expected strings (picker rows → `Enter` → `5` SQL tab → `3` Stages → `Enter` drill-down shows `⚠ skew` → `6` Failures shows the `removeReason`).
 - Final: run against a real driver/History Server if one is reachable; otherwise the mock is the acceptance fixture.
 
-## Phase 6 (future) — Streaming tab
+## Phase 6 — Streaming tab ✅ done
 
-Built on the Phase 5 driver log stream: recognise `StreamingQueryProgress` lines (JSON after `Streaming query made progress:`), keep a ring of the last ~200 batches per query, and render a **Streaming** tab: per query, batch duration / input rate / processing rate / watermark lag as sparklines, latest batch's numbers, state-store size trend, and a red flag when `processedRowsPerSecond < inputRowsPerSecond` over the last N batches (falling behind). Terminal equivalent of the web UI's Structured Streaming page, which the REST API does not expose.
+Structured Streaming has **no REST API** (`/streaming/*` is legacy DStreams; the web UI's Structured Streaming page reads the listener bus directly). Two sources are available and both are used:
+
+1. **Driver log tap** (primary). `ProgressReporter` logs every micro-batch at INFO: `… INFO MicroBatchExecution: Streaming query made progress: {` followed by the `StreamingQueryProgress` as *pretty-printed multi-line JSON* (`prettyJson`), closing when braces balance. Fields used: `id`, `runId`, `name`, `timestamp`, `batchId`, `batchDuration`, `numInputRows`, `inputRowsPerSecond`, `processedRowsPerSecond`, `durationMs{addBatch, getBatch, latestOffset, queryPlanning, triggerExecution, walCommit, commitOffsets}`, `eventTime.watermark`, `stateOperators[{operatorName, numRowsTotal, numRowsUpdated, memoryUsedBytes, numRowsDroppedByWatermark}]`, `sources[{description, numInputRows, inputRowsPerSecond, processedRowsPerSecond}]`, `sink{description, numOutputRows}`. All optional under `#[serde(default)]`. Requires the driver to log at INFO for `org.apache.spark.sql.execution.streaming` — the tab says so when it has seen the log but no progress lines.
+   - `--k8s`: a second `kubectl logs -f --tail=10000` on the driver pod, independent of the user's log view, started when the Streaming tab is first opened and kept for the life of the watched app (batches keep accumulating while you look elsewhere).
+   - YARN/standalone: the driver's `executorLogs` stderr page, re-fetched every 5 s and re-parsed; duplicates dropped by `(runId, batchId)`.
+   - History Server: no log → source 2 only.
+2. **SQL executions** (fallback, everywhere incl. History Server). A micro-batch's execution description is `"<name>\nid = <queryId>\nrunId = <runId>\nbatch = <n>"`. That yields batch id, status and duration per query with zero extra requests — enough for the batch-duration sparkline and "batches/min", not for rates or watermark.
+
+### Model — `src/streaming.rs` (pure, unit-tested)
+
+- `Progress` (the JSON above), `ProgressParser::feed(line) -> Option<Progress>`: detects the marker, buffers following lines while tracking brace depth, parses on balance; tolerates the single-line form and garbage in between (resets on a new marker).
+- `batch_from_sql(&ExecutionData) -> Option<(query_id, run_id, batch_id)>` from the description.
+- `QueryHistory { query_id, run_id, name, batches: BTreeMap<batch_id, Batch> }` capped at 300 batches; `Batch { batch_id, duration_ms, status, progress: Option<Progress> }`; a progress event upgrades an existing SQL-derived batch. `Streaming { queries: BTreeMap<query_id, QueryHistory> }` with `ingest_progress`, `ingest_sql(&[ExecutionData])`.
+- `QueryStats::of(&QueryHistory)`: latest batch, mean/p95/max trigger duration over the retained window, current input vs processed rows/s, `behind: bool` = processed < input in ≥ 3 of the last 5 batches with input > 0, total state rows / memory, watermark lag = `timestamp − watermark` when both parse, batches per minute.
+
+### Plumbing
+
+- Poller: `Request::TapProgress` (idempotent start of the driver tap), `Message::Progress(Progress)`, `Message::ProgressStatus(String)` ("tapping pod/x", "no driver log URL", "History Server: batch durations only"). Tap task = `run_logs` variant that feeds lines into `ProgressParser` and only sends parsed events (the UI never sees raw log lines). Closed on app switch / ListApps / shutdown like the log stream.
+- App: `Tab::Streaming` (key `7`), `streaming: Streaming`, `streaming_status`, `streaming_cursor: Cursor<String>` over queries (j/k), `apply_snapshot` calls `streaming.ingest_sql`, `apply_progress`. Opening the tab sends `TapProgress` once.
+
+### UI — `src/ui/streaming.rs`
+
+Per query, stacked (selected query expanded, others one summary line when there are several):
+
+- Header: name (or short id) · run id · `batch 4123` · `2s ago` · trigger `1.2s` · input `12,400 rows` · `10,300 rows/s in` vs `12,800 rows/s processed` (red + `FALLING BEHIND` when `behind`) · watermark lag `3m12s`.
+- Three sparklines side by side: **trigger duration** (mean/p95/max in the title), **rows/s** input (yellow) vs processed (green) overlaid as two sparklines split vertically, **state rows** (with memory in the title). Uses the existing `fit()` helper pattern from the Overview.
+- Latest batch breakdown line: `addBatch 900ms · getBatch 10ms · queryPlanning 30ms · walCommit 15ms · commitOffsets 20ms` and per-source rows.
+- Empty state explains the sources: "no streaming queries seen — this tab needs the driver log at INFO (`--k8s` or YARN log URLs) or micro-batch SQL executions".
+
+### As built
+
+`src/streaming.rs` (types, `ProgressParser`, `batch_from_sql`, `Streaming`/`QueryHistory`/`Batch`, `QueryStats`, hand-rolled ISO-8601 → epoch so no date crate), `src/ui/streaming.rs`. Poller: `Request::TapProgress` is idempotent (re-sent on every tab visit, ignored while the tap task runs), `run_tap` shares `LogStream`/`extract_log_text` with Phase 5 and forwards only parsed `Message::Progress`; the driver's stderr URL for HTTP mode is remembered from each snapshot's `driver` executor row. The tap is closed on app switch / ListApps / shutdown. A restarted query (new `runId`) drops its old batches; `(runId, batchId)` dedup absorbs the HTTP re-fetch. Verified against the fake `kubectl` driver log (pretty-printed blocks every ~1 s, falling behind from batch 4121) and the mock's driver stderr page + micro-batch SQL executions (`6 progress events · 3 batches from SQL executions`, batch 4124 `RUNNING` known only from SQL).
+
+### Verification
+
+- Unit: multi-line and single-line progress parsing, marker mid-line with log4j prefix, interleaved unrelated lines, dedup by `(runId, batchId)`, SQL description parsing, `behind` detection, p95.
+- Mock: fake `kubectl logs` for the driver emits a pretty-printed progress block every second with input > processed for the last few batches; mock Spark's driver stderr page carries the same; SQL executions gain three micro-batch executions with the `runId = … batch = n` description.
+- Smoke: `7` → header with batch id, `FALLING BEHIND`, three sparkline titles, breakdown line; History-Server-style run (`--no-sql` off, no log URL) shows durations only with the status line explaining why.
 
 ## Out of scope (later)
 
-Table filtering (`/`) on the main tabs, storage/RDD tab, streaming tab, config file for endpoints, GitHub release workflow with prebuilt binaries (after the phases above).
+- **Table filtering (`/`) on the main tabs** — type a substring to narrow the Jobs / Stages / Executors / SQL / Failures tables (by name, status, host, query text…), the way `/` already narrows the log and thread views. Matters on big apps: hundreds of stages, thousands of micro-batch executions.
+- **Storage / RDD tab** — `/storage/rdd`: cached RDDs and DataFrames, partitions cached vs total, memory/disk size per executor. Useful for "why is storage memory full".
+- **Config file for endpoints** — `~/.config/sparkwatch.toml` with named targets (`prod = { k8s = true, namespace = "spark" }`, `history = "http://…:18080"`) so `sparkwatch prod` works.
+- **GitHub release workflow** — cross-compile on tag (macOS arm64/x86, Linux, Windows) and attach binaries, so it installs without a Rust toolchain.

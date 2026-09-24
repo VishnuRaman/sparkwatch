@@ -75,7 +75,7 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`6` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures |
+| `1`–`7` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming |
 | `j` `k` `↓` `↑` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
 | `g` `G` `Home` `End` | First / last row |
@@ -109,6 +109,9 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
   without `/sql` (RDD-only, or Spark < 3.0) the tab says so instead of erroring.
 - **Failures** — everything that went wrong since sparkwatch started, newest
   first, and it stays even after Spark forgets it. See below.
+- **Streaming** — Structured Streaming queries: batch durations, input vs
+  processing rate, watermark lag, state size, with a `FALLING BEHIND` flag.
+  See below.
 
 Dead executors show their `removeReason` next to the host on the Executors
 tab, executors the scheduler has excluded show `excl`, and failed stages carry
@@ -159,6 +162,34 @@ While there are new ones a red strip sits under the header with the count
 and the latest one; `x` acknowledges. The **Failures** tab lists them all;
 `Enter` shows the full text (stack frames dimmed), `s` opens the stage the
 failure belongs to, straight on its failed tasks.
+
+## Streaming
+
+Structured Streaming has no REST API (the `/streaming/*` endpoints are the
+old DStreams), so the tab rebuilds what the web UI's Structured Streaming
+page shows from two sources:
+
+- **The driver log.** Every micro-batch is logged at INFO as
+  `Streaming query made progress: {…}` with the full `StreamingQueryProgress`
+  JSON. On the first visit to the tab sparkwatch starts following the driver
+  log (a second `kubectl logs -f` under `--k8s`; the driver's `executorLogs`
+  stderr page on YARN/standalone, re-read every 5 s) and keeps following for
+  as long as the app is watched, so batches accumulate while you look at
+  other tabs. The driver must log at INFO for
+  `org.apache.spark.sql.execution.streaming`.
+- **SQL executions.** Each micro-batch is also a SQL execution whose
+  description carries the query id, run id and batch number. That gives
+  batch ids, status and duration everywhere — including the History Server —
+  with no log access, just not the rates or the watermark.
+
+Per query: latest batch, trigger duration (with mean/p95/max over the last
+300 batches and batches/min), input rows/s vs processed rows/s, watermark lag,
+state rows and memory; sparklines of trigger duration, input vs processed
+rate, and state size; the latest batch's `durationMs` breakdown (`addBatch`,
+`getBatch`, `queryPlanning`, `walCommit`…), sources and sink. When
+processing has been slower than input for most of the last five batches the
+query is marked **FALLING BEHIND** and the tab title turns red. `j`/`k`
+select between queries when there are several.
 
 ## Logs
 

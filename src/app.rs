@@ -2,6 +2,7 @@ use crate::alerts::{Alert, AlertLog, Kind};
 use crate::logview::{filter_from_error, LogTarget, LogView, Stream};
 use crate::poller::{Detail, DetailData, LogEvent};
 use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData, ThreadStackTrace};
+use crate::streaming::{Progress, Streaming};
 use crate::ui::sql_detail::Pane;
 use ratatui::widgets::TableState;
 use std::collections::VecDeque;
@@ -15,16 +16,18 @@ pub enum Tab {
     Executors,
     Sql,
     Failures,
+    Streaming,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Jobs,
         Tab::Stages,
         Tab::Executors,
         Tab::Sql,
         Tab::Failures,
+        Tab::Streaming,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -35,6 +38,7 @@ impl Tab {
             Tab::Executors => "Executors",
             Tab::Sql => "SQL",
             Tab::Failures => "Failures",
+            Tab::Streaming => "Streaming",
         }
     }
 
@@ -203,6 +207,13 @@ pub struct App {
     pub threads_lines: usize,
     /// Where Esc from the logs / threads view goes back to.
     pub return_view: View,
+
+    pub streaming: Streaming,
+    pub streaming_status: Option<String>,
+    /// Selected query on the Streaming tab.
+    pub streaming_sel: usize,
+    /// Whether the driver log tap has been requested for this app.
+    pub tap_requested: bool,
 }
 
 impl App {
@@ -244,6 +255,10 @@ impl App {
             threads: ThreadsView::default(),
             threads_lines: 0,
             return_view: View::Main,
+            streaming: Streaming::default(),
+            streaming_status: None,
+            streaming_sel: 0,
+            tap_requested: false,
         }
     }
 
@@ -287,6 +302,9 @@ impl App {
                 self.alerts.ingest(&s);
                 let keys: Vec<&Alert> = self.alerts.newest_first().collect();
                 self.alerts_cursor.resync(&keys, |a| a.key.clone());
+                if let Some(sql) = &s.sql {
+                    self.streaming.ingest_sql(sql);
+                }
                 self.record_sample(&s);
                 self.snapshot = Some(s);
                 self.last_error = None;
@@ -348,6 +366,10 @@ impl App {
             self.alerts_cursor = Cursor::new();
             self.logs.close();
             self.threads = ThreadsView::default();
+            self.streaming = Streaming::default();
+            self.streaming_status = None;
+            self.streaming_sel = 0;
+            self.tap_requested = false;
             self.close_detail();
         }
         self.watching = Some(id);
@@ -548,6 +570,22 @@ impl App {
         }
     }
 
+    // -------------------------------------------------------------- streaming
+
+    pub fn apply_progress(&mut self, p: Progress) {
+        self.streaming.ingest_progress(p);
+    }
+
+    /// Entering the Streaming tab: returns true the first time, when the
+    /// driver log tap should be started.
+    pub fn want_tap(&mut self) -> bool {
+        if self.tap_requested {
+            return false;
+        }
+        self.tap_requested = true;
+        true
+    }
+
     /// Text input for the `/` filter in the logs or threads view. Returns
     /// true if the key was consumed as text.
     pub fn filter_input_key(&mut self, key: crossterm::event::KeyCode) -> bool {
@@ -722,13 +760,16 @@ impl App {
                 if self.tab == Tab::Failures {
                     return self.alerts.len();
                 }
+                if self.tab == Tab::Streaming {
+                    return self.streaming.queries.len();
+                }
                 let Some(s) = &self.snapshot else { return 0 };
                 match self.tab {
                     Tab::Jobs => s.jobs.len(),
                     Tab::Stages => visible_stages(s, &self.stage_filter).len(),
                     Tab::Executors => s.executors.len(),
                     Tab::Sql => s.sql.as_ref().map_or(0, Vec::len),
-                    Tab::Overview | Tab::Failures => 0,
+                    Tab::Overview | Tab::Failures | Tab::Streaming => 0,
                 }
             }
         }
@@ -751,6 +792,7 @@ impl App {
                 Tab::Executors => self.executors.selected(),
                 Tab::Sql => self.sql.selected(),
                 Tab::Failures => self.alerts_cursor.selected(),
+                Tab::Streaming => self.streaming_sel,
                 Tab::Overview => 0,
             },
         }
@@ -799,6 +841,10 @@ impl App {
                     let keys: Vec<&Alert> = self.alerts.newest_first().collect();
                     return self.alerts_cursor.select(index, &keys, |a| a.key.clone());
                 }
+                if self.tab == Tab::Streaming {
+                    self.streaming_sel = index;
+                    return;
+                }
                 let Self {
                     snapshot,
                     tab,
@@ -815,7 +861,7 @@ impl App {
                     Tab::Stages => stages.select(index, &visible_stages(s, stage_filter), |st| st.key()),
                     Tab::Executors => executors.select(index, &s.executors, |e| e.id.clone()),
                     Tab::Sql => sql.select(index, s.sql.as_deref().unwrap_or(&[]), |e| e.id),
-                    Tab::Overview | Tab::Failures => {}
+                    Tab::Overview | Tab::Failures | Tab::Streaming => {}
                 }
             }
         }

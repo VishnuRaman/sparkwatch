@@ -5,6 +5,7 @@ mod k8s;
 mod logview;
 mod poller;
 mod spark;
+mod streaming;
 mod threads;
 mod ui;
 
@@ -146,6 +147,8 @@ async fn run(
                 }
                 Message::Log(event) => app.apply_log(event),
                 Message::Threads { executor_id, result } => app.apply_threads(&executor_id, result),
+                Message::Progress(p) => app.apply_progress(p),
+                Message::ProgressStatus(s) => app.streaming_status = Some(s),
             },
             _ = tick.tick() => {}
         }
@@ -292,10 +295,17 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                     send(req_tx, Request::FetchThreads(id)).await;
                 }
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                app.tab = app.tab.next();
+                tap_if_streaming(app, req_tx).await;
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                app.tab = app.tab.prev();
+                tap_if_streaming(app, req_tx).await;
+            }
+            KeyCode::Char(c @ '1'..='7') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
+                tap_if_streaming(app, req_tx).await;
             }
             KeyCode::Char('a') => {
                 app.open_picker();
@@ -312,6 +322,14 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             }
             _ => {}
         },
+    }
+}
+
+/// The first visit to the Streaming tab starts the driver log tap, which
+/// then runs for as long as this app is watched.
+async fn tap_if_streaming(app: &mut App, req_tx: &mpsc::Sender<Request>) {
+    if app.tab == app::Tab::Streaming && app.want_tap() {
+        send(req_tx, Request::TapProgress).await;
     }
 }
 

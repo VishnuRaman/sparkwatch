@@ -261,6 +261,23 @@ def log_page(eid, stream):
     return "<html><body><h1>Logs for container_%s</h1><pre>%s</pre></body></html>" % (eid, body)
 
 
+GiB = 1024 * MiB
+RDDS = [
+    {"id": 40, "name": "*(2) Project [customer_id#12L, amount#15] MapPartitionsRDD[40] at cache at Main.scala:31",
+     "numPartitions": 200, "numCachedPartitions": 150, "storageLevel": "Memory Deserialized 1x Replicated",
+     "memoryUsed": 3 * GiB, "diskUsed": 0,
+     "dataDistribution": [{"address": "10.0.1.9:7079", "memoryUsed": 2 * GiB, "memoryRemaining": 1 * GiB, "diskUsed": 0},
+                          {"address": "10.0.1.11:7079", "memoryUsed": 1 * GiB, "memoryRemaining": 2 * GiB, "diskUsed": 0}],
+     "partitions": [{"blockName": "rdd_40_%d" % i, "storageLevel": "Memory Deserialized 1x Replicated",
+                     "memoryUsed": 20 * MiB, "diskUsed": 0, "executors": ["10.0.1.9:7079" if i % 3 else "10.0.1.11:7079"]}
+                    for i in range(150)]},
+    {"id": 12, "name": "customers MapPartitionsRDD[12] at persist at Main.scala:18",
+     "numPartitions": 8, "numCachedPartitions": 8, "storageLevel": "Disk Memory Serialized 1x Replicated",
+     "memoryUsed": 400 * MiB, "diskUsed": 1200 * MiB,
+     "dataDistribution": [{"address": "10.0.1.9:7079", "memoryUsed": 400 * MiB, "memoryRemaining": 600 * MiB, "diskUsed": 1200 * MiB}],
+     "partitions": []},
+]
+
 # Completed-task counters tick up on every poll so the sparklines move.
 TICK = {"n": 0}
 
@@ -285,6 +302,11 @@ class H(BaseHTTPRequestHandler):
             return STAGES
         if rest.startswith("stages/"):
             return self.stage_route(rest.split("/")[1:], query)
+        if rest == "storage/rdd":
+            return [{k: v for k, v in r.items() if k not in ("dataDistribution", "partitions")} for r in RDDS]
+        if rest.startswith("storage/rdd/"):
+            rid = int(rest.split("/")[2])
+            return next((r for r in RDDS if r["id"] == rid), None)
         if rest == "sql" and SQL_ENABLED:
             offset, length = int(query.get("offset", 0)), int(query.get("length", 20))
             return [e for e in SQL[offset:offset + length]]

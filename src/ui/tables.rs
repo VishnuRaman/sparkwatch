@@ -4,7 +4,7 @@ use super::{
     fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style, table_block, warn_if,
 };
 use super::fmt_millis;
-use crate::spark::{ExecutionData, Snapshot, StageData};
+use crate::spark::{ExecutionData, ExecutorSummary, JobData, StageData};
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Style},
@@ -13,9 +13,8 @@ use ratatui::{
     Frame,
 };
 
-pub fn draw_jobs(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableState) {
-    let rows: Vec<Row> = s
-        .jobs
+pub fn draw_jobs(f: &mut Frame, area: Rect, jobs: &[&JobData], title: String, state: &mut TableState) {
+    let rows: Vec<Row> = jobs
         .iter()
         .map(|j| {
             Row::new(vec![
@@ -47,7 +46,7 @@ pub fn draw_jobs(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableState
     .header(header_row(&[
         "ID", "STATUS", "NAME", "SUBMITTED", "TASKS", "FAILED", "STAGES", "PROGRESS",
     ]))
-    .block(table_block(format!(" Jobs ({}) ", s.jobs.len())))
+    .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 
@@ -105,9 +104,8 @@ pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: Stri
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_executors(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut TableState) {
-    let rows: Vec<Row> = s
-        .executors
+pub fn draw_executors(f: &mut Frame, area: Rect, execs: &[&ExecutorSummary], title: String, state: &mut TableState) {
+    let rows: Vec<Row> = execs
         .iter()
         .map(|e| {
             let gc_pct = if e.total_duration > 0 {
@@ -170,14 +168,14 @@ pub fn draw_executors(f: &mut Frame, area: Rect, s: &Snapshot, state: &mut Table
     .header(header_row(&[
         "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R",
     ]))
-    .block(table_block(format!(" Executors ({}) ", s.executors.len())))
+    .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[ExecutionData]>, state: &mut TableState) {
+pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[&ExecutionData]>, title: String, state: &mut TableState) {
     let Some(execs) = sql else {
         f.render_widget(
             Paragraph::new(vec![
@@ -238,7 +236,7 @@ pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[ExecutionData]>, state:
         ],
     )
     .header(header_row(&["ID", "STATUS", "QUERY", "SUBMITTED", "DURATION", "JOBS", "ERROR"]))
-    .block(table_block(format!(" SQL executions ({}) · Enter for plan ", execs.len())))
+    .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 

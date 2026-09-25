@@ -1,14 +1,17 @@
 use crate::alerts::{Alert, AlertLog, Kind};
 use crate::logview::{filter_from_error, LogTarget, LogView, Stream};
 use crate::poller::{Detail, DetailData, LogEvent};
-use crate::spark::{ApplicationInfo, ExecutionData, Snapshot, StageData, StageDetail, TaskData, ThreadStackTrace};
+use crate::spark::{
+    ApplicationInfo, ExecutionData, ExecutorSummary, JobData, RddStorageInfo, Snapshot, StageData, StageDetail,
+    TaskData, ThreadStackTrace,
+};
 use crate::streaming::{Progress, Streaming};
 use crate::ui::sql_detail::Pane;
 use ratatui::widgets::TableState;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Overview,
     Jobs,
@@ -17,10 +20,11 @@ pub enum Tab {
     Sql,
     Failures,
     Streaming,
+    Storage,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Overview,
         Tab::Jobs,
         Tab::Stages,
@@ -28,7 +32,16 @@ impl Tab {
         Tab::Sql,
         Tab::Failures,
         Tab::Streaming,
+        Tab::Storage,
     ];
+
+    /// Tabs whose table `/` can narrow.
+    pub fn filterable(&self) -> bool {
+        matches!(
+            self,
+            Tab::Jobs | Tab::Stages | Tab::Executors | Tab::Sql | Tab::Failures | Tab::Storage
+        )
+    }
 
     pub fn title(&self) -> &'static str {
         match self {
@@ -39,6 +52,7 @@ impl Tab {
             Tab::Sql => "SQL",
             Tab::Failures => "Failures",
             Tab::Streaming => "Streaming",
+            Tab::Storage => "Storage",
         }
     }
 
@@ -72,6 +86,8 @@ pub enum View {
     Logs,
     /// An executor's thread dump.
     Threads,
+    /// One cached RDD's distribution.
+    Rdd,
 }
 
 #[derive(Default)]
@@ -147,13 +163,71 @@ pub struct StageFilter {
     pub stage_ids: Vec<i64>,
 }
 
-/// The stages the Stages tab shows, honouring the job filter.
-pub fn visible_stages<'a>(snapshot: &'a Snapshot, filter: &Option<StageFilter>) -> Vec<&'a StageData> {
-    snapshot
-        .stages
+/// Case-insensitive substring match of a `/` filter against a row's fields.
+fn hit(filter: Option<&str>, fields: &[&str]) -> bool {
+    match filter {
+        None => true,
+        Some(f) => fields.iter().any(|x| x.to_lowercase().contains(f)),
+    }
+}
+
+pub fn visible_jobs<'a>(s: &'a Snapshot, f: Option<&str>) -> Vec<&'a JobData> {
+    s.jobs
         .iter()
-        .filter(|s| filter.as_ref().is_none_or(|f| f.stage_ids.contains(&s.stage_id)))
+        .filter(|j| hit(f, &[&j.job_id.to_string(), &j.status, &j.name]))
         .collect()
+}
+
+/// The stages the Stages tab shows: the job filter (Enter on a job) and the
+/// text filter both apply.
+pub fn visible_stages<'a>(s: &'a Snapshot, job: &Option<StageFilter>, f: Option<&str>) -> Vec<&'a StageData> {
+    s.stages
+        .iter()
+        .filter(|st| job.as_ref().is_none_or(|j| j.stage_ids.contains(&st.stage_id)))
+        .filter(|st| hit(f, &[&format!("{}.{}", st.stage_id, st.attempt_id), &st.status, &st.name]))
+        .collect()
+}
+
+pub fn visible_executors<'a>(s: &'a Snapshot, f: Option<&str>) -> Vec<&'a ExecutorSummary> {
+    s.executors
+        .iter()
+        .filter(|e| {
+            let state = if !e.is_active { "dead" } else if e.excluded() { "excluded" } else { "up" };
+            hit(f, &[&e.id, &e.host_port, state, e.remove_reason.as_deref().unwrap_or("")])
+        })
+        .collect()
+}
+
+pub fn visible_sql<'a>(s: &'a Snapshot, f: Option<&str>) -> Option<Vec<&'a ExecutionData>> {
+    Some(
+        s.sql
+            .as_ref()?
+            .iter()
+            .filter(|e| hit(f, &[&e.id.to_string(), &e.status, &e.description, e.error_message.as_deref().unwrap_or("")]))
+            .collect(),
+    )
+}
+
+pub fn visible_alerts<'a>(log: &'a AlertLog, f: Option<&str>) -> Vec<&'a Alert> {
+    log.newest_first()
+        .filter(|a| hit(f, &[a.kind.label(), &a.title, a.detail.as_deref().unwrap_or("")]))
+        .collect()
+}
+
+pub fn visible_rdds<'a>(s: &'a Snapshot, f: Option<&str>) -> Vec<&'a RddStorageInfo> {
+    s.rdds
+        .iter()
+        .filter(|r| hit(f, &[&r.id.to_string(), &r.name, &r.storage_level]))
+        .collect()
+}
+
+/// `" Jobs (3 of 12) · filter: foo "` or `" Jobs (12) "`.
+pub fn filtered_title(base: &str, shown: usize, total: usize, f: Option<&str>) -> String {
+    match f {
+        Some(f) if shown != total => format!(" {base} ({shown} of {total}) · filter: {f} "),
+        Some(f) => format!(" {base} ({total}) · filter: {f} "),
+        None => format!(" {base} ({total}) "),
+    }
 }
 
 pub struct App {
@@ -179,6 +253,12 @@ pub struct App {
     pub stage_filter: Option<StageFilter>,
     pub executors: Cursor<String>,
     pub sql: Cursor<i64>,
+    pub rdds: Cursor<i64>,
+    /// `/` text filter per tab, lower-cased.
+    pub filters: HashMap<Tab, String>,
+    /// `Some` while a filter is being typed for the current tab.
+    pub filter_input: Option<String>,
+    pub rdd_detail: Option<RddStorageInfo>,
 
     /// The drill-down that is open (and being refreshed by the poller).
     pub detail_target: Option<Detail>,
@@ -237,6 +317,10 @@ impl App {
             stage_filter: None,
             executors: Cursor::new(),
             sql: Cursor::new(),
+            rdds: Cursor::new(),
+            filters: HashMap::new(),
+            filter_input: None,
+            rdd_detail: None,
             detail_target: None,
             detail_error: None,
             stage_detail: None,
@@ -294,19 +378,13 @@ impl App {
         }
         match result {
             Ok(s) => {
-                self.jobs.resync(&s.jobs, |j| j.job_id);
-                self.stages
-                    .resync(&visible_stages(&s, &self.stage_filter), |st| st.key());
-                self.executors.resync(&s.executors, |e| e.id.clone());
-                self.sql.resync(s.sql.as_deref().unwrap_or(&[]), |e| e.id);
                 self.alerts.ingest(&s);
-                let keys: Vec<&Alert> = self.alerts.newest_first().collect();
-                self.alerts_cursor.resync(&keys, |a| a.key.clone());
                 if let Some(sql) = &s.sql {
                     self.streaming.ingest_sql(sql);
                 }
                 self.record_sample(&s);
                 self.snapshot = Some(s);
+                self.resync_all();
                 self.last_error = None;
                 self.last_update = Some(Instant::now());
             }
@@ -333,7 +411,72 @@ impl App {
             Ok(DetailData::Sql(None)) => {
                 self.detail_error = Some("this execution is no longer retained by the driver".into());
             }
+            Ok(DetailData::Rdd(Some(r))) => {
+                self.rdd_detail = Some(r);
+                self.detail_error = None;
+            }
+            Ok(DetailData::Rdd(None)) => {
+                self.detail_error = Some("this RDD has been unpersisted".into());
+            }
             Err(e) => self.detail_error = Some(e),
+        }
+    }
+
+    /// Re-point every table cursor at its row after the rows changed
+    /// (new snapshot, filter edited).
+    fn resync_all(&mut self) {
+        let Self {
+            snapshot,
+            filters,
+            stage_filter,
+            jobs,
+            stages,
+            executors,
+            sql,
+            rdds,
+            alerts,
+            alerts_cursor,
+            ..
+        } = self;
+        let f = |t: Tab| filters.get(&t).map(String::as_str);
+        alerts_cursor.resync(&visible_alerts(alerts, f(Tab::Failures)), |a| a.key.clone());
+        let Some(s) = snapshot else { return };
+        jobs.resync(&visible_jobs(s, f(Tab::Jobs)), |j| j.job_id);
+        stages.resync(&visible_stages(s, stage_filter, f(Tab::Stages)), |st| st.key());
+        executors.resync(&visible_executors(s, f(Tab::Executors)), |e| e.id.clone());
+        sql.resync(&visible_sql(s, f(Tab::Sql)).unwrap_or_default(), |e| e.id);
+        rdds.resync(&visible_rdds(s, f(Tab::Storage)), |r| r.id);
+    }
+
+    /// The `/` filter for a tab.
+    pub fn filter_for(&self, tab: Tab) -> Option<&str> {
+        self.filters.get(&tab).map(String::as_str)
+    }
+
+    pub fn start_table_filter(&mut self) {
+        if self.tab.filterable() {
+            self.filter_input = Some(self.filters.get(&self.tab).cloned().unwrap_or_default());
+        }
+    }
+
+    /// Returns true if there was a filter to clear.
+    pub fn clear_table_filter(&mut self) -> bool {
+        if self.filters.remove(&self.tab).is_none() {
+            return false;
+        }
+        self.resync_all();
+        true
+    }
+
+    fn commit_table_filter(&mut self) {
+        if let Some(text) = self.filter_input.take() {
+            let text = text.trim().to_lowercase();
+            if text.is_empty() {
+                self.filters.remove(&self.tab);
+            } else {
+                self.filters.insert(self.tab, text);
+            }
+            self.resync_all();
         }
     }
 
@@ -362,6 +505,9 @@ impl App {
             self.stage_filter = None;
             self.executors = Cursor::new();
             self.sql = Cursor::new();
+            self.rdds = Cursor::new();
+            self.filters.clear();
+            self.filter_input = None;
             self.alerts.clear();
             self.alerts_cursor = Cursor::new();
             self.logs.close();
@@ -389,7 +535,7 @@ impl App {
     /// The stage under the cursor on the Stages tab.
     pub fn selected_stage(&self) -> Option<&StageData> {
         let s = self.snapshot.as_ref()?;
-        visible_stages(s, &self.stage_filter)
+        visible_stages(s, &self.stage_filter, self.filter_for(Tab::Stages))
             .get(self.stages.selected())
             .copied()
     }
@@ -420,7 +566,9 @@ impl App {
     // ---------------------------------------------------------------- alerts
 
     pub fn selected_alert(&self) -> Option<&Alert> {
-        self.alerts.get_newest(self.alerts_cursor.selected())
+        visible_alerts(&self.alerts, self.filter_for(Tab::Failures))
+            .get(self.alerts_cursor.selected())
+            .copied()
     }
 
     pub fn open_alert(&mut self) {
@@ -468,8 +616,15 @@ impl App {
     }
 
     /// `L` on the Executors tab.
+    fn selected_executor_id(&self) -> Option<String> {
+        let s = self.snapshot.as_ref()?;
+        visible_executors(s, self.filter_for(Tab::Executors))
+            .get(self.executors.selected())
+            .map(|e| e.id.clone())
+    }
+
     pub fn open_logs_selected_executor(&mut self) -> Option<LogTarget> {
-        let id = self.snapshot.as_ref()?.executors.get(self.executors.selected())?.id.clone();
+        let id = self.selected_executor_id()?;
         Some(self.open_logs(id, None))
     }
 
@@ -543,7 +698,7 @@ impl App {
     }
 
     pub fn open_threads_selected_executor(&mut self) -> Option<String> {
-        let id = self.snapshot.as_ref()?.executors.get(self.executors.selected())?.id.clone();
+        let id = self.selected_executor_id()?;
         Some(self.open_threads(id))
     }
 
@@ -591,6 +746,18 @@ impl App {
     pub fn filter_input_key(&mut self, key: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode::*;
         match self.view {
+            View::Main if self.filter_input.is_some() => {
+                match key {
+                    Char(c) => self.filter_input.as_mut().unwrap().push(c),
+                    Backspace => {
+                        self.filter_input.as_mut().unwrap().pop();
+                    }
+                    Enter => self.commit_table_filter(),
+                    Esc => self.filter_input = None,
+                    _ => {}
+                }
+                true
+            }
             View::Logs if self.logs.filter_input.is_some() => {
                 match key {
                     Char(c) => self.logs.filter_push(c),
@@ -631,7 +798,9 @@ impl App {
 
     /// The SQL execution under the cursor on the SQL tab.
     pub fn selected_sql(&self) -> Option<&ExecutionData> {
-        self.snapshot.as_ref()?.sql.as_ref()?.get(self.sql.selected())
+        visible_sql(self.snapshot.as_ref()?, self.filter_for(Tab::Sql))?
+            .get(self.sql.selected())
+            .copied()
     }
 
     /// Enter on the SQL tab: open the plan/metrics view for the selection.
@@ -686,8 +855,9 @@ impl App {
         self.detail_target = None;
         self.stage_detail = None;
         self.sql_detail = None;
+        self.rdd_detail = None;
         self.detail_error = None;
-        if matches!(self.view, View::Stage | View::Sql | View::Alert) {
+        if matches!(self.view, View::Stage | View::Sql | View::Alert | View::Rdd) {
             self.view = View::Main;
         }
     }
@@ -725,15 +895,16 @@ impl App {
     /// Enter on the Jobs tab: show only that job's stages.
     pub fn filter_stages_by_selected_job(&mut self) {
         let Some(s) = &self.snapshot else { return };
-        let Some(job) = s.jobs.get(self.jobs.selected()) else { return };
+        let Some(job) = visible_jobs(s, self.filter_for(Tab::Jobs)).get(self.jobs.selected()).copied() else {
+            return;
+        };
         self.stage_filter = Some(StageFilter {
             job_id: job.job_id,
             stage_ids: job.stage_ids.clone(),
         });
         self.stages = Cursor::new();
-        self.stages
-            .resync(&visible_stages(s, &self.stage_filter), |st| st.key());
         self.tab = Tab::Stages;
+        self.resync_all();
     }
 
     /// Returns true if there was a filter to clear.
@@ -741,10 +912,26 @@ impl App {
         if self.stage_filter.take().is_none() {
             return false;
         }
-        if let Some(s) = &self.snapshot {
-            self.stages.resync(&visible_stages(s, &None), |st| st.key());
-        }
+        self.resync_all();
         true
+    }
+
+    // --------------------------------------------------------------- storage
+
+    pub fn selected_rdd(&self) -> Option<&RddStorageInfo> {
+        let s = self.snapshot.as_ref()?;
+        visible_rdds(s, self.filter_for(Tab::Storage)).get(self.rdds.selected()).copied()
+    }
+
+    pub fn open_rdd_detail(&mut self) -> Option<Detail> {
+        let target = Detail::Rdd(self.selected_rdd()?.id);
+        if self.detail_target != Some(target) {
+            self.rdd_detail = None;
+            self.detail_error = None;
+        }
+        self.detail_target = Some(target);
+        self.view = View::Rdd;
+        Some(target)
     }
 
     /// Row count of the table currently in focus.
@@ -756,19 +943,22 @@ impl App {
             View::Alert => self.alert_scroll_max() as usize + 1,
             View::Logs => self.logs.visible().len(),
             View::Threads => self.threads_lines,
+            View::Rdd => 0,
             View::Main => {
                 if self.tab == Tab::Failures {
-                    return self.alerts.len();
+                    return visible_alerts(&self.alerts, self.filter_for(Tab::Failures)).len();
                 }
                 if self.tab == Tab::Streaming {
                     return self.streaming.queries.len();
                 }
                 let Some(s) = &self.snapshot else { return 0 };
+                let f = self.filter_for(self.tab);
                 match self.tab {
-                    Tab::Jobs => s.jobs.len(),
-                    Tab::Stages => visible_stages(s, &self.stage_filter).len(),
-                    Tab::Executors => s.executors.len(),
-                    Tab::Sql => s.sql.as_ref().map_or(0, Vec::len),
+                    Tab::Jobs => visible_jobs(s, f).len(),
+                    Tab::Stages => visible_stages(s, &self.stage_filter, f).len(),
+                    Tab::Executors => visible_executors(s, f).len(),
+                    Tab::Sql => visible_sql(s, f).map_or(0, |v| v.len()),
+                    Tab::Storage => visible_rdds(s, f).len(),
                     Tab::Overview | Tab::Failures | Tab::Streaming => 0,
                 }
             }
@@ -786,6 +976,7 @@ impl App {
             View::Alert => self.alert_scroll as usize,
             View::Logs => self.logs.scroll,
             View::Threads => self.threads.scroll as usize,
+            View::Rdd => 0,
             View::Main => match self.tab {
                 Tab::Jobs => self.jobs.selected(),
                 Tab::Stages => self.stages.selected(),
@@ -793,6 +984,7 @@ impl App {
                 Tab::Sql => self.sql.selected(),
                 Tab::Failures => self.alerts_cursor.selected(),
                 Tab::Streaming => self.streaming_sel,
+                Tab::Storage => self.rdds.selected(),
                 Tab::Overview => 0,
             },
         }
@@ -822,6 +1014,7 @@ impl App {
             View::Threads => {
                 self.threads.scroll = index.min(self.threads_lines.saturating_sub(1)) as u16;
             }
+            View::Rdd => {}
             View::Stage => {
                 let Self {
                     stage_detail,
@@ -838,8 +1031,8 @@ impl App {
             }
             View::Main => {
                 if self.tab == Tab::Failures {
-                    let keys: Vec<&Alert> = self.alerts.newest_first().collect();
-                    return self.alerts_cursor.select(index, &keys, |a| a.key.clone());
+                    let rows = visible_alerts(&self.alerts, self.filter_for(Tab::Failures));
+                    return self.alerts_cursor.select(index, &rows, |a| a.key.clone());
                 }
                 if self.tab == Tab::Streaming {
                     self.streaming_sel = index;
@@ -848,19 +1041,23 @@ impl App {
                 let Self {
                     snapshot,
                     tab,
+                    filters,
                     jobs,
                     stages,
                     stage_filter,
                     executors,
                     sql,
+                    rdds,
                     ..
                 } = self;
                 let Some(s) = snapshot else { return };
+                let f = filters.get(tab).map(String::as_str);
                 match tab {
-                    Tab::Jobs => jobs.select(index, &s.jobs, |j| j.job_id),
-                    Tab::Stages => stages.select(index, &visible_stages(s, stage_filter), |st| st.key()),
-                    Tab::Executors => executors.select(index, &s.executors, |e| e.id.clone()),
-                    Tab::Sql => sql.select(index, s.sql.as_deref().unwrap_or(&[]), |e| e.id),
+                    Tab::Jobs => jobs.select(index, &visible_jobs(s, f), |j| j.job_id),
+                    Tab::Stages => stages.select(index, &visible_stages(s, stage_filter, f), |st| st.key()),
+                    Tab::Executors => executors.select(index, &visible_executors(s, f), |e| e.id.clone()),
+                    Tab::Sql => sql.select(index, &visible_sql(s, f).unwrap_or_default(), |e| e.id),
+                    Tab::Storage => rdds.select(index, &visible_rdds(s, f), |r| r.id),
                     Tab::Overview | Tab::Failures | Tab::Streaming => {}
                 }
             }
@@ -1004,7 +1201,7 @@ mod tests {
         app.tab = Tab::Jobs;
         app.filter_stages_by_selected_job();
         assert_eq!(app.tab, Tab::Stages);
-        let ids: Vec<i64> = visible_stages(app.snapshot.as_ref().unwrap(), &app.stage_filter)
+        let ids: Vec<i64> = visible_stages(app.snapshot.as_ref().unwrap(), &app.stage_filter, None)
             .iter()
             .map(|s| s.stage_id)
             .collect();
@@ -1015,6 +1212,42 @@ mod tests {
         assert!(!app.clear_stage_filter());
         // Cursor followed stage 7 into the unfiltered list.
         assert_eq!(app.selected_stage().unwrap().stage_id, 7);
+    }
+
+    #[test]
+    fn table_filter_narrows_rows_and_keeps_cursor_on_a_matching_row() {
+        let mut app = watched_app();
+        let snap = Snapshot {
+            stages: vec![
+                StageData { stage_id: 9, status: "ACTIVE".into(), name: "mapPartitions at Writer.scala:88".into(), ..Default::default() },
+                StageData { stage_id: 8, status: "COMPLETE".into(), name: "exchange at Writer.scala:70".into(), ..Default::default() },
+                StageData { stage_id: 4, status: "FAILED".into(), name: "collect at Main.scala:22".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        app.apply_snapshot("a", Ok(snap));
+        app.tab = Tab::Stages;
+        app.move_selection(2); // stage 4
+        app.start_table_filter();
+        for c in "WRITER".chars() {
+            assert!(app.filter_input_key(crossterm::event::KeyCode::Char(c)));
+        }
+        assert!(app.filter_input_key(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.filter_for(Tab::Stages), Some("writer"));
+        let ids: Vec<i64> = visible_stages(app.snapshot.as_ref().unwrap(), &None, app.filter_for(Tab::Stages))
+            .iter()
+            .map(|s| s.stage_id)
+            .collect();
+        assert_eq!(ids, [9, 8]);
+        // Stage 4 vanished from view; the cursor lands on a visible row.
+        assert!(app.selected_stage().is_some());
+        assert_eq!(
+            filtered_title("Stages", 2, 3, app.filter_for(Tab::Stages)),
+            " Stages (2 of 3) · filter: writer "
+        );
+        assert!(app.clear_table_filter());
+        assert!(!app.clear_table_filter());
+        assert_eq!(app.filter_for(Tab::Stages), None);
     }
 
     #[test]

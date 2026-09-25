@@ -95,6 +95,11 @@ impl AlertLog {
         self.acked = self.alerts.len();
     }
 
+    /// Not yet acknowledged with `x`.
+    pub fn is_new(&self, a: &Alert) -> bool {
+        self.alerts.iter().position(|x| x.key == a.key).is_some_and(|i| i >= self.acked)
+    }
+
     pub fn clear(&mut self) {
         *self = Self::default();
     }

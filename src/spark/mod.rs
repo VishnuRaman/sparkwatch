@@ -68,19 +68,24 @@ impl SparkClient {
 
     /// Everything the main view shows for one application, fetched concurrently.
     pub async fn poll(&self, id: &str) -> Result<Snapshot> {
-        let (app_path, jobs_path, stages_path, execs_path) = (
+        let (app_path, jobs_path, stages_path, execs_path, rdd_path) = (
             format!("/applications/{id}"),
             format!("/applications/{id}/jobs"),
             format!("/applications/{id}/stages"),
             format!("/applications/{id}/allexecutors"),
+            format!("/applications/{id}/storage/rdd"),
         );
 
-        let (app, jobs, stages, executors) = tokio::try_join!(
+        let (app, jobs, stages, executors, rdds) = tokio::try_join!(
             self.get::<ApplicationInfo>(&app_path),
             self.get::<Vec<JobData>>(&jobs_path),
             self.get::<Vec<StageData>>(&stages_path),
             self.get::<Vec<ExecutorSummary>>(&execs_path),
+            // The History Server has no storage data; a 404 is "nothing cached".
+            self.get_opt::<Vec<RddStorageInfo>>(&rdd_path),
         )?;
+        let mut rdds = rdds.unwrap_or_default();
+        rdds.sort_by_key(|r| -(r.memory_used + r.disk_used));
 
         let mut jobs = jobs;
         jobs.sort_by_key(|j| -j.job_id);
@@ -94,6 +99,7 @@ impl SparkClient {
             executors,
             sql: None,               // filled in by the poller from its SQL cache
             failed_tasks: Vec::new(), // likewise, once it knows which stages grew
+            rdds,
         })
     }
 
@@ -185,6 +191,12 @@ const SQL_PAGE: usize = 500;
 const SQL_MAX_PAGES: usize = 10;
 
 impl SparkClient {
+    /// One cached RDD with its per-executor distribution and partitions.
+    /// `None` once it has been unpersisted.
+    pub async fn rdd_detail(&self, app_id: &str, rdd_id: i64) -> Result<Option<RddStorageInfo>> {
+        self.get_opt(&format!("/applications/{app_id}/storage/rdd/{rdd_id}")).await
+    }
+
     /// Live thread dump of an executor. `None` where it is not served (the
     /// History Server, or an executor that is gone).
     pub async fn threads(&self, app_id: &str, executor_id: &str) -> Result<Option<Vec<ThreadStackTrace>>> {

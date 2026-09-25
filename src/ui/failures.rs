@@ -49,7 +49,7 @@ pub fn draw_strip(f: &mut Frame, area: Rect, log: &AlertLog) {
     );
 }
 
-pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, state: &mut TableState) {
+pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, rows_in: &[&Alert], title: String, state: &mut TableState) {
     if log.len() == 0 {
         f.render_widget(
             Paragraph::new(vec![
@@ -66,11 +66,9 @@ pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, state: &mut TableSt
         return;
     }
 
-    let unacked = log.unacked();
-    let rows: Vec<Row> = log
-        .newest_first()
-        .enumerate()
-        .map(|(i, a)| {
+    let rows: Vec<Row> = rows_in
+        .iter()
+        .map(|a| {
             let row = Row::new(vec![
                 Cell::from(age(a.first_seen)),
                 Cell::from(a.kind.label()).style(kind_style(a.kind)),
@@ -78,7 +76,7 @@ pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, state: &mut TableSt
                 Cell::from(a.detail_line().chars().take(120).collect::<String>())
                     .style(Style::default().fg(Color::Gray)),
             ]);
-            if i < unacked {
+            if log.is_new(a) {
                 row.style(Style::default().add_modifier(Modifier::BOLD))
             } else {
                 row.style(Style::default().fg(Color::DarkGray))
@@ -96,11 +94,7 @@ pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, state: &mut TableSt
         ],
     )
     .header(header_row(&["WHEN", "KIND", "WHAT", "DETAIL"]))
-    .block(table_block(format!(
-        " Failures ({}, {} new) · Enter full text · s open stage · x acknowledge ",
-        log.len(),
-        unacked
-    )))
+    .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 

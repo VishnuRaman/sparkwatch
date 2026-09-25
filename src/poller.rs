@@ -8,7 +8,7 @@
 use crate::k8s::{self, LogStream, PortForward};
 use crate::logview::LogTarget;
 use crate::streaming::{Progress, ProgressParser};
-use crate::spark::{logs, ApplicationInfo, ExecutionData, Snapshot, SparkClient, StageDetail, ThreadStackTrace};
+use crate::spark::{logs, ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail, ThreadStackTrace};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -45,6 +45,7 @@ pub enum Request {
 pub enum Detail {
     Stage { id: i64, attempt: i64 },
     Sql(i64),
+    Rdd(i64),
 }
 
 /// Poller → UI.
@@ -87,6 +88,8 @@ pub enum DetailData {
     Stage(StageDetail),
     /// `None`: the driver no longer retains this execution.
     Sql(Option<ExecutionData>),
+    /// `None`: unpersisted since it was listed.
+    Rdd(Option<RddStorageInfo>),
 }
 
 /// Per-app poller state that survives between cycles.
@@ -694,6 +697,10 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &m
             Some(d @ Detail::Sql(id)) => Some((
                 d,
                 client.sql_detail(&spark_id, id).await.map(DetailData::Sql).map_err(err),
+            )),
+            Some(d @ Detail::Rdd(id)) => Some((
+                d,
+                client.rdd_detail(&spark_id, id).await.map(DetailData::Rdd).map_err(err),
             )),
             None => None,
         }

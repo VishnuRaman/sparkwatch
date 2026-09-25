@@ -335,6 +335,55 @@ pub struct ShuffleWriteMetricDistributions {
     pub write_time: Vec<f64>,
 }
 
+/// A cached RDD / DataFrame from `storage/rdd`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RddStorageInfo {
+    pub id: i64,
+    pub name: String,
+    pub num_partitions: i64,
+    pub num_cached_partitions: i64,
+    /// e.g. "Memory Deserialized 1x Replicated"
+    pub storage_level: String,
+    pub memory_used: i64,
+    pub disk_used: i64,
+    /// Per-executor breakdown; only from `storage/rdd/{id}`.
+    pub data_distribution: Vec<RddDataDistribution>,
+    /// Per-partition detail; only from `storage/rdd/{id}`.
+    pub partitions: Vec<RddPartitionInfo>,
+}
+
+impl RddStorageInfo {
+    pub fn cached_ratio(&self) -> f64 {
+        if self.num_partitions <= 0 {
+            return 0.0;
+        }
+        (self.num_cached_partitions as f64 / self.num_partitions as f64).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RddDataDistribution {
+    /// `host:port` of the block manager (the executor).
+    pub address: String,
+    pub memory_used: i64,
+    pub memory_remaining: i64,
+    pub disk_used: i64,
+    pub on_heap_memory_used: Option<i64>,
+    pub off_heap_memory_used: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RddPartitionInfo {
+    pub block_name: String,
+    pub storage_level: String,
+    pub memory_used: i64,
+    pub disk_used: i64,
+    pub executors: Vec<String>,
+}
+
 /// One thread from `executors/{id}/threads`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -452,6 +501,8 @@ pub struct Snapshot {
     /// Failed tasks fetched this cycle for stages whose failure count grew,
     /// keyed by `(stage_id, attempt_id)`. Feeds the alert log.
     pub failed_tasks: Vec<((i64, i64), Vec<TaskData>)>,
+    /// Cached RDDs / DataFrames, largest first.
+    pub rdds: Vec<RddStorageInfo>,
 }
 
 #[cfg(test)]
@@ -550,6 +601,17 @@ mod tests {
         let e = &s.executor_summary["1"];
         assert_eq!(e.tasks(), 100);
         assert!(e.excluded());
+    }
+
+    #[test]
+    fn parses_rdd_storage() {
+        let r: Vec<RddStorageInfo> = serde_json::from_str(r#"[{"id":12,"name":"*(2) Project [customer_id#12L] MapPartitionsRDD[40]",
+            "numPartitions":200,"numCachedPartitions":150,"storageLevel":"Memory Deserialized 1x Replicated",
+            "memoryUsed":3221225472,"diskUsed":0,
+            "dataDistribution":[{"address":"10.0.1.9:7079","memoryUsed":2147483648,"memoryRemaining":1073741824,"diskUsed":0}]}]"#).unwrap();
+        assert_eq!(r[0].num_cached_partitions, 150);
+        assert!((r[0].cached_ratio() - 0.75).abs() < 1e-9);
+        assert_eq!(r[0].data_distribution[0].address, "10.0.1.9:7079");
     }
 
     #[test]

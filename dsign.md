@@ -198,7 +198,10 @@ Per query, stacked (selected query expanded, others one summary line when there 
 
 ## Out of scope (later)
 
-- **Table filtering (`/`) on the main tabs** — type a substring to narrow the Jobs / Stages / Executors / SQL / Failures tables (by name, status, host, query text…), the way `/` already narrows the log and thread views. Matters on big apps: hundreds of stages, thousands of micro-batch executions.
-- **Storage / RDD tab** — `/storage/rdd`: cached RDDs and DataFrames, partitions cached vs total, memory/disk size per executor. Useful for "why is storage memory full".
-- **Config file for endpoints** — `~/.config/sparkwatch.toml` with named targets (`prod = { k8s = true, namespace = "spark" }`, `history = "http://…:18080"`) so `sparkwatch prod` works.
 - **GitHub release workflow** — cross-compile on tag (macOS arm64/x86, Linux, Windows) and attach binaries, so it installs without a Rust toolchain.
+
+## Phase 7 — table filtering, Storage tab, config file ✅ done
+
+- **Table filtering.** `App.filters: HashMap<Tab, String>` (lower-cased) and `filter_input` for the one being typed; `visible_jobs/stages/executors/sql/alerts/rdds(snapshot, filter)` are the single source of rows for both drawing and cursors, so a cursor can never point at a hidden row (`resync_all` after every snapshot and filter edit). `/` starts input (footer takes over, like the log view), `Enter` applies, `c` clears, `Esc` peels: text filter → job stage-filter → quit. Titles via `filtered_title`. Fields matched per tab are listed in the README.
+- **Storage tab** (`8`). `/storage/rdd` joins the snapshot (404 → empty: the History Server has none); sorted by bytes. Summary line: storage memory used/max across executors, fullest executor, disk. `Enter` → `Detail::Rdd(id)` fetches `/storage/rdd/{id}` for `dataDistribution` (per executor: partitions held, bytes, share, how full that executor's storage is) and a partition summary; unpersisted → "has been unpersisted".
+- **Config file.** `src/config.rs`: `[defaults] interval/timeout`, `[targets.<name>]` with `url` xor `k8s` (+ `namespace`, `app`); `deny_unknown_fields` so a typo is an error; missing file = empty config, malformed = error. `resolve_target` folds a named target into the parsed CLI, CLI flags winning; skipped under `--k8s` (positional is an app name). `--config PATH`, `--targets`. `interval`/`timeout` became `Option` on the CLI so the config's defaults can apply.

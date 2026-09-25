@@ -7,11 +7,16 @@ mod overview;
 mod picker;
 pub mod sql_detail;
 mod stage_detail;
+mod storage;
 mod streaming;
 mod tables;
 mod threads;
 
-use crate::app::{visible_stages, App, Tab, View};
+use crate::alerts::Alert;
+use crate::app::{
+    filtered_title, visible_alerts, visible_executors, visible_jobs, visible_rdds, visible_sql, visible_stages, App,
+    Tab, View,
+};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -143,6 +148,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         stage_filter,
         executors,
         sql,
+        rdds,
+        filters,
+        rdd_detail,
         stage_detail,
         detail_error,
         tasks,
@@ -219,13 +227,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             threads::draw(f, body, threads, threads_lines);
             return;
         }
+        View::Rdd => {
+            storage::draw_detail(f, body, rdd_detail.as_ref(), detail_error.as_deref());
+            return;
+        }
         View::Main => {}
     }
 
     // Failures come from the alert log, not the snapshot, so they show even
     // while the endpoint is unreachable.
+    let filter = |t: Tab| filters.get(&t).map(String::as_str);
     if *tab == Tab::Failures {
-        failures::draw_table(f, body, alerts, &mut alerts_cursor.state);
+        let rows: Vec<&Alert> = visible_alerts(alerts, filter(Tab::Failures));
+        let title = format!(
+            "{}· {} new · Enter full text · s open stage · x acknowledge ",
+            filtered_title("Failures", rows.len(), alerts.len(), filter(Tab::Failures)),
+            alerts.unacked()
+        );
+        failures::draw_table(f, body, alerts, &rows, title, &mut alerts_cursor.state);
         return;
     }
     if *tab == Tab::Streaming {
@@ -243,22 +262,45 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match *tab {
         Tab::Overview => overview::draw(f, body, snap, history),
-        Tab::Jobs => tables::draw_jobs(f, body, snap, &mut jobs.state),
-        Tab::Stages => {
-            let visible = visible_stages(snap, stage_filter);
-            let title = match stage_filter {
-                Some(fl) => format!(
-                    " Stages ({} of {}) · job #{} · Esc to clear ",
-                    visible.len(),
-                    snap.stages.len(),
-                    fl.job_id
-                ),
-                None => format!(" Stages ({}) ", visible.len()),
-            };
-            tables::draw_stages(f, body, &visible, title, &mut stages.state)
+        Tab::Jobs => {
+            let rows = visible_jobs(snap, filter(Tab::Jobs));
+            let title = filtered_title("Jobs", rows.len(), snap.jobs.len(), filter(Tab::Jobs));
+            tables::draw_jobs(f, body, &rows, title, &mut jobs.state)
         }
-        Tab::Executors => tables::draw_executors(f, body, snap, &mut executors.state),
-        Tab::Sql => tables::draw_sql(f, body, snap.sql.as_deref(), &mut sql.state),
+        Tab::Stages => {
+            let rows = visible_stages(snap, stage_filter, filter(Tab::Stages));
+            let mut title = filtered_title("Stages", rows.len(), snap.stages.len(), filter(Tab::Stages));
+            if let Some(fl) = stage_filter {
+                title = format!("{title}· job #{} · Esc to clear ", fl.job_id);
+            }
+            tables::draw_stages(f, body, &rows, title, &mut stages.state)
+        }
+        Tab::Executors => {
+            let rows = visible_executors(snap, filter(Tab::Executors));
+            let title = filtered_title("Executors", rows.len(), snap.executors.len(), filter(Tab::Executors));
+            tables::draw_executors(f, body, &rows, title, &mut executors.state)
+        }
+        Tab::Sql => {
+            let rows = visible_sql(snap, filter(Tab::Sql));
+            let title = format!(
+                "{}· Enter for plan ",
+                filtered_title(
+                    "SQL executions",
+                    rows.as_ref().map_or(0, Vec::len),
+                    snap.sql.as_ref().map_or(0, Vec::len),
+                    filter(Tab::Sql)
+                )
+            );
+            tables::draw_sql(f, body, rows.as_deref(), title, &mut sql.state)
+        }
+        Tab::Storage => {
+            let rows = visible_rdds(snap, filter(Tab::Storage));
+            let title = format!(
+                "{}· Enter for distribution ",
+                filtered_title("Cached RDDs", rows.len(), snap.rdds.len(), filter(Tab::Storage))
+            );
+            storage::draw_list(f, body, snap, &rows, title, &mut rdds.state)
+        }
         Tab::Failures | Tab::Streaming => unreachable!("handled above"),
     }
 }
@@ -279,14 +321,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let what = match (&app.view, &app.snapshot) {
         (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
-        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads, Some(s)) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads | View::Rdd, Some(s)) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
             s.app.name,
             s.app.id,
             app.endpoint,
             app.interval.as_secs()
         ),
-        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads, None) => format!(
+        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads | View::Rdd, None) => format!(
             "[{}] @ {} · every {}s · updated {age}",
             app.watching.as_deref().unwrap_or("—"),
             app.endpoint,
@@ -346,6 +388,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    // Typing a table filter takes over the footer.
+    if let (View::Main, Some(input)) = (app.view, &app.filter_input) {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" /", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(input.clone()),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("  filter {} · Enter apply · Esc cancel", app.tab.title().to_lowercase()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
     let help = match app.view {
         View::Picker if app.watching.is_some() => {
             " q quit · j/k move · Enter watch · Esc back · r refresh "
@@ -358,10 +416,13 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             " q quit · tab/←→ switch · j/k select query · x ack failures · a apps · r refresh · p pause "
         }
         View::Main if app.tab == Tab::Executors => {
-            " q quit · tab/←→ switch · j/k move · L logs · t threads · x ack failures · a apps · r refresh · p pause "
+            " q quit · tab/←→ switch · j/k move · / filter · L logs · t threads · x ack failures · a apps · r refresh · p pause "
+        }
+        View::Main if app.tab == Tab::Storage => {
+            " q quit · tab/←→ switch · j/k move · / filter · Enter distribution · a apps · r refresh · p pause "
         }
         View::Main => {
-            " q quit · tab/←→ switch · j/k move · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
+            " q quit · tab/←→ switch · j/k move · / filter · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
         }
         View::Stage => " Esc back · j/k tasks · f failed/slowest · L logs of task's executor · r refresh · p pause · q quit ",
         View::Logs => {
@@ -370,9 +431,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         View::Threads => " Esc back · j/k scroll · e expand · / filter · r refresh · L logs · q quit ",
         View::Sql => " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit ",
         View::Alert => " Esc back · j/k scroll · s open stage · L logs · x acknowledge · q quit ",
+        View::Rdd => " Esc back · r refresh · q quit ",
     };
     let error = match app.view {
         View::Stage | View::Sql => app.detail_error.as_ref().or(app.last_error.as_ref()),
+        View::Rdd => app.detail_error.as_ref().or(app.last_error.as_ref()),
         View::Alert | View::Logs | View::Threads => None,
         _ => app.last_error.as_ref(),
     };

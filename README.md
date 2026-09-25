@@ -27,12 +27,14 @@ sparkwatch [OPTIONS] [TARGET]
 
 | Option | Meaning |
 |---|---|
-| `TARGET` | Spark UI or History Server URL. With `--k8s`: the SparkApplication name. |
+| `TARGET` | Spark UI or History Server URL, or a target name from the config file. With `--k8s`: the SparkApplication name. |
 | `--k8s` | Find Spark driver pods with `kubectl` and port-forward to them. |
 | `-n, --namespace <NS>` | Kubernetes namespace (default: the current kubectl context's). Requires `--k8s`. |
 | `-a, --app <ID>` | Spark application id to watch; skips the picker on a History Server. |
-| `-i, --interval <SECS>` | Poll interval (default `2`). |
-| `-t, --timeout <SECS>` | HTTP timeout (default `5`). |
+| `-i, --interval <SECS>` | Poll interval (default `2`, or `[defaults].interval`). |
+| `-t, --timeout <SECS>` | HTTP timeout (default `5`, or `[defaults].timeout`). |
+| `--config <PATH>` | Config file (default `~/.config/sparkwatch.toml`). |
+| `--targets` | List configured targets and exit. |
 
 ### Live driver
 
@@ -70,12 +72,40 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 `spark-app-name` label set by `spark-submit`, or the driver pod name
 (`my-etl-driver`), so any of those work as `TARGET`.
 
+### Config file
+
+Name your clusters once in `~/.config/sparkwatch.toml` (or
+`$XDG_CONFIG_HOME/sparkwatch.toml`):
+
+```toml
+[defaults]
+interval = 2
+timeout = 5
+
+[targets.prod]
+k8s = true
+namespace = "spark"
+app = "my-etl"            # optional: skip the picker
+
+[targets.history]
+url = "http://history:18080"
+app = "app-20260923-0001" # optional
+```
+
+Then `sparkwatch prod` or `sparkwatch history`. Flags on the command line
+still win (`sparkwatch prod -n staging`), a URL that isn't a target name is
+used as-is, and with `--k8s` the positional is always an app name. A
+malformed config is an error, not silently ignored; `--targets` lists what
+it found.
+
 ## Keys
 
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`7` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming |
+| `1`–`8` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming / Storage |
+| `/` | Filter the table on Jobs / Stages / Executors / SQL / Failures / Storage (typed in the footer; `Enter` applies) |
+| `c` | Clear the table filter |
 | `j` `k` `↓` `↑` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
 | `g` `G` `Home` `End` | First / last row |
@@ -87,7 +117,7 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 | `f` | Stage drill-down: switch between slowest and failed tasks |
 | `Tab` / `p` | SQL drill-down: switch scrolling between plan and nodes / plan-only view |
 | `a` | Open the application picker |
-| `Esc` | Back: closes the drill-down, then the job filter, then the picker |
+| `Esc` | Back: closes a drill-down, then the table filter, then the job filter, then quits |
 | `r` | Refresh now |
 | `p` | Pause / resume polling |
 | `+` `-` | Poll interval up / down (1–60 s) |
@@ -112,6 +142,22 @@ The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
 - **Streaming** — Structured Streaming queries: batch durations, input vs
   processing rate, watermark lag, state size, with a `FALLING BEHIND` flag.
   See below.
+- **Storage** — storage memory used vs available across executors (and which
+  one is fullest), then every cached RDD / DataFrame: partitions cached vs
+  total (yellow when partial — the rest gets recomputed), storage level,
+  memory and disk. `Enter` shows how one RDD is spread across executors:
+  partitions, bytes, share, and how full that executor's storage is. The
+  History Server has no storage data.
+
+### Filtering
+
+`/` on any table tab opens a filter in the footer; type a substring and
+`Enter`. It matches what you'd expect for the tab — job/stage name and
+status, executor id/host/state/removal reason, query text and error, alert
+title and detail, RDD name and level — case-insensitively, and the title
+shows `Stages (12 of 340) · filter: writer`. Filters are per tab and stay
+until `c` or `Esc`. On a streaming app with thousands of micro-batches, `/`
+then `FAILED` on the SQL tab is the quickest way to the ones that matter.
 
 Dead executors show their `removeReason` next to the host on the Executors
 tab, executors the scheduler has excluded show `excl`, and failed stages carry

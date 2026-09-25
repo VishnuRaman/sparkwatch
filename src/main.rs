@@ -1,6 +1,7 @@
 mod alerts;
 mod analysis;
 mod app;
+mod config;
 mod k8s;
 mod logview;
 mod poller;
@@ -30,10 +31,22 @@ Examples:
   sparkwatch http://history:18080             History Server; pick an app
   sparkwatch http://history:18080 -a app-123  History Server; watch one app
   sparkwatch --k8s -n spark                   pick a running driver pod
-  sparkwatch --k8s -n spark my-etl            watch the SparkApplication my-etl")]
+  sparkwatch --k8s -n spark my-etl            watch the SparkApplication my-etl
+  sparkwatch prod                             a target from ~/.config/sparkwatch.toml
+
+Config file (~/.config/sparkwatch.toml or $XDG_CONFIG_HOME/sparkwatch.toml):
+  [defaults]
+  interval = 2
+  timeout = 5
+  [targets.prod]
+  k8s = true
+  namespace = \"spark\"
+  app = \"my-etl\"          # optional
+  [targets.history]
+  url = \"http://history:18080\"")]
 struct Cli {
-    /// Spark driver UI (http://host:4040) or History Server (http://host:18080).
-    /// With --k8s: the SparkApplication name to watch.
+    /// Spark driver UI (http://host:4040), History Server (http://host:18080),
+    /// or a target name from the config file. With --k8s: the SparkApplication name.
     target: Option<String>,
 
     /// Find Spark driver pods with kubectl and port-forward to them
@@ -41,27 +54,72 @@ struct Cli {
     k8s: bool,
 
     /// Kubernetes namespace (default: the current kubectl context's)
-    #[arg(short = 'n', long, requires = "k8s")]
+    #[arg(short = 'n', long)]
     namespace: Option<String>,
 
     /// Application id to watch; skips the picker when the endpoint lists several
     #[arg(short, long, conflicts_with = "k8s")]
     app: Option<String>,
 
-    /// Poll interval in seconds
-    #[arg(short, long, default_value_t = 2)]
-    interval: u64,
+    /// Poll interval in seconds [default: 2, or [defaults].interval]
+    #[arg(short, long)]
+    interval: Option<u64>,
 
-    /// HTTP timeout in seconds
-    #[arg(short, long, default_value_t = 5)]
-    timeout: u64,
+    /// HTTP timeout in seconds [default: 5, or [defaults].timeout]
+    #[arg(short, long)]
+    timeout: Option<u64>,
+
+    /// Config file [default: ~/.config/sparkwatch.toml]
+    #[arg(long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+
+    /// List the targets in the config file and exit
+    #[arg(long)]
+    targets: bool,
+}
+
+/// Fold a named config target into the CLI: the target supplies what the
+/// command line left unset.
+fn resolve_target(mut cli: Cli, cfg: &config::Config) -> Cli {
+    if cli.k8s {
+        return cli; // positional is an app name here, never a target name
+    }
+    let Some(t) = cli.target.as_ref().and_then(|n| cfg.targets.get(n)).cloned() else {
+        return cli;
+    };
+    if t.k8s {
+        cli.k8s = true;
+        cli.namespace = cli.namespace.or(t.namespace);
+        cli.target = t.app;
+        cli.app = None;
+    } else {
+        cli.target = t.url;
+        cli.app = cli.app.or(t.app);
+    }
+    cli
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let interval = Duration::from_secs(cli.interval.max(1));
-    let timeout = Duration::from_secs(cli.timeout.max(1));
+    let cfg = config::load(cli.config.clone())?;
+    if cli.targets {
+        if cfg.targets.is_empty() {
+            println!("no targets configured ({})", config::default_path().map(|p| p.display().to_string()).unwrap_or_default());
+        }
+        for (name, t) in &cfg.targets {
+            let how = if t.k8s {
+                format!("k8s{}", t.namespace.as_ref().map(|n| format!(" -n {n}")).unwrap_or_default())
+            } else {
+                t.url.clone().unwrap_or_default()
+            };
+            println!("{name:<16} {how}{}", t.app.as_ref().map(|a| format!("  app {a}")).unwrap_or_default());
+        }
+        return Ok(());
+    }
+    let cli = resolve_target(cli, &cfg);
+    let interval = Duration::from_secs(cli.interval.or(cfg.defaults.interval).unwrap_or(2).max(1));
+    let timeout = Duration::from_secs(cli.timeout.or(cfg.defaults.timeout).unwrap_or(5).max(1));
 
     // What the header shows as the endpoint, and which app (if any) to start on.
     let (source, endpoint, watch) = if cli.k8s {
@@ -215,6 +273,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             KeyCode::Char('p') => app.toggle_plan_only(),
             _ => {}
         },
+        View::Rdd => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.close_detail();
+                send(req_tx, Request::SetDetail(None)).await;
+            }
+            _ => {}
+        },
         View::Alert => match key.code {
             KeyCode::Esc | KeyCode::Backspace => app.close_alert(),
             KeyCode::Char('s') => open_alert_stage(app, req_tx).await,
@@ -257,11 +322,16 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             _ => {}
         },
         View::Main => match key.code {
-            // Esc peels back one layer: a stage filter first, then the app.
+            // Esc peels back one layer: the text filter, the job's stage
+            // filter, then the app.
             KeyCode::Esc => {
-                if !app.clear_stage_filter() {
+                if !app.clear_table_filter() && !app.clear_stage_filter() {
                     app.should_quit = true;
                 }
+            }
+            KeyCode::Char('/') => app.start_table_filter(),
+            KeyCode::Char('c') => {
+                app.clear_table_filter();
             }
             KeyCode::Enter => match app.tab {
                 app::Tab::Stages => {
@@ -278,6 +348,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 }
                 app::Tab::Jobs => app.filter_stages_by_selected_job(),
                 app::Tab::Failures => app.open_alert(),
+                app::Tab::Storage => {
+                    if let Some(target) = app.open_rdd_detail() {
+                        send(req_tx, Request::SetDetail(Some(target))).await;
+                        send(req_tx, Request::RefreshNow).await;
+                    }
+                }
                 _ => {}
             },
             KeyCode::Char('x') => app.alerts.acknowledge(),
@@ -303,7 +379,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 app.tab = app.tab.prev();
                 tap_if_streaming(app, req_tx).await;
             }
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
                 tap_if_streaming(app, req_tx).await;
             }
@@ -365,4 +441,45 @@ async fn send(req_tx: &mpsc::Sender<Request>, req: Request) {
     // The only way this fails is the poller having exited, and then we are
     // shutting down anyway.
     let _ = req_tx.send(req).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("sparkwatch").chain(args.iter().copied()))
+    }
+
+    fn cfg() -> config::Config {
+        config::parse(
+            "[targets.prod]\nk8s = true\nnamespace = \"spark\"\napp = \"my-etl\"\n[targets.history]\nurl = \"http://h:18080\"\napp = \"app-1\"",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn target_name_expands_to_its_settings() {
+        let c = resolve_target(cli(&["prod"]), &cfg());
+        assert!(c.k8s);
+        assert_eq!(c.namespace.as_deref(), Some("spark"));
+        assert_eq!(c.target.as_deref(), Some("my-etl"));
+
+        let c = resolve_target(cli(&["history"]), &cfg());
+        assert!(!c.k8s);
+        assert_eq!(c.target.as_deref(), Some("http://h:18080"));
+        assert_eq!(c.app.as_deref(), Some("app-1"));
+    }
+
+    #[test]
+    fn explicit_flags_win_and_unknown_names_pass_through() {
+        let c = resolve_target(cli(&["prod", "-n", "other"]), &cfg());
+        assert_eq!(c.namespace.as_deref(), Some("other"));
+        let c = resolve_target(cli(&["http://x:4040"]), &cfg());
+        assert_eq!(c.target.as_deref(), Some("http://x:4040"));
+        // With --k8s the positional is an app name, even if a target shares it.
+        let c = resolve_target(cli(&["--k8s", "prod"]), &cfg());
+        assert_eq!(c.target.as_deref(), Some("prod"));
+        assert_eq!(c.namespace, None);
+    }
 }

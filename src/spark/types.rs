@@ -412,7 +412,9 @@ impl ThreadStackTrace {
 
     /// Doing something for a task, as opposed to idling in a pool.
     pub fn is_spark_work(&self) -> bool {
-        self.frames().iter().any(|f| f.starts_with("org.apache.spark"))
+        self.frames()
+            .iter()
+            .any(|f| f.starts_with("org.apache.spark"))
     }
 }
 
@@ -550,7 +552,12 @@ mod tests {
             {"id":"3","isActive":true,"isBlacklisted":true},
             {"id":"4","isActive":true,"isExcluded":true}
         ]"#).unwrap();
-        assert!(e[0].remove_reason.as_deref().unwrap().starts_with("Container killed"));
+        assert!(
+            e[0].remove_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("Container killed")
+        );
         assert!(e[1].excluded() && e[2].excluded());
     }
 
@@ -578,9 +585,17 @@ mod tests {
     fn parses_task_list_including_failed_task() {
         let t: Vec<TaskData> = serde_json::from_str(TASKS_JSON).unwrap();
         assert_eq!(t[0].duration_ms(), 91_000);
-        assert_eq!(t[0].metrics().shuffle_read_metrics.bytes(), 1073741824 + 1048576);
+        assert_eq!(
+            t[0].metrics().shuffle_read_metrics.bytes(),
+            1073741824 + 1048576
+        );
         assert_eq!(t[1].duration_ms(), 0);
-        assert!(t[1].error_message.as_deref().unwrap().starts_with("ExecutorLostFailure"));
+        assert!(
+            t[1].error_message
+                .as_deref()
+                .unwrap()
+                .starts_with("ExecutorLostFailure")
+        );
     }
 
     #[test]
@@ -597,7 +612,10 @@ mod tests {
         let s: StageData = serde_json::from_str(r#"{"stageId":9,"attemptId":0,
             "failureReason":"Job aborted due to stage failure",
             "executorSummary":{"1":{"taskTime":1820000,"failedTasks":2,"succeededTasks":98,"isExcludedForStage":true}}}"#).unwrap();
-        assert_eq!(s.failure_reason.as_deref(), Some("Job aborted due to stage failure"));
+        assert_eq!(
+            s.failure_reason.as_deref(),
+            Some("Job aborted due to stage failure")
+        );
         let e = &s.executor_summary["1"];
         assert_eq!(e.tasks(), 100);
         assert!(e.excluded());
@@ -637,7 +655,11 @@ mod tests {
         let e: Vec<ExecutorSummary> = serde_json::from_str(r#"[{"id":"1",
             "executorLogs":{"stdout":"http://nm:8042/node/containerlogs/c/u/stdout?start=-4096",
                             "stderr":"http://nm:8042/node/containerlogs/c/u/stderr?start=-4096"}}]"#).unwrap();
-        assert!(e[0].log_url("stderr").unwrap().ends_with("stderr?start=-4096"));
+        assert!(
+            e[0].log_url("stderr")
+                .unwrap()
+                .ends_with("stderr?start=-4096")
+        );
         assert!(e[0].log_url("nope").is_none());
     }
 

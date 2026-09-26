@@ -3,11 +3,11 @@
 use super::{header_row, selected_style, table_block};
 use crate::alerts::{Alert, AlertLog, Kind};
 use ratatui::{
+    Frame,
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
-    Frame,
 };
 use std::time::Instant;
 
@@ -32,7 +32,9 @@ fn kind_style(kind: Kind) -> Style {
 
 /// One red line under the header while there are unacknowledged failures.
 pub fn draw_strip(f: &mut Frame, area: Rect, log: &AlertLog) {
-    let Some(latest) = log.latest_unacked() else { return };
+    let Some(latest) = log.latest_unacked() else {
+        return;
+    };
     let n = log.unacked();
     let text = format!(
         " ▲ {n} new failure{} · {} — {} · x acknowledge · 6 for all ",
@@ -43,13 +45,23 @@ pub fn draw_strip(f: &mut Frame, area: Rect, log: &AlertLog) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             text,
-            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
         ))),
         area,
     );
 }
 
-pub fn draw_table(f: &mut Frame, area: Rect, log: &AlertLog, rows_in: &[&Alert], title: String, state: &mut TableState) {
+pub fn draw_table(
+    f: &mut Frame,
+    area: Rect,
+    log: &AlertLog,
+    rows_in: &[&Alert],
+    title: String,
+    state: &mut TableState,
+) {
     if log.len() == 0 {
         f.render_widget(
             Paragraph::new(vec![
@@ -110,7 +122,10 @@ pub fn draw_detail(f: &mut Frame, area: Rect, alert: &Alert, scroll: u16) {
     f.render_widget(block, area);
 
     let mut lines = vec![Line::from(vec![
-        Span::styled(alert.kind.label(), kind_style(alert.kind).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            alert.kind.label(),
+            kind_style(alert.kind).add_modifier(Modifier::BOLD),
+        ),
         format!("  first seen {}", age(alert.first_seen)).dark_gray(),
         match alert.stage {
             Some((id, att)) => format!("  stage {id}.{att} (s to open)").dark_gray(),
@@ -126,7 +141,10 @@ pub fn draw_detail(f: &mut Frame, area: Rect, alert: &Alert, scroll: u16) {
         Some(d) => lines.extend(d.lines().map(|l| {
             // Stack frames fade back so the exception line stands out.
             if l.trim_start().starts_with("at ") {
-                Line::from(Span::styled(l.to_string(), Style::default().fg(Color::DarkGray)))
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ))
             } else {
                 Line::from(l.to_string())
             }
@@ -137,7 +155,9 @@ pub fn draw_detail(f: &mut Frame, area: Rect, alert: &Alert, scroll: u16) {
         ))),
     }
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         inner,
     );
 }

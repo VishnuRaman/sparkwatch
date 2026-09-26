@@ -97,7 +97,10 @@ impl AlertLog {
 
     /// Not yet acknowledged with `x`.
     pub fn is_new(&self, a: &Alert) -> bool {
-        self.alerts.iter().position(|x| x.key == a.key).is_some_and(|i| i >= self.acked)
+        self.alerts
+            .iter()
+            .position(|x| x.key == a.key)
+            .is_some_and(|i| i >= self.acked)
     }
 
     pub fn clear(&mut self) {
@@ -113,10 +116,11 @@ impl AlertLog {
         if self.keys.contains(&alert.key) {
             // Already known; the only thing worth updating is a reason that
             // arrived later (Spark fills failureReason after the FAILED status).
-            if let Some(existing) = self.alerts.iter_mut().find(|a| a.key == alert.key) {
-                if existing.detail.is_none() && alert.detail.is_some() {
-                    existing.detail = alert.detail.take();
-                }
+            if let Some(existing) = self.alerts.iter_mut().find(|a| a.key == alert.key)
+                && existing.detail.is_none()
+                && alert.detail.is_some()
+            {
+                existing.detail = alert.detail.take();
             }
             return;
         }
@@ -139,7 +143,10 @@ impl AlertLog {
                 key: format!("stage:{}.{}", st.stage_id, st.attempt_id),
                 kind: Kind::Stage,
                 first_seen: Instant::now(),
-                title: format!("Stage {}.{} failed · {}", st.stage_id, st.attempt_id, st.name),
+                title: format!(
+                    "Stage {}.{} failed · {}",
+                    st.stage_id, st.attempt_id, st.name
+                ),
                 detail: st.failure_reason.clone(),
                 stage: Some(st.key()),
                 executor_id: None,
@@ -337,6 +344,9 @@ mod tests {
             log.ingest(&snap);
         }
         assert_eq!(log.len(), MAX_ALERTS);
-        assert_eq!(log.newest_first().next().unwrap().stage, Some((MAX_ALERTS as i64 + 49, 0)));
+        assert_eq!(
+            log.newest_first().next().unwrap().stage,
+            Some((MAX_ALERTS as i64 + 49, 0))
+        );
     }
 }

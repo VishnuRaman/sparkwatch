@@ -1,19 +1,25 @@
 //! Jobs / Stages / Executors tables.
 
+use super::fmt_millis;
 use super::{
     fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style, table_block, warn_if,
 };
-use super::fmt_millis;
 use crate::spark::{ExecutionData, ExecutorSummary, JobData, StageData};
 use ratatui::{
+    Frame,
     layout::{Constraint, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Cell, Paragraph, Row, Table, TableState},
-    Frame,
 };
 
-pub fn draw_jobs(f: &mut Frame, area: Rect, jobs: &[&JobData], title: String, state: &mut TableState) {
+pub fn draw_jobs(
+    f: &mut Frame,
+    area: Rect,
+    jobs: &[&JobData],
+    title: String,
+    state: &mut TableState,
+) {
     let rows: Vec<Row> = jobs
         .iter()
         .map(|j| {
@@ -44,7 +50,14 @@ pub fn draw_jobs(f: &mut Frame, area: Rect, jobs: &[&JobData], title: String, st
         ],
     )
     .header(header_row(&[
-        "ID", "STATUS", "NAME", "SUBMITTED", "TASKS", "FAILED", "STAGES", "PROGRESS",
+        "ID",
+        "STATUS",
+        "NAME",
+        "SUBMITTED",
+        "TASKS",
+        "FAILED",
+        "STAGES",
+        "PROGRESS",
     ]))
     .block(table_block(title))
     .row_highlight_style(selected_style())
@@ -53,7 +66,13 @@ pub fn draw_jobs(f: &mut Frame, area: Rect, jobs: &[&JobData], title: String, st
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: String, state: &mut TableState) {
+pub fn draw_stages(
+    f: &mut Frame,
+    area: Rect,
+    stages: &[&StageData],
+    title: String,
+    state: &mut TableState,
+) {
     let rows: Vec<Row> = stages
         .iter()
         .map(|st| {
@@ -62,7 +81,11 @@ pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: Stri
                     "{}.{}{}",
                     st.stage_id,
                     st.attempt_id,
-                    if st.failure_reason.is_some() { " ✗" } else { "" }
+                    if st.failure_reason.is_some() {
+                        " ✗"
+                    } else {
+                        ""
+                    }
                 )),
                 Cell::from(st.status.clone()).style(status_style(&st.status)),
                 Cell::from(st.name.chars().take(40).collect::<String>()),
@@ -70,11 +93,13 @@ pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: Stri
                 Cell::from(fmt_bytes(st.input_bytes)),
                 Cell::from(fmt_bytes(st.shuffle_read_bytes)),
                 Cell::from(fmt_bytes(st.shuffle_write_bytes)),
-                Cell::from(fmt_bytes(st.memory_bytes_spilled)).style(if st.memory_bytes_spilled > 0 {
-                    Style::default().fg(Color::Magenta)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                }),
+                Cell::from(fmt_bytes(st.memory_bytes_spilled)).style(
+                    if st.memory_bytes_spilled > 0 {
+                        Style::default().fg(Color::Magenta)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
                 Cell::from(mini_bar(st.progress(), 12)),
             ])
         })
@@ -104,7 +129,13 @@ pub fn draw_stages(f: &mut Frame, area: Rect, stages: &[&StageData], title: Stri
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_executors(f: &mut Frame, area: Rect, execs: &[&ExecutorSummary], title: String, state: &mut TableState) {
+pub fn draw_executors(
+    f: &mut Frame,
+    area: Rect,
+    execs: &[&ExecutorSummary],
+    title: String,
+    state: &mut TableState,
+) {
     let rows: Vec<Row> = execs
         .iter()
         .map(|e| {
@@ -125,7 +156,12 @@ pub fn draw_executors(f: &mut Frame, area: Rect, execs: &[&ExecutorSummary], tit
                 (Some(r), false) => format!(
                     "{} · {}",
                     e.host_port,
-                    r.lines().next().unwrap_or(r).chars().take(48).collect::<String>()
+                    r.lines()
+                        .next()
+                        .unwrap_or(r)
+                        .chars()
+                        .take(48)
+                        .collect::<String>()
                 ),
                 _ => e.host_port.clone(),
             };
@@ -139,7 +175,11 @@ pub fn draw_executors(f: &mut Frame, area: Rect, execs: &[&ExecutorSummary], tit
                 }),
                 Cell::from(format!("{}/{}", e.active_tasks, e.total_cores)),
                 Cell::from(e.failed_tasks.to_string()).style(warn_if(e.failed_tasks)),
-                Cell::from(format!("{} / {}", fmt_bytes(e.memory_used), fmt_bytes(e.max_memory))),
+                Cell::from(format!(
+                    "{} / {}",
+                    fmt_bytes(e.memory_used),
+                    fmt_bytes(e.max_memory)
+                )),
                 Cell::from(mini_bar(e.memory_ratio(), 10)),
                 Cell::from(format!("{gc_pct:.1}%")).style(if gc_pct > 10.0 {
                     Style::default().fg(Color::Red)
@@ -175,7 +215,13 @@ pub fn draw_executors(f: &mut Frame, area: Rect, execs: &[&ExecutorSummary], tit
     f.render_stateful_widget(table, area, state);
 }
 
-pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[&ExecutionData]>, title: String, state: &mut TableState) {
+pub fn draw_sql(
+    f: &mut Frame,
+    area: Rect,
+    sql: Option<&[&ExecutionData]>,
+    title: String,
+    state: &mut TableState,
+) {
     let Some(execs) = sql else {
         f.render_widget(
             Paragraph::new(vec![
@@ -235,7 +281,15 @@ pub fn draw_sql(f: &mut Frame, area: Rect, sql: Option<&[&ExecutionData]>, title
             Constraint::Min(16),
         ],
     )
-    .header(header_row(&["ID", "STATUS", "QUERY", "SUBMITTED", "DURATION", "JOBS", "ERROR"]))
+    .header(header_row(&[
+        "ID",
+        "STATUS",
+        "QUERY",
+        "SUBMITTED",
+        "DURATION",
+        "JOBS",
+        "ERROR",
+    ]))
     .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");

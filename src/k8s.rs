@@ -64,7 +64,10 @@ pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
         .await
         .context("running kubectl (is it on PATH?)")?;
     if !out.status.success() {
-        anyhow::bail!("kubectl get pods: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "kubectl get pods: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let json: Value = serde_json::from_slice(&out.stdout).context("parsing kubectl output")?;
 
@@ -99,31 +102,43 @@ pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
 
 pub async fn find_driver(namespace: Option<&str>, name: &str) -> Result<Driver> {
     let drivers = list_drivers(namespace).await?;
-    drivers.iter().find(|d| d.matches(name)).cloned().with_context(|| {
-        let known: Vec<_> = drivers.iter().map(|d| d.app_name.as_str()).collect();
-        format!(
-            "no running driver for '{name}'{}",
-            if known.is_empty() {
-                String::new()
-            } else {
-                format!(" (running: {})", known.join(", "))
-            }
-        )
-    })
+    drivers
+        .iter()
+        .find(|d| d.matches(name))
+        .cloned()
+        .with_context(|| {
+            let known: Vec<_> = drivers.iter().map(|d| d.app_name.as_str()).collect();
+            format!(
+                "no running driver for '{name}'{}",
+                if known.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (running: {})", known.join(", "))
+                }
+            )
+        })
 }
 
 /// The pod running executor `exec_id` of Spark application `spark_app_id`,
 /// if it still exists. Spark labels executor pods with `spark-exec-id` and
 /// `spark-app-selector` (= the Spark app id); the operator keeps those.
-pub async fn find_executor_pod(namespace: Option<&str>, spark_app_id: &str, exec_id: &str) -> Result<Option<String>> {
-    let selector = format!("spark-role=executor,spark-exec-id={exec_id},spark-app-selector={spark_app_id}");
+pub async fn find_executor_pod(
+    namespace: Option<&str>,
+    spark_app_id: &str,
+    exec_id: &str,
+) -> Result<Option<String>> {
+    let selector =
+        format!("spark-role=executor,spark-exec-id={exec_id},spark-app-selector={spark_app_id}");
     let out = kubectl(namespace)
         .args(["get", "pods", "-l", &selector, "-o", "json"])
         .output()
         .await
         .context("running kubectl (is it on PATH?)")?;
     if !out.status.success() {
-        anyhow::bail!("kubectl get pods: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "kubectl get pods: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let json: Value = serde_json::from_slice(&out.stdout).context("parsing kubectl output")?;
     Ok(json["items"]
@@ -267,8 +282,14 @@ mod tests {
 
     #[test]
     fn parses_kubectl_forwarding_banner() {
-        assert_eq!(parse_forwarding_line("Forwarding from 127.0.0.1:54321 -> 4040"), Some(54321));
-        assert_eq!(parse_forwarding_line("Forwarding from [::1]:54321 -> 4040"), Some(54321));
+        assert_eq!(
+            parse_forwarding_line("Forwarding from 127.0.0.1:54321 -> 4040"),
+            Some(54321)
+        );
+        assert_eq!(
+            parse_forwarding_line("Forwarding from [::1]:54321 -> 4040"),
+            Some(54321)
+        );
         assert_eq!(parse_forwarding_line("Handling connection for 54321"), None);
     }
 

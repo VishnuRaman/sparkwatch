@@ -198,7 +198,14 @@ Per query, stacked (selected query expanded, others one summary line when there 
 
 ## Out of scope (later)
 
-- **GitHub release workflow** — cross-compile on tag (macOS arm64/x86, Linux, Windows) and attach binaries, so it installs without a Rust toolchain.
+(nothing left from the original list)
+
+## Phase 8 — CI and releases ✅ done
+
+- `.github/workflows/ci.yml`: `cargo fmt --check` + `clippy --all-targets -D warnings` on Linux, then `cargo test --locked`, a release build and `--help` on Linux/macOS/Windows. The tree was `cargo fmt`-ed and clippy-cleaned once to make that enforceable.
+- `.github/workflows/release.yml` on `v*` tags: a job that refuses a tag not matching `Cargo.toml`'s version; a matrix of `x86_64`/`aarch64-unknown-linux-musl` (static, runs in any image), `x86_64`/`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`; archives `sparkwatch-<ver>-<target>.tar.gz|zip` with the README; `SHA256SUMS`; `softprops/action-gh-release` with generated notes. Linux arm64 builds natively on `ubuntu-24.04-arm` rather than cross-compiling.
+- `install.sh`: detects OS/arch, resolves the latest tag from the `/releases/latest` redirect (no API token), downloads the archive + `SHA256SUMS`, verifies, installs to `~/.local/bin` or `/usr/local/bin`; `SPARKWATCH_VERSION` / `SPARKWATCH_INSTALL_DIR` overrides.
+- `Cargo.toml`: crate metadata and a `[profile.release]` with LTO, one codegen unit, `strip`, `panic = "abort"` for small assets. No license field yet — pick one before the first public release.
 
 ## Phase 7 — table filtering, Storage tab, config file ✅ done
 

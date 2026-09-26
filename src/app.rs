@@ -1,9 +1,9 @@
 use crate::alerts::{Alert, AlertLog, Kind};
-use crate::logview::{filter_from_error, LogTarget, LogView, Stream};
+use crate::logview::{LogTarget, LogView, Stream, filter_from_error};
 use crate::poller::{Detail, DetailData, LogEvent};
 use crate::spark::{
-    ApplicationInfo, ExecutionData, ExecutorSummary, JobData, RddStorageInfo, Snapshot, StageData, StageDetail,
-    TaskData, ThreadStackTrace,
+    ApplicationInfo, ExecutionData, ExecutorSummary, JobData, RddStorageInfo, Snapshot, StageData,
+    StageDetail, TaskData, ThreadStackTrace,
 };
 use crate::streaming::{Progress, Streaming};
 use crate::ui::sql_detail::Pane;
@@ -180,11 +180,27 @@ pub fn visible_jobs<'a>(s: &'a Snapshot, f: Option<&str>) -> Vec<&'a JobData> {
 
 /// The stages the Stages tab shows: the job filter (Enter on a job) and the
 /// text filter both apply.
-pub fn visible_stages<'a>(s: &'a Snapshot, job: &Option<StageFilter>, f: Option<&str>) -> Vec<&'a StageData> {
+pub fn visible_stages<'a>(
+    s: &'a Snapshot,
+    job: &Option<StageFilter>,
+    f: Option<&str>,
+) -> Vec<&'a StageData> {
     s.stages
         .iter()
-        .filter(|st| job.as_ref().is_none_or(|j| j.stage_ids.contains(&st.stage_id)))
-        .filter(|st| hit(f, &[&format!("{}.{}", st.stage_id, st.attempt_id), &st.status, &st.name]))
+        .filter(|st| {
+            job.as_ref()
+                .is_none_or(|j| j.stage_ids.contains(&st.stage_id))
+        })
+        .filter(|st| {
+            hit(
+                f,
+                &[
+                    &format!("{}.{}", st.stage_id, st.attempt_id),
+                    &st.status,
+                    &st.name,
+                ],
+            )
+        })
         .collect()
 }
 
@@ -192,8 +208,22 @@ pub fn visible_executors<'a>(s: &'a Snapshot, f: Option<&str>) -> Vec<&'a Execut
     s.executors
         .iter()
         .filter(|e| {
-            let state = if !e.is_active { "dead" } else if e.excluded() { "excluded" } else { "up" };
-            hit(f, &[&e.id, &e.host_port, state, e.remove_reason.as_deref().unwrap_or("")])
+            let state = if !e.is_active {
+                "dead"
+            } else if e.excluded() {
+                "excluded"
+            } else {
+                "up"
+            };
+            hit(
+                f,
+                &[
+                    &e.id,
+                    &e.host_port,
+                    state,
+                    e.remove_reason.as_deref().unwrap_or(""),
+                ],
+            )
         })
         .collect()
 }
@@ -203,14 +233,29 @@ pub fn visible_sql<'a>(s: &'a Snapshot, f: Option<&str>) -> Option<Vec<&'a Execu
         s.sql
             .as_ref()?
             .iter()
-            .filter(|e| hit(f, &[&e.id.to_string(), &e.status, &e.description, e.error_message.as_deref().unwrap_or("")]))
+            .filter(|e| {
+                hit(
+                    f,
+                    &[
+                        &e.id.to_string(),
+                        &e.status,
+                        &e.description,
+                        e.error_message.as_deref().unwrap_or(""),
+                    ],
+                )
+            })
             .collect(),
     )
 }
 
 pub fn visible_alerts<'a>(log: &'a AlertLog, f: Option<&str>) -> Vec<&'a Alert> {
     log.newest_first()
-        .filter(|a| hit(f, &[a.kind.label(), &a.title, a.detail.as_deref().unwrap_or("")]))
+        .filter(|a| {
+            hit(
+                f,
+                &[a.kind.label(), &a.title, a.detail.as_deref().unwrap_or("")],
+            )
+        })
         .collect()
 }
 
@@ -299,7 +344,11 @@ pub struct App {
 impl App {
     pub fn new(endpoint: String, interval: Duration, watching: Option<String>) -> Self {
         Self {
-            view: if watching.is_some() { View::Main } else { View::Picker },
+            view: if watching.is_some() {
+                View::Main
+            } else {
+                View::Picker
+            },
             tab: Tab::Overview,
             endpoint,
             interval,
@@ -409,7 +458,8 @@ impl App {
                 self.detail_error = None;
             }
             Ok(DetailData::Sql(None)) => {
-                self.detail_error = Some("this execution is no longer retained by the driver".into());
+                self.detail_error =
+                    Some("this execution is no longer retained by the driver".into());
             }
             Ok(DetailData::Rdd(Some(r))) => {
                 self.rdd_detail = Some(r);
@@ -442,7 +492,9 @@ impl App {
         alerts_cursor.resync(&visible_alerts(alerts, f(Tab::Failures)), |a| a.key.clone());
         let Some(s) = snapshot else { return };
         jobs.resync(&visible_jobs(s, f(Tab::Jobs)), |j| j.job_id);
-        stages.resync(&visible_stages(s, stage_filter, f(Tab::Stages)), |st| st.key());
+        stages.resync(&visible_stages(s, stage_filter, f(Tab::Stages)), |st| {
+            st.key()
+        });
         executors.resync(&visible_executors(s, f(Tab::Executors)), |e| e.id.clone());
         sql.resync(&visible_sql(s, f(Tab::Sql)).unwrap_or_default(), |e| e.id);
         rdds.resync(&visible_rdds(s, f(Tab::Storage)), |r| r.id);
@@ -593,7 +645,11 @@ impl App {
     // ------------------------------------------------------- logs & threads
 
     fn executor(&self, id: &str) -> Option<&crate::spark::ExecutorSummary> {
-        self.snapshot.as_ref()?.executors.iter().find(|e| e.id == id)
+        self.snapshot
+            .as_ref()?
+            .executors
+            .iter()
+            .find(|e| e.id == id)
     }
 
     /// Open the log viewer on an executor. Returns the target to stream.
@@ -662,7 +718,9 @@ impl App {
     pub fn logs_toggle_stream(&mut self) -> Option<LogTarget> {
         let mut t = self.logs.target.clone()?;
         t.stream = t.stream.other();
-        t.http_url = self.executor(&t.executor_id).and_then(|e| e.log_url(t.stream.name()));
+        t.http_url = self
+            .executor(&t.executor_id)
+            .and_then(|e| e.log_url(t.stream.name()));
         let filter = self.logs.filter.clone();
         self.logs.open(t.clone(), filter);
         Some(t)
@@ -707,7 +765,11 @@ impl App {
         self.view = self.return_view;
     }
 
-    pub fn apply_threads(&mut self, executor_id: &str, result: Result<Option<Vec<ThreadStackTrace>>, String>) {
+    pub fn apply_threads(
+        &mut self,
+        executor_id: &str,
+        result: Result<Option<Vec<ThreadStackTrace>>, String>,
+    ) {
         if self.view != View::Threads || self.threads.executor_id != executor_id {
             return;
         }
@@ -775,7 +837,13 @@ impl App {
                         self.threads.filter_input.as_mut().unwrap().pop();
                     }
                     Enter => {
-                        let f = self.threads.filter_input.take().unwrap().trim().to_lowercase();
+                        let f = self
+                            .threads
+                            .filter_input
+                            .take()
+                            .unwrap()
+                            .trim()
+                            .to_lowercase();
                         self.threads.filter = if f.is_empty() { None } else { Some(f) };
                         self.threads.scroll = 0;
                     }
@@ -837,7 +905,11 @@ impl App {
         let Some(e) = &self.sql_detail else { return 0 };
         let lines = match self.sql_focus {
             Pane::Plan => e.plan_description.lines().count(),
-            Pane::Nodes => e.nodes.iter().map(|n| crate::ui::sql_detail::node_lines(n).len()).sum(),
+            Pane::Nodes => e
+                .nodes
+                .iter()
+                .map(|n| crate::ui::sql_detail::node_lines(n).len())
+                .sum(),
         };
         lines.saturating_sub(1).min(u16::MAX as usize) as u16
     }
@@ -895,7 +967,10 @@ impl App {
     /// Enter on the Jobs tab: show only that job's stages.
     pub fn filter_stages_by_selected_job(&mut self) {
         let Some(s) = &self.snapshot else { return };
-        let Some(job) = visible_jobs(s, self.filter_for(Tab::Jobs)).get(self.jobs.selected()).copied() else {
+        let Some(job) = visible_jobs(s, self.filter_for(Tab::Jobs))
+            .get(self.jobs.selected())
+            .copied()
+        else {
             return;
         };
         self.stage_filter = Some(StageFilter {
@@ -920,7 +995,9 @@ impl App {
 
     pub fn selected_rdd(&self) -> Option<&RddStorageInfo> {
         let s = self.snapshot.as_ref()?;
-        visible_rdds(s, self.filter_for(Tab::Storage)).get(self.rdds.selected()).copied()
+        visible_rdds(s, self.filter_for(Tab::Storage))
+            .get(self.rdds.selected())
+            .copied()
     }
 
     pub fn open_rdd_detail(&mut self) -> Option<Detail> {
@@ -1054,8 +1131,12 @@ impl App {
                 let f = filters.get(tab).map(String::as_str);
                 match tab {
                     Tab::Jobs => jobs.select(index, &visible_jobs(s, f), |j| j.job_id),
-                    Tab::Stages => stages.select(index, &visible_stages(s, stage_filter, f), |st| st.key()),
-                    Tab::Executors => executors.select(index, &visible_executors(s, f), |e| e.id.clone()),
+                    Tab::Stages => {
+                        stages.select(index, &visible_stages(s, stage_filter, f), |st| st.key())
+                    }
+                    Tab::Executors => {
+                        executors.select(index, &visible_executors(s, f), |e| e.id.clone())
+                    }
                     Tab::Sql => sql.select(index, &visible_sql(s, f).unwrap_or_default(), |e| e.id),
                     Tab::Storage => rdds.select(index, &visible_rdds(s, f), |r| r.id),
                     Tab::Overview | Tab::Failures | Tab::Streaming => {}
@@ -1188,7 +1269,11 @@ mod tests {
                 stage_ids: vec![7, 9],
                 ..Default::default()
             }],
-            stages: vec![stage(9, "ACTIVE"), stage(8, "COMPLETE"), stage(7, "COMPLETE")],
+            stages: vec![
+                stage(9, "ACTIVE"),
+                stage(8, "COMPLETE"),
+                stage(7, "COMPLETE"),
+            ],
             ..Default::default()
         };
         app.apply_snapshot("a", Ok(snap));
@@ -1219,9 +1304,24 @@ mod tests {
         let mut app = watched_app();
         let snap = Snapshot {
             stages: vec![
-                StageData { stage_id: 9, status: "ACTIVE".into(), name: "mapPartitions at Writer.scala:88".into(), ..Default::default() },
-                StageData { stage_id: 8, status: "COMPLETE".into(), name: "exchange at Writer.scala:70".into(), ..Default::default() },
-                StageData { stage_id: 4, status: "FAILED".into(), name: "collect at Main.scala:22".into(), ..Default::default() },
+                StageData {
+                    stage_id: 9,
+                    status: "ACTIVE".into(),
+                    name: "mapPartitions at Writer.scala:88".into(),
+                    ..Default::default()
+                },
+                StageData {
+                    stage_id: 8,
+                    status: "COMPLETE".into(),
+                    name: "exchange at Writer.scala:70".into(),
+                    ..Default::default()
+                },
+                StageData {
+                    stage_id: 4,
+                    status: "FAILED".into(),
+                    name: "collect at Main.scala:22".into(),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
@@ -1234,10 +1334,14 @@ mod tests {
         }
         assert!(app.filter_input_key(crossterm::event::KeyCode::Enter));
         assert_eq!(app.filter_for(Tab::Stages), Some("writer"));
-        let ids: Vec<i64> = visible_stages(app.snapshot.as_ref().unwrap(), &None, app.filter_for(Tab::Stages))
-            .iter()
-            .map(|s| s.stage_id)
-            .collect();
+        let ids: Vec<i64> = visible_stages(
+            app.snapshot.as_ref().unwrap(),
+            &None,
+            app.filter_for(Tab::Stages),
+        )
+        .iter()
+        .map(|s| s.stage_id)
+        .collect();
         assert_eq!(ids, [9, 8]);
         // Stage 4 vanished from view; the cursor lands on a visible row.
         assert!(app.selected_stage().is_some());
@@ -1314,7 +1418,10 @@ mod tests {
         assert_eq!(app.logs.filter.as_deref(), Some("executorlostfailure"));
         assert_eq!(app.view, View::Logs);
 
-        app.apply_log(LogEvent::Lines(vec!["INFO ok".into(), "ERROR ExecutorLostFailure boom".into()]));
+        app.apply_log(LogEvent::Lines(vec![
+            "INFO ok".into(),
+            "ERROR ExecutorLostFailure boom".into(),
+        ]));
         assert_eq!(app.logs.visible(), ["ERROR ExecutorLostFailure boom"]);
         app.close_logs();
         assert_eq!(app.view, View::Stage, "Esc returns to where L was pressed");
@@ -1324,7 +1431,10 @@ mod tests {
     fn sql_detail_scrolls_focused_pane_within_bounds() {
         let mut app = watched_app();
         let snap = Snapshot {
-            sql: Some(vec![ExecutionData { id: 12, ..Default::default() }]),
+            sql: Some(vec![ExecutionData {
+                id: 12,
+                ..Default::default()
+            }]),
             ..Default::default()
         };
         app.apply_snapshot("a", Ok(snap));
@@ -1347,7 +1457,12 @@ mod tests {
         assert_eq!(app.plan_scroll, 3);
 
         app.apply_detail(target, Ok(DetailData::Sql(None)));
-        assert!(app.detail_error.as_deref().unwrap().contains("no longer retained"));
+        assert!(
+            app.detail_error
+                .as_deref()
+                .unwrap()
+                .contains("no longer retained")
+        );
         assert!(app.sql_detail.is_some()); // last good data stays
     }
 
@@ -1365,7 +1480,10 @@ mod tests {
         assert!(app.stage_detail.is_none());
 
         let detail = StageDetail {
-            slowest: vec![TaskData { task_id: 1, ..Default::default() }],
+            slowest: vec![TaskData {
+                task_id: 1,
+                ..Default::default()
+            }],
             ..Default::default()
         };
         app.apply_detail(target, Ok(DetailData::Stage(detail)));

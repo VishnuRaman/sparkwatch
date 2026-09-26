@@ -5,11 +5,11 @@ use super::{fmt_bytes, fmt_millis, header_row, selected_style, status_style, tab
 use crate::analysis::{self, Unit};
 use crate::spark::{StageDetail, TaskData};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState, Wrap},
-    Frame,
 };
 
 pub struct Props<'a> {
@@ -23,8 +23,14 @@ pub struct Props<'a> {
 pub fn draw(f: &mut Frame, area: Rect, p: Props) {
     let Some(d) = p.detail else {
         let text = match p.error {
-            Some(e) => Line::from(Span::styled(format!("Error: {e}"), Style::default().fg(Color::Red))),
-            None => Line::from(Span::styled("Loading stage…", Style::default().fg(Color::DarkGray))),
+            Some(e) => Line::from(Span::styled(
+                format!("Error: {e}"),
+                Style::default().fg(Color::Red),
+            )),
+            None => Line::from(Span::styled(
+                "Loading stage…",
+                Style::default().fg(Color::DarkGray),
+            )),
         };
         f.render_widget(
             Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
@@ -79,13 +85,20 @@ fn draw_head(f: &mut Frame, area: Rect, d: &StageDetail) {
     };
     let lines = vec![
         Line::from(vec![
-            Span::styled(st.status.clone(), status_style(&st.status).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                st.status.clone(),
+                status_style(&st.status).add_modifier(Modifier::BOLD),
+            ),
             "  pool ".dark_gray(),
             st.scheduling_pool.clone().into(),
             "  tasks ".dark_gray(),
             format!(
                 "{} done · {} running · {} failed · {} killed / {}",
-                st.num_complete_tasks, st.num_active_tasks, st.num_failed_tasks, st.num_killed_tasks, st.num_tasks
+                st.num_complete_tasks,
+                st.num_active_tasks,
+                st.num_failed_tasks,
+                st.num_killed_tasks,
+                st.num_tasks
             )
             .into(),
         ]),
@@ -98,15 +111,27 @@ fn draw_head(f: &mut Frame, area: Rect, d: &StageDetail) {
             fmt_bytes(st.shuffle_write_bytes).into(),
             "  spill ".dark_gray(),
             Span::styled(
-                format!("{} mem / {} disk", fmt_bytes(st.memory_bytes_spilled), fmt_bytes(st.disk_bytes_spilled)),
-                if st.memory_bytes_spilled > 0 { Style::default().fg(Color::Magenta) } else { Style::default() },
+                format!(
+                    "{} mem / {} disk",
+                    fmt_bytes(st.memory_bytes_spilled),
+                    fmt_bytes(st.disk_bytes_spilled)
+                ),
+                if st.memory_bytes_spilled > 0 {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default()
+                },
             ),
             "  task time ".dark_gray(),
             fmt_millis(st.executor_run_time).into(),
             "  gc ".dark_gray(),
             Span::styled(
                 format!("{gc_pct:.1}%"),
-                if gc_pct > 10.0 { Style::default().fg(Color::Red) } else { Style::default() },
+                if gc_pct > 10.0 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default()
+                },
             ),
         ]),
     ];
@@ -124,7 +149,10 @@ fn draw_head(f: &mut Frame, area: Rect, d: &StageDetail) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 "✗ ".red().bold(),
-                Span::styled(r.lines().next().unwrap_or(r).to_string(), Style::default().fg(Color::Red)),
+                Span::styled(
+                    r.lines().next().unwrap_or(r).to_string(),
+                    Style::default().fg(Color::Red),
+                ),
             ]))
             .wrap(Wrap { trim: true }),
             reason,
@@ -155,9 +183,13 @@ fn draw_distributions(f: &mut Frame, area: Rect, d: &StageDetail) {
         .map(|m| {
             let skewed = m.is_skewed();
             let skew_cell = match m.skew {
-                Some(r) if skewed => Cell::from(format!("⚠ ×{}", fmt_ratio(r)))
-                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Some(r) => Cell::from(format!("×{}", fmt_ratio(r))).style(Style::default().fg(Color::DarkGray)),
+                Some(r) if skewed => Cell::from(format!("⚠ ×{}", fmt_ratio(r))).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Some(r) => Cell::from(format!("×{}", fmt_ratio(r)))
+                    .style(Style::default().fg(Color::DarkGray)),
                 None => Cell::from(""),
             };
             let mut cells = vec![Cell::from(m.name)];
@@ -189,7 +221,9 @@ fn draw_distributions(f: &mut Frame, area: Rect, d: &StageDetail) {
             Constraint::Min(8),
         ],
     )
-    .header(header_row(&["METRIC", "P5", "P25", "P50", "P75", "P95", "MAX", "SKEW"]))
+    .header(header_row(&[
+        "METRIC", "P5", "P25", "P50", "P75", "P95", "MAX", "SKEW",
+    ]))
     .block(table_block(format!(
         " Task metrics · skew = max/median, flagged ≥ ×{} ",
         analysis::SKEW_RATIO
@@ -252,7 +286,9 @@ fn draw_executors(f: &mut Frame, area: Rect, d: &StageDetail) {
             Constraint::Min(16),
         ],
     )
-    .header(header_row(&["EXEC", "TASKS", "TIME", "AVG", "SHUF R", "SPILL", "WHY"]))
+    .header(header_row(&[
+        "EXEC", "TASKS", "TIME", "AVG", "SHUF R", "SPILL", "WHY",
+    ]))
     .block(table_block(format!(" Executors ({}) ", rows_data.len())));
     f.render_widget(table, area);
 }

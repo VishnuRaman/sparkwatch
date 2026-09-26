@@ -2,6 +2,19 @@
 name = "sparkwatch"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal monitor for Apache Spark applications: a Spark UI you can use over SSH"
+repository = "https://github.com/VishnuRaman/sparkwatch"
+readme = "README.md"
+keywords = ["spark", "tui", "monitoring", "kubernetes"]
+categories = ["command-line-utilities"]
+rust-version = "1.88"
+
+# Small, fast binaries for the release assets; debug builds are unaffected.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
 
 [dependencies]
 anyhow = "1"

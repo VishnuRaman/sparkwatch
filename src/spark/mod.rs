@@ -54,7 +54,10 @@ impl SparkClient {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GET {url} -> {status}: {}", body.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "GET {url} -> {status}: {}",
+                body.chars().take(200).collect::<String>()
+            );
         }
         resp.json::<T>()
             .await
@@ -97,7 +100,7 @@ impl SparkClient {
             jobs,
             stages,
             executors,
-            sql: None,               // filled in by the poller from its SQL cache
+            sql: None,                // filled in by the poller from its SQL cache
             failed_tasks: Vec::new(), // likewise, once it knows which stages grew
             rdds,
         })
@@ -105,7 +108,12 @@ impl SparkClient {
 
     /// The stage drill-down: stage with per-executor summary, task metric
     /// quantiles, the slowest tasks and (if any) the failed ones.
-    pub async fn stage_detail(&self, app_id: &str, stage_id: i64, attempt: i64) -> Result<StageDetail> {
+    pub async fn stage_detail(
+        &self,
+        app_id: &str,
+        stage_id: i64,
+        attempt: i64,
+    ) -> Result<StageDetail> {
         let base = format!("/applications/{app_id}/stages/{stage_id}/{attempt}");
         let summary_path = format!("{base}/taskSummary?quantiles={SUMMARY_QUANTILES}");
         let slowest_path = format!("{base}/taskList?sortBy=-runtime&length={SLOWEST_TASKS}");
@@ -115,7 +123,8 @@ impl SparkClient {
             self.get::<Vec<TaskData>>(&slowest_path),
         )?;
         let failed = if stage.num_failed_tasks > 0 {
-            self.failed_tasks(app_id, stage_id, attempt, FAILED_TASKS).await?
+            self.failed_tasks(app_id, stage_id, attempt, FAILED_TASKS)
+                .await?
         } else {
             Vec::new()
         };
@@ -140,7 +149,11 @@ impl SparkClient {
 /// The first call (`after == None`) pages through everything once.
 impl SparkClient {
     /// `Ok(None)` when the endpoint has no `/sql` at all.
-    pub async fn sql_tail(&self, app_id: &str, after: Option<i64>) -> Result<Option<Vec<ExecutionData>>> {
+    pub async fn sql_tail(
+        &self,
+        app_id: &str,
+        after: Option<i64>,
+    ) -> Result<Option<Vec<ExecutionData>>> {
         let list = |offset: usize, length: usize| {
             let path = format!(
                 "/applications/{app_id}/sql?details=false&planDescription=false&offset={offset}&length={length}"
@@ -194,14 +207,21 @@ impl SparkClient {
     /// One cached RDD with its per-executor distribution and partitions.
     /// `None` once it has been unpersisted.
     pub async fn rdd_detail(&self, app_id: &str, rdd_id: i64) -> Result<Option<RddStorageInfo>> {
-        self.get_opt(&format!("/applications/{app_id}/storage/rdd/{rdd_id}")).await
+        self.get_opt(&format!("/applications/{app_id}/storage/rdd/{rdd_id}"))
+            .await
     }
 
     /// Live thread dump of an executor. `None` where it is not served (the
     /// History Server, or an executor that is gone).
-    pub async fn threads(&self, app_id: &str, executor_id: &str) -> Result<Option<Vec<ThreadStackTrace>>> {
-        self.get_opt(&format!("/applications/{app_id}/executors/{executor_id}/threads"))
-            .await
+    pub async fn threads(
+        &self,
+        app_id: &str,
+        executor_id: &str,
+    ) -> Result<Option<Vec<ThreadStackTrace>>> {
+        self.get_opt(&format!(
+            "/applications/{app_id}/executors/{executor_id}/threads"
+        ))
+        .await
     }
 
     /// A raw GET of any URL (executor log pages live outside `/api/v1`).
@@ -220,7 +240,13 @@ impl SparkClient {
     }
 
     /// The failed tasks of a stage attempt, with their error messages.
-    pub async fn failed_tasks(&self, app_id: &str, stage_id: i64, attempt: i64, length: usize) -> Result<Vec<TaskData>> {
+    pub async fn failed_tasks(
+        &self,
+        app_id: &str,
+        stage_id: i64,
+        attempt: i64,
+        length: usize,
+    ) -> Result<Vec<TaskData>> {
         self.get(&format!(
             "/applications/{app_id}/stages/{stage_id}/{attempt}/taskList?status=failed&length={length}"
         ))

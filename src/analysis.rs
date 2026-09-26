@@ -66,7 +66,11 @@ fn row(name: &'static str, unit: Unit, values: &[f64]) -> Option<MetricRow> {
     let (median, max) = (r.median(), r.max());
     if max >= floor(unit) {
         // A zero median with a real max is the worst skew there is.
-        r.skew = Some(if median > 0.0 { max / median } else { f64::INFINITY });
+        r.skew = Some(if median > 0.0 {
+            max / median
+        } else {
+            f64::INFINITY
+        });
     }
     Some(r)
 }
@@ -78,9 +82,21 @@ pub fn metric_rows(d: &TaskMetricDistributions) -> Vec<MetricRow> {
         row("gc time", Unit::Millis, &d.jvm_gc_time),
         row("sched delay", Unit::Millis, &d.scheduler_delay),
         row("input", Unit::Bytes, &d.input_metrics.bytes_read),
-        row("shuffle read", Unit::Bytes, &d.shuffle_read_metrics.read_bytes),
-        row("fetch wait", Unit::Millis, &d.shuffle_read_metrics.fetch_wait_time),
-        row("shuffle write", Unit::Bytes, &d.shuffle_write_metrics.write_bytes),
+        row(
+            "shuffle read",
+            Unit::Bytes,
+            &d.shuffle_read_metrics.read_bytes,
+        ),
+        row(
+            "fetch wait",
+            Unit::Millis,
+            &d.shuffle_read_metrics.fetch_wait_time,
+        ),
+        row(
+            "shuffle write",
+            Unit::Bytes,
+            &d.shuffle_write_metrics.write_bytes,
+        ),
         row("mem spill", Unit::Bytes, &d.memory_bytes_spilled),
         row("disk spill", Unit::Bytes, &d.disk_bytes_spilled),
         row("peak exec mem", Unit::Bytes, &d.peak_execution_memory),
@@ -93,10 +109,10 @@ pub fn metric_rows(d: &TaskMetricDistributions) -> Vec<MetricRow> {
 /// Median task duration, from the distribution when Spark gave us one,
 /// otherwise from the tasks we have.
 pub fn median_duration(detail: &StageDetail) -> f64 {
-    if let Some(d) = &detail.summary {
-        if let Some(m) = d.duration.get(2) {
-            return *m;
-        }
+    if let Some(d) = &detail.summary
+        && let Some(m) = d.duration.get(2)
+    {
+        return *m;
     }
     let mut ds: Vec<i64> = detail
         .slowest
@@ -113,8 +129,7 @@ pub fn median_duration(detail: &StageDetail) -> f64 {
 
 /// A task is a straggler when it ran `SKEW_RATIO`× longer than the median.
 pub fn is_straggler(task: &TaskData, median_ms: f64) -> bool {
-    median_ms >= floor(Unit::Millis) / 10.0
-        && task.duration_ms() as f64 >= SKEW_RATIO * median_ms
+    median_ms >= floor(Unit::Millis) / 10.0 && task.duration_ms() as f64 >= SKEW_RATIO * median_ms
 }
 
 /// Per-executor view of a stage, worst first.
@@ -146,7 +161,8 @@ pub fn executor_rows(detail: &StageDetail) -> Vec<ExecutorRow> {
             } else {
                 0.0
             };
-            let slow = stage_mean >= floor(Unit::Millis) / 10.0 && mean >= SLOW_EXECUTOR_RATIO * stage_mean;
+            let slow = stage_mean >= floor(Unit::Millis) / 10.0
+                && mean >= SLOW_EXECUTOR_RATIO * stage_mean;
             let mut reasons = Vec::new();
             if e.failed_tasks > 0 {
                 reasons.push(format!("{} failed", e.failed_tasks));
@@ -197,7 +213,14 @@ mod tests {
         let mib = 1024.0 * 1024.0;
         let d = dist(
             &[1000.0, 2500.0, 8000.0, 9500.0, 30000.0, 91000.0],
-            &[mib, 2.0 * mib, 4.0 * mib, 8.0 * mib, 32.0 * mib, 1025.0 * mib],
+            &[
+                mib,
+                2.0 * mib,
+                4.0 * mib,
+                8.0 * mib,
+                32.0 * mib,
+                1025.0 * mib,
+            ],
         );
         let rows = metric_rows(&d);
         let dur = rows.iter().find(|r| r.name == "duration").unwrap();
@@ -221,7 +244,10 @@ mod tests {
     fn zero_median_with_real_max_is_infinite_skew() {
         let mut d = dist(&[], &[]);
         d.memory_bytes_spilled = vec![0.0, 0.0, 0.0, 0.0, 0.0, 512.0 * 1024.0 * 1024.0];
-        let spill = metric_rows(&d).into_iter().find(|r| r.name == "mem spill").unwrap();
+        let spill = metric_rows(&d)
+            .into_iter()
+            .find(|r| r.name == "mem spill")
+            .unwrap();
         assert!(spill.is_skewed());
         assert!(spill.skew.unwrap().is_infinite());
     }
@@ -229,7 +255,10 @@ mod tests {
     #[test]
     fn stragglers_use_median_from_distribution() {
         let detail = StageDetail {
-            summary: Some(dist(&[1000.0, 2500.0, 8000.0, 9500.0, 30000.0, 91000.0], &[])),
+            summary: Some(dist(
+                &[1000.0, 2500.0, 8000.0, 9500.0, 30000.0, 91000.0],
+                &[],
+            )),
             ..Default::default()
         };
         let m = median_duration(&detail);

@@ -10,14 +10,43 @@ Kubernetes (Spark Operator or plain `spark-submit`).
 
 ## Install
 
-Requires a Rust toolchain (1.85+, edition 2024).
+Prebuilt binaries (macOS arm64/x86_64, Linux x86_64/arm64 as static musl,
+Windows x86_64) are attached to every
+[release](https://github.com/VishnuRaman/sparkwatch/releases). On macOS or
+Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VishnuRaman/sparkwatch/main/install.sh | sh
+```
+
+That verifies the SHA256 and installs to `~/.local/bin` (or `/usr/local/bin`
+as root); `SPARKWATCH_VERSION=v0.1.0` pins a version,
+`SPARKWATCH_INSTALL_DIR` changes the location. On Windows, unzip the
+`x86_64-pc-windows-msvc` asset somewhere on your `PATH`.
+
+From source, with a Rust toolchain (1.88+):
 
 ```bash
 cargo install --path .
 ```
 
-That puts `sparkwatch` in `~/.cargo/bin`. For `--k8s` mode, `kubectl` must be
-on your `PATH` and pointed at the right cluster.
+For `--k8s` mode, `kubectl` must be on your `PATH` and pointed at the right
+cluster. The binary is a single file with no other dependencies (TLS via
+rustls, no OpenSSL).
+
+### Releasing
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `clippy -D
+warnings` and the tests on Linux, macOS and Windows for every push. To cut a
+release, bump `version` in `Cargo.toml`, then tag it:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` refuses a tag that doesn't match
+`Cargo.toml`, builds the five targets, and publishes a GitHub release with
+the archives, `SHA256SUMS` and generated notes.
 
 ## Usage
 

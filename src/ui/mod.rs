@@ -14,15 +14,15 @@ mod threads;
 
 use crate::alerts::Alert;
 use crate::app::{
-    filtered_title, visible_alerts, visible_executors, visible_jobs, visible_rdds, visible_sql, visible_stages, App,
-    Tab, View,
+    App, Tab, View, filtered_title, visible_alerts, visible_executors, visible_jobs, visible_rdds,
+    visible_sql, visible_stages,
 };
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Tabs},
-    Frame,
 };
 
 // ---------------------------------------------------------------- formatting
@@ -107,12 +107,18 @@ pub fn table_block(title: String) -> Block<'static> {
 }
 
 pub fn selected_style() -> Style {
-    Style::default().bg(Color::Rgb(40, 44, 60)).add_modifier(Modifier::BOLD)
+    Style::default()
+        .bg(Color::Rgb(40, 44, 60))
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn header_row(cols: &[&'static str]) -> Row<'static> {
     Row::new(cols.iter().map(|c| Cell::from(*c)).collect::<Vec<_>>())
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .height(1)
 }
 
@@ -120,7 +126,11 @@ pub fn header_row(cols: &[&'static str]) -> Row<'static> {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     // The alert strip only takes a line while there is something new.
-    let strip_h = if app.view != View::Picker && app.alerts.unacked() > 0 { 1 } else { 0 };
+    let strip_h = if app.view != View::Picker && app.alerts.unacked() > 0 {
+        1
+    } else {
+        0
+    };
     let [header, strip, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(strip_h),
@@ -248,7 +258,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     if *tab == Tab::Streaming {
-        streaming::draw(f, body, streaming_state, streaming_status.as_deref(), *streaming_sel);
+        streaming::draw(
+            f,
+            body,
+            streaming_state,
+            streaming_status.as_deref(),
+            *streaming_sel,
+        );
         return;
     }
 
@@ -269,7 +285,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Tab::Stages => {
             let rows = visible_stages(snap, stage_filter, filter(Tab::Stages));
-            let mut title = filtered_title("Stages", rows.len(), snap.stages.len(), filter(Tab::Stages));
+            let mut title =
+                filtered_title("Stages", rows.len(), snap.stages.len(), filter(Tab::Stages));
             if let Some(fl) = stage_filter {
                 title = format!("{title}· job #{} · Esc to clear ", fl.job_id);
             }
@@ -277,7 +294,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Tab::Executors => {
             let rows = visible_executors(snap, filter(Tab::Executors));
-            let title = filtered_title("Executors", rows.len(), snap.executors.len(), filter(Tab::Executors));
+            let title = filtered_title(
+                "Executors",
+                rows.len(),
+                snap.executors.len(),
+                filter(Tab::Executors),
+            );
             tables::draw_executors(f, body, &rows, title, &mut executors.state)
         }
         Tab::Sql => {
@@ -297,7 +319,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let rows = visible_rdds(snap, filter(Tab::Storage));
             let title = format!(
                 "{}· Enter for distribution ",
-                filtered_title("Cached RDDs", rows.len(), snap.rdds.len(), filter(Tab::Storage))
+                filtered_title(
+                    "Cached RDDs",
+                    rows.len(),
+                    snap.rdds.len(),
+                    filter(Tab::Storage)
+                )
             );
             storage::draw_list(f, body, snap, &rows, title, &mut rdds.state)
         }
@@ -312,7 +339,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "never".into());
 
     let state = if app.paused {
-        Span::styled(" PAUSED ", Style::default().fg(Color::Black).bg(Color::Yellow))
+        Span::styled(
+            " PAUSED ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
     } else if app.last_error.is_some() {
         Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red))
     } else {
@@ -321,14 +351,32 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let what = match (&app.view, &app.snapshot) {
         (View::Picker, _) => format!("{} · updated {age}", app.endpoint),
-        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads | View::Rdd, Some(s)) => format!(
+        (
+            View::Main
+            | View::Stage
+            | View::Sql
+            | View::Alert
+            | View::Logs
+            | View::Threads
+            | View::Rdd,
+            Some(s),
+        ) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
             s.app.name,
             s.app.id,
             app.endpoint,
             app.interval.as_secs()
         ),
-        (View::Main | View::Stage | View::Sql | View::Alert | View::Logs | View::Threads | View::Rdd, None) => format!(
+        (
+            View::Main
+            | View::Stage
+            | View::Sql
+            | View::Alert
+            | View::Logs
+            | View::Threads
+            | View::Rdd,
+            None,
+        ) => format!(
             "[{}] @ {} · every {}s · updated {age}",
             app.watching.as_deref().unwrap_or("—"),
             app.endpoint,
@@ -340,7 +388,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     if app.view == View::Picker {
         f.render_widget(
-            Paragraph::new(" choose an application").style(Style::default().fg(Color::DarkGray)).block(block),
+            Paragraph::new(" choose an application")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
             area,
         );
         return;
@@ -392,11 +442,19 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if let (View::Main, Some(input)) = (app.view, &app.filter_input) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" /", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " /",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(input.clone()),
                 Span::styled("█", Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    format!("  filter {} · Enter apply · Esc cancel", app.tab.title().to_lowercase()),
+                    format!(
+                        "  filter {} · Enter apply · Esc cancel",
+                        app.tab.title().to_lowercase()
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ])),
@@ -424,12 +482,18 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         View::Main => {
             " q quit · tab/←→ switch · j/k move · / filter · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
         }
-        View::Stage => " Esc back · j/k tasks · f failed/slowest · L logs of task's executor · r refresh · p pause · q quit ",
+        View::Stage => {
+            " Esc back · j/k tasks · f failed/slowest · L logs of task's executor · r refresh · p pause · q quit "
+        }
         View::Logs => {
             " Esc back · j/k PgUp/PgDn scroll · g/G · F follow · / filter · c clear filter · w wrap · P previous · o stdout/stderr · t threads · q quit "
         }
-        View::Threads => " Esc back · j/k scroll · e expand · / filter · r refresh · L logs · q quit ",
-        View::Sql => " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit ",
+        View::Threads => {
+            " Esc back · j/k scroll · e expand · / filter · r refresh · L logs · q quit "
+        }
+        View::Sql => {
+            " Esc back · j/k scroll · Tab plan/nodes · p plan only · g/G top/bottom · q quit "
+        }
         View::Alert => " Esc back · j/k scroll · s open stage · L logs · x acknowledge · q quit ",
         View::Rdd => " Esc back · r refresh · q quit ",
     };

@@ -2,29 +2,25 @@
 //! shows, built from progress events and micro-batch SQL executions.
 
 use super::{fmt_bytes, fmt_millis, selected_style};
-use crate::streaming::{tail, QueryHistory, QueryStats, Streaming};
+use crate::streaming::{QueryHistory, QueryStats, Streaming, tail};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Sparkline, Wrap},
-    Frame,
 };
 
 fn fmt_num(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
     }
-    if n < 0 {
-        format!("-{out}")
-    } else {
-        out
-    }
+    if n < 0 { format!("-{out}") } else { out }
 }
 
 fn fmt_rate(r: f64) -> String {
@@ -42,8 +38,12 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
             Line::from("  No streaming queries seen yet.".dark_gray()),
             Line::from(""),
             Line::from("  This tab needs one of:"),
-            Line::from("   · the driver log at INFO for org.apache.spark.sql.execution.streaming (--k8s, or YARN/standalone log URLs)"),
-            Line::from("   · micro-batch SQL executions on the SQL tab (any endpoint, incl. the History Server) — durations only"),
+            Line::from(
+                "   · the driver log at INFO for org.apache.spark.sql.execution.streaming (--k8s, or YARN/standalone log URLs)",
+            ),
+            Line::from(
+                "   · micro-batch SQL executions on the SQL tab (any endpoint, incl. the History Server) — durations only",
+            ),
             Line::from(""),
         ];
         if let Some(st) = status {
@@ -91,7 +91,10 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
                     .into(),
                 ]);
                 if st.behind {
-                    line.push_span(Span::styled("  FALLING BEHIND", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                    line.push_span(Span::styled(
+                        "  FALLING BEHIND",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
                 }
                 if i == sel {
                     line = line.style(selected_style());
@@ -100,10 +103,11 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
             })
             .collect();
         f.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
-                " Queries ({}) · j/k select ",
-                queries.len()
-            ))),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Queries ({}) · j/k select ", queries.len())),
+            ),
             list,
         );
     }
@@ -119,9 +123,11 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
 
 fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     let st = QueryStats::of(q);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} · run {} ", q.label(), q.run_id.chars().take(8).collect::<String>()));
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " {} · run {} ",
+        q.label(),
+        q.run_id.chars().take(8).collect::<String>()
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -137,7 +143,10 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     let latest_p = latest.and_then(|b| b.progress.as_ref());
     let mut l1 = vec![
         "batch ".dark_gray(),
-        Span::styled(latest.map_or("-".into(), |b| b.batch_id.to_string()), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            latest.map_or("-".into(), |b| b.batch_id.to_string()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         "  trigger ".dark_gray(),
         fmt_millis(latest.map_or(0, |b| b.duration_ms)).into(),
         "  mean ".dark_gray(),
@@ -151,28 +160,41 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
         l1.push("  rate ".dark_gray());
         l1.push(format!("{:.1} batches/min", st.batches_per_min).into());
     }
-    if let Some(b) = latest {
-        if !b.status.is_empty() && b.status != "COMPLETED" {
-            l1.push("  ".into());
-            l1.push(Span::styled(b.status.clone(), super::status_style(&b.status)));
-        }
+    if let Some(b) = latest
+        && !b.status.is_empty()
+        && b.status != "COMPLETED"
+    {
+        l1.push("  ".into());
+        l1.push(Span::styled(
+            b.status.clone(),
+            super::status_style(&b.status),
+        ));
     }
     let mut l2 = match latest_p {
         Some(p) => vec![
             "input ".dark_gray(),
             format!("{} rows", fmt_num(p.num_input_rows)).into(),
             "  ".into(),
-            Span::styled(format!("{} rows/s in", fmt_rate(st.input_rps)), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{} rows/s in", fmt_rate(st.input_rps)),
+                Style::default().fg(Color::Yellow),
+            ),
             "  vs  ".dark_gray(),
             Span::styled(
                 format!("{} rows/s processed", fmt_rate(st.processed_rps)),
                 Style::default().fg(if st.behind { Color::Red } else { Color::Green }),
             ),
         ],
-        None => vec!["rates need the driver log (progress events); showing SQL batch durations only".dark_gray()],
+        None => vec![
+            "rates need the driver log (progress events); showing SQL batch durations only"
+                .dark_gray(),
+        ],
     };
     if st.behind {
-        l2.push(Span::styled("  ▲ FALLING BEHIND", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        l2.push(Span::styled(
+            "  ▲ FALLING BEHIND",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
     }
     if let Some(lag) = st.watermark_lag_ms {
         l2.push("  watermark lag ".dark_gray());
@@ -180,16 +202,28 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     }
     if st.state_rows > 0 {
         l2.push("  state ".dark_gray());
-        l2.push(format!("{} rows / {}", fmt_num(st.state_rows), fmt_bytes(st.state_bytes)).into());
+        l2.push(
+            format!(
+                "{} rows / {}",
+                fmt_num(st.state_rows),
+                fmt_bytes(st.state_bytes)
+            )
+            .into(),
+        );
     }
     f.render_widget(Paragraph::new(vec![Line::from(l1), Line::from(l2)]), head);
 
     // ---- sparklines
-    let [c1, c2, c3] = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(33), Constraint::Percentage(33)]).areas(charts);
+    let [c1, c2, c3] = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .areas(charts);
     let w = |r: Rect| r.width.saturating_sub(2) as usize;
     f.render_widget(
         Sparkline::default()
-            .data(&tail(&st.durations, w(c1)))
+            .data(tail(&st.durations, w(c1)))
             .style(Style::default().fg(Color::Cyan))
             .block(Block::default().borders(Borders::ALL).title(format!(
                 " Trigger duration · last {} batches ",
@@ -205,25 +239,33 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     ));
     let rate_inner = rate_block.inner(c2);
     f.render_widget(rate_block, c2);
-    let [top, bottom] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(rate_inner);
-    let scale = st.input_series.iter().chain(st.processed_series.iter()).max().copied().unwrap_or(1).max(1);
+    let [top, bottom] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(rate_inner);
+    let scale = st
+        .input_series
+        .iter()
+        .chain(st.processed_series.iter())
+        .max()
+        .copied()
+        .unwrap_or(1)
+        .max(1);
     f.render_widget(
         Sparkline::default()
-            .data(&tail(&st.input_series, rate_inner.width as usize))
+            .data(tail(&st.input_series, rate_inner.width as usize))
             .max(scale)
             .style(Style::default().fg(Color::Yellow)),
         top,
     );
     f.render_widget(
         Sparkline::default()
-            .data(&tail(&st.processed_series, rate_inner.width as usize))
+            .data(tail(&st.processed_series, rate_inner.width as usize))
             .max(scale)
             .style(Style::default().fg(if st.behind { Color::Red } else { Color::Green })),
         bottom,
     );
     f.render_widget(
         Sparkline::default()
-            .data(&tail(&st.state_series, w(c3)))
+            .data(tail(&st.state_series, w(c3)))
             .style(Style::default().fg(Color::Magenta))
             .block(Block::default().borders(Borders::ALL).title(format!(
                 " State rows · {} · {} ",
@@ -236,11 +278,25 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     // ---- latest batch breakdown
     let mut lines = Vec::new();
     if let Some(p) = latest_p {
-        let parts: Vec<String> = ["addBatch", "getBatch", "latestOffset", "queryPlanning", "walCommit", "commitOffsets"]
-            .iter()
-            .filter_map(|k| p.duration_ms.get(*k).map(|v| format!("{k} {}", fmt_millis(*v))))
-            .collect();
-        lines.push(Line::from(vec!["durations ".dark_gray(), parts.join(" · ").into()]));
+        let parts: Vec<String> = [
+            "addBatch",
+            "getBatch",
+            "latestOffset",
+            "queryPlanning",
+            "walCommit",
+            "commitOffsets",
+        ]
+        .iter()
+        .filter_map(|k| {
+            p.duration_ms
+                .get(*k)
+                .map(|v| format!("{k} {}", fmt_millis(*v)))
+        })
+        .collect();
+        lines.push(Line::from(vec![
+            "durations ".dark_gray(),
+            parts.join(" · ").into(),
+        ]));
         for src in &p.sources {
             lines.push(Line::from(vec![
                 "source ".dark_gray(),
@@ -257,7 +313,12 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
         if !p.sink.description.is_empty() {
             lines.push(Line::from(vec![
                 "sink ".dark_gray(),
-                p.sink.description.chars().take(60).collect::<String>().into(),
+                p.sink
+                    .description
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .into(),
                 format!("  {} rows out", fmt_num(p.sink.num_output_rows)).dark_gray(),
             ]));
         }
@@ -275,11 +336,12 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
                 .dark_gray(),
             ]));
         }
-        lines.push(Line::from(vec!["at ".dark_gray(), p.timestamp.clone().into()]));
+        lines.push(Line::from(vec![
+            "at ".dark_gray(),
+            p.timestamp.clone().into(),
+        ]));
     } else {
-        lines.push(Line::from(
-            "latest batches: ".dark_gray(),
-        ));
+        lines.push(Line::from("latest batches: ".dark_gray()));
         for b in q.batches.values().rev().take(5) {
             lines.push(Line::from(vec![
                 format!("  batch {} ", b.batch_id).into(),

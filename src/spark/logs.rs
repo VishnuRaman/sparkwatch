@@ -83,7 +83,9 @@ mod tests {
         );
         assert_eq!(
             with_tail("http://w:8081/logPage?appId=a&executorId=1&logType=stderr"),
-            format!("http://w:8081/logPage?appId=a&executorId=1&logType=stderr&start=-{TAIL_BYTES}")
+            format!(
+                "http://w:8081/logPage?appId=a&executorId=1&logType=stderr&start=-{TAIL_BYTES}"
+            )
         );
     }
 }

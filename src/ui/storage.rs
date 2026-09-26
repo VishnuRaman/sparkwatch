@@ -3,15 +3,22 @@
 use super::{fmt_bytes, header_row, mini_bar, selected_style, table_block};
 use crate::spark::{RddStorageInfo, Snapshot};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
-    Frame,
 };
 use std::collections::BTreeMap;
 
-pub fn draw_list(f: &mut Frame, area: Rect, snap: &Snapshot, rdds: &[&RddStorageInfo], title: String, state: &mut TableState) {
+pub fn draw_list(
+    f: &mut Frame,
+    area: Rect,
+    snap: &Snapshot,
+    rdds: &[&RddStorageInfo],
+    title: String,
+    state: &mut TableState,
+) {
     let [summary, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
     // Storage memory is a slice of each executor's heap; this is the "is it
@@ -19,20 +26,34 @@ pub fn draw_list(f: &mut Frame, area: Rect, snap: &Snapshot, rdds: &[&RddStorage
     let used: i64 = snap.executors.iter().map(|e| e.memory_used).sum();
     let max: i64 = snap.executors.iter().map(|e| e.max_memory).sum();
     let disk: i64 = snap.executors.iter().map(|e| e.disk_used).sum();
-    let pct = if max > 0 { 100.0 * used as f64 / max as f64 } else { 0.0 };
+    let pct = if max > 0 {
+        100.0 * used as f64 / max as f64
+    } else {
+        0.0
+    };
     let fullest = snap
         .executors
         .iter()
         .filter(|e| e.max_memory > 0)
         .max_by(|a, b| a.memory_ratio().partial_cmp(&b.memory_ratio()).unwrap())
-        .map(|e| format!("fullest executor {} at {:.0}%", e.id, 100.0 * e.memory_ratio()))
+        .map(|e| {
+            format!(
+                "fullest executor {} at {:.0}%",
+                e.id,
+                100.0 * e.memory_ratio()
+            )
+        })
         .unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             "storage memory ".dark_gray(),
             Span::styled(
                 format!("{} / {} ({pct:.0}%)", fmt_bytes(used), fmt_bytes(max)),
-                if pct > 90.0 { Style::default().fg(Color::Red) } else { Style::default() },
+                if pct > 90.0 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default()
+                },
             ),
             "  disk ".dark_gray(),
             fmt_bytes(disk).into(),
@@ -69,11 +90,13 @@ pub fn draw_list(f: &mut Frame, area: Rect, snap: &Snapshot, rdds: &[&RddStorage
                 Cell::from(r.id.to_string()),
                 Cell::from(r.name.chars().take(60).collect::<String>()),
                 Cell::from(r.storage_level.clone()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(format!("{}/{}", r.num_cached_partitions, r.num_partitions)).style(if partial {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default()
-                }),
+                Cell::from(format!("{}/{}", r.num_cached_partitions, r.num_partitions)).style(
+                    if partial {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    },
+                ),
                 Cell::from(mini_bar(r.cached_ratio(), 10)),
                 Cell::from(fmt_bytes(r.memory_used)),
                 Cell::from(fmt_bytes(r.disk_used)).style(if r.disk_used > 0 {
@@ -97,7 +120,15 @@ pub fn draw_list(f: &mut Frame, area: Rect, snap: &Snapshot, rdds: &[&RddStorage
             Constraint::Length(10),
         ],
     )
-    .header(header_row(&["ID", "NAME", "LEVEL", "PARTITIONS", "CACHED", "MEMORY", "DISK"]))
+    .header(header_row(&[
+        "ID",
+        "NAME",
+        "LEVEL",
+        "PARTITIONS",
+        "CACHED",
+        "MEMORY",
+        "DISK",
+    ]))
     .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
@@ -111,10 +142,19 @@ fn area_of(r: Rect) -> Rect {
 pub fn draw_detail(f: &mut Frame, area: Rect, rdd: Option<&RddStorageInfo>, error: Option<&str>) {
     let Some(r) = rdd else {
         let text = match error {
-            Some(e) => Line::from(Span::styled(format!("Error: {e}"), Style::default().fg(Color::Red))),
-            None => Line::from(Span::styled("Loading RDD…", Style::default().fg(Color::DarkGray))),
+            Some(e) => Line::from(Span::styled(
+                format!("Error: {e}"),
+                Style::default().fg(Color::Red),
+            )),
+            None => Line::from(Span::styled(
+                "Loading RDD…",
+                Style::default().fg(Color::DarkGray),
+            )),
         };
-        f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL)), area);
+        f.render_widget(
+            Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+            area,
+        );
         return;
     };
 
@@ -139,7 +179,11 @@ pub fn draw_detail(f: &mut Frame, area: Rect, rdd: Option<&RddStorageInfo>, erro
                 "  partitions ".dark_gray(),
                 Span::styled(
                     format!("{} of {} cached", r.num_cached_partitions, r.num_partitions),
-                    if partial { Style::default().fg(Color::Yellow) } else { Style::default() },
+                    if partial {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    },
                 ),
                 if partial {
                     "  (the rest will be recomputed when read)".yellow()
@@ -164,17 +208,30 @@ pub fn draw_detail(f: &mut Frame, area: Rect, rdd: Option<&RddStorageInfo>, erro
             *per_exec.entry(e.as_str()).or_default() += 1;
         }
     }
-    let total_mem: i64 = r.data_distribution.iter().map(|d| d.memory_used).sum::<i64>().max(1);
+    let total_mem: i64 = r
+        .data_distribution
+        .iter()
+        .map(|d| d.memory_used)
+        .sum::<i64>()
+        .max(1);
     let rows: Vec<Row> = r
         .data_distribution
         .iter()
         .map(|d| {
             let share = d.memory_used as f64 / total_mem as f64;
             let cap = d.memory_used + d.memory_remaining;
-            let fill = if cap > 0 { d.memory_used as f64 / cap as f64 } else { 0.0 };
+            let fill = if cap > 0 {
+                d.memory_used as f64 / cap as f64
+            } else {
+                0.0
+            };
             Row::new(vec![
                 Cell::from(d.address.clone()),
-                Cell::from(per_exec.get(d.address.as_str()).map_or("-".into(), |n| n.to_string())),
+                Cell::from(
+                    per_exec
+                        .get(d.address.as_str())
+                        .map_or("-".into(), |n| n.to_string()),
+                ),
                 Cell::from(fmt_bytes(d.memory_used)),
                 Cell::from(format!("{:.0}%", 100.0 * share)),
                 Cell::from(mini_bar(share, 10)),
@@ -202,22 +259,44 @@ pub fn draw_detail(f: &mut Frame, area: Rect, rdd: Option<&RddStorageInfo>, erro
         ],
     )
     .header(header_row(&[
-        "EXECUTOR", "PARTS", "MEMORY", "SHARE", "", "REMAINING", "EXEC FULL", "DISK",
+        "EXECUTOR",
+        "PARTS",
+        "MEMORY",
+        "SHARE",
+        "",
+        "REMAINING",
+        "EXEC FULL",
+        "DISK",
     ]))
-    .block(table_block(format!(" Distribution across {} executors ", r.data_distribution.len())));
+    .block(table_block(format!(
+        " Distribution across {} executors ",
+        r.data_distribution.len()
+    )));
     f.render_widget(table, dist);
 
     let on_disk = r.partitions.iter().filter(|p| p.disk_used > 0).count();
-    let biggest = r.partitions.iter().max_by_key(|p| p.memory_used + p.disk_used);
+    let biggest = r
+        .partitions
+        .iter()
+        .max_by_key(|p| p.memory_used + p.disk_used);
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{} partitions listed", r.partitions.len()), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} partitions listed", r.partitions.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         format!("  {} on disk", on_disk).dark_gray(),
     ])];
     if let Some(b) = biggest {
         lines.push(Line::from(vec![
             "largest ".dark_gray(),
             b.block_name.clone().into(),
-            format!("  {} mem · {} disk · on {}", fmt_bytes(b.memory_used), fmt_bytes(b.disk_used), b.executors.join(", ")).dark_gray(),
+            format!(
+                "  {} mem · {} disk · on {}",
+                fmt_bytes(b.memory_used),
+                fmt_bytes(b.disk_used),
+                b.executors.join(", ")
+            )
+            .dark_gray(),
         ]));
     }
     f.render_widget(Paragraph::new(lines), parts);

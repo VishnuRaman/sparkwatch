@@ -25,7 +25,10 @@ use tokio::time::interval;
 
 /// Terminal monitor for Apache Spark applications.
 #[derive(Parser, Debug)]
-#[command(name = "sparkwatch", version, after_help = "\
+#[command(
+    name = "sparkwatch",
+    version,
+    after_help = "\
 Examples:
   sparkwatch                                  driver UI on localhost:4040
   sparkwatch http://history:18080             History Server; pick an app
@@ -43,7 +46,8 @@ Config file (~/.config/sparkwatch.toml or $XDG_CONFIG_HOME/sparkwatch.toml):
   namespace = \"spark\"
   app = \"my-etl\"          # optional
   [targets.history]
-  url = \"http://history:18080\"")]
+  url = \"http://history:18080\""
+)]
 struct Cli {
     /// Spark driver UI (http://host:4040), History Server (http://host:18080),
     /// or a target name from the config file. With --k8s: the SparkApplication name.
@@ -84,7 +88,12 @@ fn resolve_target(mut cli: Cli, cfg: &config::Config) -> Cli {
     if cli.k8s {
         return cli; // positional is an app name here, never a target name
     }
-    let Some(t) = cli.target.as_ref().and_then(|n| cfg.targets.get(n)).cloned() else {
+    let Some(t) = cli
+        .target
+        .as_ref()
+        .and_then(|n| cfg.targets.get(n))
+        .cloned()
+    else {
         return cli;
     };
     if t.k8s {
@@ -105,15 +114,32 @@ async fn main() -> Result<()> {
     let cfg = config::load(cli.config.clone())?;
     if cli.targets {
         if cfg.targets.is_empty() {
-            println!("no targets configured ({})", config::default_path().map(|p| p.display().to_string()).unwrap_or_default());
+            println!(
+                "no targets configured ({})",
+                config::default_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
         }
         for (name, t) in &cfg.targets {
             let how = if t.k8s {
-                format!("k8s{}", t.namespace.as_ref().map(|n| format!(" -n {n}")).unwrap_or_default())
+                format!(
+                    "k8s{}",
+                    t.namespace
+                        .as_ref()
+                        .map(|n| format!(" -n {n}"))
+                        .unwrap_or_default()
+                )
             } else {
                 t.url.clone().unwrap_or_default()
             };
-            println!("{name:<16} {how}{}", t.app.as_ref().map(|a| format!("  app {a}")).unwrap_or_default());
+            println!(
+                "{name:<16} {how}{}",
+                t.app
+                    .as_ref()
+                    .map(|a| format!("  app {a}"))
+                    .unwrap_or_default()
+            );
         }
         return Ok(());
     }
@@ -235,7 +261,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
         KeyCode::Char('r') => {
             if app.view == View::Threads {
                 app.threads.error = None;
-                send(req_tx, Request::FetchThreads(app.threads.executor_id.clone())).await;
+                send(
+                    req_tx,
+                    Request::FetchThreads(app.threads.executor_id.clone()),
+                )
+                .await;
             }
             return send(req_tx, Request::RefreshNow).await;
         }
@@ -310,7 +340,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
         },
         View::Threads => match key.code {
             KeyCode::Esc | KeyCode::Backspace => app.close_threads(),
-            KeyCode::Char('/') => app.threads.filter_input = Some(app.threads.filter.clone().unwrap_or_default()),
+            KeyCode::Char('/') => {
+                app.threads.filter_input = Some(app.threads.filter.clone().unwrap_or_default())
+            }
             KeyCode::Char('c') => app.threads.filter = None,
             KeyCode::Char('e') => app.threads.expanded = !app.threads.expanded,
             KeyCode::Char('L') => {
@@ -411,7 +443,11 @@ async fn tap_if_streaming(app: &mut App, req_tx: &mpsc::Sender<Request>) {
 
 /// Open the log view via one of `App`'s `open_logs_*` helpers and start the
 /// stream for whatever target it chose.
-async fn open_logs(app: &mut App, req_tx: &mpsc::Sender<Request>, pick: fn(&mut App) -> Option<LogTarget>) {
+async fn open_logs(
+    app: &mut App,
+    req_tx: &mpsc::Sender<Request>,
+    pick: fn(&mut App) -> Option<LogTarget>,
+) {
     if let Some(target) = pick(app) {
         send(req_tx, Request::OpenLogs(target)).await;
     }
@@ -431,8 +467,18 @@ fn keylog(key: &KeyEvent) {
     let t0 = START.get_or_init(std::time::Instant::now);
     if let Ok(path) = std::env::var("SPARKWATCH_KEYLOG") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "+{}ms {:?} {:?}", t0.elapsed().as_millis(), key.code, key.modifiers);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                f,
+                "+{}ms {:?} {:?}",
+                t0.elapsed().as_millis(),
+                key.code,
+                key.modifiers
+            );
         }
     }
 }

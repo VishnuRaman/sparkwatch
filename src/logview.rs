@@ -48,7 +48,11 @@ pub enum Severity {
 }
 
 pub fn severity(line: &str) -> Severity {
-    if line.contains(" ERROR ") || line.contains("Exception") || line.contains("Error:") || line.contains("FATAL") {
+    if line.contains(" ERROR ")
+        || line.contains("Exception")
+        || line.contains("Error:")
+        || line.contains("FATAL")
+    {
         Severity::Error
     } else if line.contains(" WARN ") {
         Severity::Warn
@@ -209,11 +213,7 @@ pub fn filter_from_error(error: &str) -> Option<String> {
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != ':' && *c != '(')
         .collect();
-    if token.len() >= 4 {
-        Some(token)
-    } else {
-        None
-    }
+    if token.len() >= 4 { Some(token) } else { None }
 }
 
 #[cfg(test)]
@@ -299,8 +299,17 @@ mod tests {
 
     #[test]
     fn severity_classification() {
-        assert_eq!(severity("26/09/24 10:00:00 ERROR Executor: boom"), Severity::Error);
-        assert_eq!(severity("26/09/24 10:00:00 WARN TaskSetManager: lost"), Severity::Warn);
-        assert_eq!(severity("26/09/24 10:00:00 INFO Executor: ok"), Severity::Plain);
+        assert_eq!(
+            severity("26/09/24 10:00:00 ERROR Executor: boom"),
+            Severity::Error
+        );
+        assert_eq!(
+            severity("26/09/24 10:00:00 WARN TaskSetManager: lost"),
+            Severity::Warn
+        );
+        assert_eq!(
+            severity("26/09/24 10:00:00 INFO Executor: ok"),
+            Severity::Plain
+        );
     }
 }

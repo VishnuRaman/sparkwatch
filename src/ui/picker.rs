@@ -3,10 +3,10 @@
 use super::{fmt_millis, header_row, selected_style, table_block};
 use crate::spark::ApplicationInfo;
 use ratatui::{
+    Frame,
     layout::{Constraint, Rect},
     style::{Color, Style},
     widgets::{Cell, Paragraph, Row, Table, TableState},
-    Frame,
 };
 
 pub fn draw(f: &mut Frame, area: Rect, apps: &[ApplicationInfo], state: &mut TableState) {

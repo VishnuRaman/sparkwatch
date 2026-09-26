@@ -48,7 +48,9 @@ pub struct Target {
 impl Target {
     pub fn validate(&self, name: &str) -> Result<()> {
         match (&self.url, self.k8s) {
-            (Some(_), true) => anyhow::bail!("target '{name}': set either url or k8s = true, not both"),
+            (Some(_), true) => {
+                anyhow::bail!("target '{name}': set either url or k8s = true, not both")
+            }
             (None, false) => anyhow::bail!("target '{name}': needs url = \"…\" or k8s = true"),
             _ => Ok(()),
         }
@@ -72,7 +74,9 @@ pub fn load(path: Option<PathBuf>) -> Result<Config> {
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => return Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            return Ok(Config::default());
+        }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     parse(&text).with_context(|| format!("in {}", path.display()))
@@ -118,7 +122,10 @@ mod tests {
                 app: Some("my-etl".into())
             }
         );
-        assert_eq!(cfg.targets["history"].url.as_deref(), Some("http://history:18080"));
+        assert_eq!(
+            cfg.targets["history"].url.as_deref(),
+            Some("http://history:18080")
+        );
     }
 
     #[test]

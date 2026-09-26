@@ -3,11 +3,11 @@
 use super::{fmt_millis, status_style, table_block};
 use crate::spark::{ExecutionData, SqlNode};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 /// Which pane `j`/`k` scroll.
@@ -29,8 +29,14 @@ pub struct Props<'a> {
 pub fn draw(f: &mut Frame, area: Rect, p: Props) {
     let Some(e) = p.exec else {
         let text = match p.error {
-            Some(err) => Line::from(Span::styled(format!("Error: {err}"), Style::default().fg(Color::Red))),
-            None => Line::from(Span::styled("Loading query…", Style::default().fg(Color::DarkGray))),
+            Some(err) => Line::from(Span::styled(
+                format!("Error: {err}"),
+                Style::default().fg(Color::Red),
+            )),
+            None => Line::from(Span::styled(
+                "Loading query…",
+                Style::default().fg(Color::DarkGray),
+            )),
         };
         f.render_widget(
             Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
@@ -62,9 +68,10 @@ pub fn draw(f: &mut Frame, area: Rect, p: Props) {
 }
 
 fn draw_head(f: &mut Frame, area: Rect, e: &ExecutionData) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Query #{} · {} ", e.id, e.title()));
+    let block =
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Query #{} · {} ", e.id, e.title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -72,14 +79,24 @@ fn draw_head(f: &mut Frame, area: Rect, e: &ExecutionData) {
         if ids.is_empty() {
             "-".to_string()
         } else {
-            ids.iter().map(|j| format!("#{j}")).collect::<Vec<_>>().join(" ")
+            ids.iter()
+                .map(|j| format!("#{j}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(e.status.clone(), status_style(&e.status).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                e.status.clone(),
+                status_style(&e.status).add_modifier(Modifier::BOLD),
+            ),
             "  submitted ".dark_gray(),
-            e.submission_time.chars().take(19).collect::<String>().into(),
+            e.submission_time
+                .chars()
+                .take(19)
+                .collect::<String>()
+                .into(),
             "  duration ".dark_gray(),
             fmt_millis(e.duration).into(),
         ]),
@@ -96,7 +113,10 @@ fn draw_head(f: &mut Frame, area: Rect, e: &ExecutionData) {
     if let Some(err) = &e.error_message {
         lines.push(Line::from(vec![
             "✗ ".red().bold(),
-            Span::styled(err.lines().next().unwrap_or(err).to_string(), Style::default().fg(Color::Red)),
+            Span::styled(
+                err.lines().next().unwrap_or(err).to_string(),
+                Style::default().fg(Color::Red),
+            ),
         ]));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -141,7 +161,12 @@ fn style_plan_line(line: &str) -> Line<'static> {
     let (op, args) = rest.split_at(op_len);
     Line::from(vec![
         Span::styled(tree.to_string(), Style::default().fg(Color::DarkGray)),
-        Span::styled(op.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            op.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(args.to_string(), Style::default().fg(Color::Gray)),
     ])
 }
@@ -161,10 +186,21 @@ const METRICS_PER_NODE: usize = 3;
 
 pub fn node_lines(n: &SqlNode) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("#{} ", n.node_id), Style::default().fg(Color::DarkGray)),
-        Span::styled(n.node_name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("#{} ", n.node_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            n.node_name.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         match n.whole_stage_codegen_id {
-            Some(id) => Span::styled(format!("  codegen {id}"), Style::default().fg(Color::DarkGray)),
+            Some(id) => Span::styled(
+                format!("  codegen {id}"),
+                Style::default().fg(Color::DarkGray),
+            ),
             None => Span::raw(""),
         },
     ])];
@@ -173,7 +209,10 @@ pub fn node_lines(n: &SqlNode) -> Vec<Line<'static>> {
     let mut chosen: Vec<&crate::spark::SqlMetric> = Vec::new();
     for pref in PREFERRED_METRICS {
         for m in &n.metrics {
-            if chosen.len() < METRICS_PER_NODE && m.name.contains(pref) && !chosen.iter().any(|c| c.name == m.name) {
+            if chosen.len() < METRICS_PER_NODE
+                && m.name.contains(pref)
+                && !chosen.iter().any(|c| c.name == m.name)
+            {
                 chosen.push(m);
             }
         }
@@ -184,13 +223,21 @@ pub fn node_lines(n: &SqlNode) -> Vec<Line<'static>> {
         }
     }
     for m in chosen {
-        let hot = m.name.contains("spill") && !m.value.starts_with("0.0 B") && !m.value.starts_with('0');
+        let hot =
+            m.name.contains("spill") && !m.value.starts_with("0.0 B") && !m.value.starts_with('0');
         lines.push(Line::from(vec![
             Span::raw("   "),
-            Span::styled(format!("{}: ", m.name), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}: ", m.name),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(
                 m.value.clone(),
-                if hot { Style::default().fg(Color::Magenta) } else { Style::default() },
+                if hot {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default()
+                },
             ),
         ]));
     }
@@ -199,7 +246,10 @@ pub fn node_lines(n: &SqlNode) -> Vec<Line<'static>> {
 
 fn draw_nodes(f: &mut Frame, area: Rect, e: &ExecutionData, scroll: u16, focused: bool) {
     let lines: Vec<Line> = if e.nodes.is_empty() {
-        vec![Line::from(Span::styled("(no node metrics reported)", Style::default().fg(Color::DarkGray)))]
+        vec![Line::from(Span::styled(
+            "(no node metrics reported)",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
         e.nodes.iter().flat_map(node_lines).collect()
     };

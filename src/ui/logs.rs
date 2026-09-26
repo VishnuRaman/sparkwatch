@@ -1,12 +1,12 @@
 //! The log viewer.
 
-use crate::logview::{severity, LogView, Severity};
+use crate::logview::{LogView, Severity, severity};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 /// Draws the viewer and reports how many log rows fit, so scrolling can
@@ -23,7 +23,12 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
     if t.http_url.is_some() {
         title.push_str(&format!("· {} ", t.stream.name()));
     }
-    title.push_str(&format!("· {}-{} of {} lines", start + 1, start + win.len(), shown));
+    title.push_str(&format!(
+        "· {}-{} of {} lines",
+        start + 1,
+        start + win.len(),
+        shown
+    ));
     if logs.filter.is_some() {
         title.push_str(&format!(" ({} unfiltered)", logs.total()));
     }
@@ -59,7 +64,12 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
     // Bottom bar: the filter being typed, else the active filter + status.
     let bar_line = match &logs.filter_input {
         Some(input) => Line::from(vec![
-            Span::styled(" /", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " /",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(input.clone()),
             Span::styled("█", Style::default().fg(Color::Cyan)),
             "  Enter apply · Esc cancel".dark_gray(),
@@ -69,12 +79,18 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
             if let Some(fl) = &logs.filter {
                 spans.push(Span::styled(
                     format!("filter: {fl} "),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 spans.push("(c clears) ".dark_gray());
             }
             if let Some(s) = &logs.status {
-                let style = if s.starts_with("pod gone") || s.contains("failed") || s.contains("ended") || s.starts_with("no log") {
+                let style = if s.starts_with("pod gone")
+                    || s.contains("failed")
+                    || s.contains("ended")
+                    || s.starts_with("no log")
+                {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::DarkGray)

@@ -7,8 +7,11 @@
 
 use crate::k8s::{self, LogStream, PortForward};
 use crate::logview::LogTarget;
+use crate::spark::{
+    ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail,
+    ThreadStackTrace, logs,
+};
 use crate::streaming::{Progress, ProgressParser};
-use crate::spark::{logs, ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail, ThreadStackTrace};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -50,6 +53,7 @@ pub enum Detail {
 
 /// Poller → UI.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Apps(Result<Vec<ApplicationInfo>, String>),
     /// Tagged with the app id so the UI can drop a snapshot that arrives after
@@ -84,6 +88,7 @@ pub enum LogEvent {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DetailData {
     Stage(StageDetail),
     /// `None`: the driver no longer retains this execution.
@@ -185,6 +190,7 @@ impl SqlCache {
 }
 
 /// Where applications come from and how to reach one.
+#[allow(clippy::large_enum_variant)]
 pub enum Source {
     /// A URL: live driver UI or History Server.
     Http(SparkClient),
@@ -252,7 +258,9 @@ impl Source {
     fn log_source(&self) -> Result<LogSource> {
         match self {
             Source::Http(client) => Ok(LogSource::Http(client.clone())),
-            Source::Kube { namespace, conn, .. } => {
+            Source::Kube {
+                namespace, conn, ..
+            } => {
                 let c = conn.as_ref().context("not connected to a driver yet")?;
                 Ok(LogSource::Kube {
                     namespace: namespace.clone(),
@@ -435,7 +443,9 @@ impl Poller {
                 match self.source.log_source() {
                     Ok(src) => self.logs = Some(tokio::spawn(run_logs(src, target, tx))),
                     Err(e) => {
-                        let _ = tx.send(Message::Log(LogEvent::Status(format!("{e:#}")))).await;
+                        let _ = tx
+                            .send(Message::Log(LogEvent::Status(format!("{e:#}"))))
+                            .await;
                     }
                 }
             }
@@ -468,7 +478,13 @@ impl Poller {
                     },
                     None => Err("no application is being watched".into()),
                 };
-                let _ = self.msg_tx.send(Message::Threads { executor_id, result }).await;
+                let _ = self
+                    .msg_tx
+                    .send(Message::Threads {
+                        executor_id,
+                        result,
+                    })
+                    .await;
             }
             Request::Shutdown => return true,
         }
@@ -519,10 +535,11 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
             // and then we name Spark's container.
             let mut container: Option<&str> = None;
             loop {
-                let mut stream = match LogStream::start(ns, &pod, container, target.previous, LOG_TAIL).await {
-                    Ok(s) => s,
-                    Err(e) => return status(format!("{e:#}")).await,
-                };
+                let mut stream =
+                    match LogStream::start(ns, &pod, container, target.previous, LOG_TAIL).await {
+                        Ok(s) => s,
+                        Err(e) => return status(format!("{e:#}")).await,
+                    };
                 status(format!(
                     "streaming pod/{pod}{}{}",
                     container.map(|c| format!(" -c {c}")).unwrap_or_default(),
@@ -535,7 +552,11 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
                     container = Some(default_container);
                     continue;
                 }
-                let why = if reason.is_empty() { "stream ended".to_string() } else { reason };
+                let why = if reason.is_empty() {
+                    "stream ended".to_string()
+                } else {
+                    reason
+                };
                 return status(format!("kubectl logs ended: {why}")).await;
             }
         }
@@ -550,11 +571,22 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
             loop {
                 match client.fetch_text(&url).await {
                     Ok(body) => {
-                        let lines: Vec<String> = logs::extract_log_text(&body).lines().map(str::to_string).collect();
-                        if tx.send(Message::Log(LogEvent::Replace(lines))).await.is_err() {
+                        let lines: Vec<String> = logs::extract_log_text(&body)
+                            .lines()
+                            .map(str::to_string)
+                            .collect();
+                        if tx
+                            .send(Message::Log(LogEvent::Replace(lines)))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
-                        status(format!("tail of {url} · refreshed every {}s", HTTP_LOG_REFRESH.as_secs())).await;
+                        status(format!(
+                            "tail of {url} · refreshed every {}s",
+                            HTTP_LOG_REFRESH.as_secs()
+                        ))
+                        .await;
                     }
                     Err(e) => status(format!("fetch failed: {e:#}")).await,
                 }
@@ -587,21 +619,17 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
             let ns = namespace.as_deref();
             let mut container: Option<&str> = None;
             loop {
-                let mut stream = match LogStream::start(ns, &driver_pod, container, false, TAP_TAIL).await {
-                    Ok(s) => s,
-                    Err(e) => return status(format!("{e:#}")).await,
-                };
+                let mut stream =
+                    match LogStream::start(ns, &driver_pod, container, false, TAP_TAIL).await {
+                        Ok(s) => s,
+                        Err(e) => return status(format!("{e:#}")).await,
+                    };
                 status(format!("following pod/{driver_pod}")).await;
-                loop {
-                    match stream.lines.next_line().await {
-                        Ok(Some(line)) => {
-                            if let Some(p) = parser.feed(&line) {
-                                if tx.send(Message::Progress(p)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        _ => break,
+                while let Ok(Some(line)) = stream.lines.next_line().await {
+                    if let Some(p) = parser.feed(&line)
+                        && tx.send(Message::Progress(p)).await.is_err()
+                    {
+                        return;
                     }
                 }
                 let reason = stream.exit_reason().await;
@@ -648,18 +676,23 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
 async fn pump(stream: &mut LogStream, tx: &mpsc::Sender<Message>) -> bool {
     let mut batch: Vec<String> = Vec::new();
     loop {
-        let (eof, timer) = match tokio::time::timeout(LOG_BATCH_EVERY, stream.lines.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                batch.push(line);
-                (false, false)
-            }
-            Ok(Ok(None)) | Ok(Err(_)) => (true, false),
-            Err(_) => (false, true), // batch timer fired
-        };
-        if !batch.is_empty() && (eof || timer || batch.len() >= LOG_BATCH_MAX) {
-            if tx.send(Message::Log(LogEvent::Lines(std::mem::take(&mut batch)))).await.is_err() {
-                return false;
-            }
+        let (eof, timer) =
+            match tokio::time::timeout(LOG_BATCH_EVERY, stream.lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    batch.push(line);
+                    (false, false)
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => (true, false),
+                Err(_) => (false, true), // batch timer fired
+            };
+        if !batch.is_empty()
+            && (eof || timer || batch.len() >= LOG_BATCH_MAX)
+            && tx
+                .send(Message::Log(LogEvent::Lines(std::mem::take(&mut batch))))
+                .await
+                .is_err()
+        {
+            return false;
         }
         if eof {
             return true;
@@ -669,7 +702,12 @@ async fn pump(stream: &mut LogStream, tx: &mpsc::Sender<Message>) -> bool {
 
 /// One cycle for a watched app: the snapshot, plus the open detail view if
 /// any, fetched concurrently.
-async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &mut AppState) -> Vec<Message> {
+async fn fetch(
+    source: &mut Source,
+    key: &str,
+    detail: Option<Detail>,
+    state: &mut AppState,
+) -> Vec<Message> {
     let err = |e: anyhow::Error| format!("{e:#}");
     let (client, spark_id) = match source.resolve(key).await {
         Ok(c) => c,
@@ -696,11 +734,19 @@ async fn fetch(source: &mut Source, key: &str, detail: Option<Detail>, state: &m
             )),
             Some(d @ Detail::Sql(id)) => Some((
                 d,
-                client.sql_detail(&spark_id, id).await.map(DetailData::Sql).map_err(err),
+                client
+                    .sql_detail(&spark_id, id)
+                    .await
+                    .map(DetailData::Sql)
+                    .map_err(err),
             )),
             Some(d @ Detail::Rdd(id)) => Some((
                 d,
-                client.rdd_detail(&spark_id, id).await.map(DetailData::Rdd).map_err(err),
+                client
+                    .rdd_detail(&spark_id, id)
+                    .await
+                    .map(DetailData::Rdd)
+                    .map_err(err),
             )),
             None => None,
         }

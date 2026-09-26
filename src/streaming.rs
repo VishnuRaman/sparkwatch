@@ -56,7 +56,10 @@ pub struct SinkProgress {
 
 impl Progress {
     pub fn watermark(&self) -> Option<&str> {
-        self.event_time.get("watermark").map(String::as_str).filter(|w| !w.is_empty())
+        self.event_time
+            .get("watermark")
+            .map(String::as_str)
+            .filter(|w| !w.is_empty())
     }
 
     pub fn trigger_ms(&self) -> i64 {
@@ -71,7 +74,10 @@ impl Progress {
     }
 
     pub fn state_bytes(&self) -> i64 {
-        self.state_operators.iter().map(|s| s.memory_used_bytes).sum()
+        self.state_operators
+            .iter()
+            .map(|s| s.memory_used_bytes)
+            .sum()
     }
 
     /// `timestamp − watermark`, when both parse.
@@ -83,14 +89,20 @@ impl Progress {
 /// `2026-09-25T10:00:00.000Z` (or `.000GMT`, or no fraction) → epoch millis.
 /// Hand-rolled so we don't pull a date crate in for one field.
 pub fn parse_iso_ms(s: &str) -> Option<i64> {
-    let s = s.trim().trim_end_matches('Z').trim_end_matches("GMT").trim_end_matches("UTC");
+    let s = s
+        .trim()
+        .trim_end_matches('Z')
+        .trim_end_matches("GMT")
+        .trim_end_matches("UTC");
     let (date, time) = s.split_once('T')?;
     let mut d = date.split('-').map(|p| p.parse::<i64>());
     let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
     let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
     let mut t = hms.split(':').map(|p| p.parse::<i64>());
     let (h, mi, sec) = (t.next()?.ok()?, t.next()?.ok()?, t.next()?.ok()?);
-    let millis: i64 = format!("{:0<3}", frac.chars().take(3).collect::<String>()).parse().ok()?;
+    let millis: i64 = format!("{:0<3}", frac.chars().take(3).collect::<String>())
+        .parse()
+        .ok()?;
     // Days from civil (Howard Hinnant).
     let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = y.div_euclid(400);
@@ -259,10 +271,13 @@ impl Streaming {
     /// Returns false for a duplicate (same run and batch already known
     /// with progress), which the HTTP re-fetch produces constantly.
     pub fn ingest_progress(&mut self, p: Progress) -> bool {
-        let q = self.queries.entry(p.id.clone()).or_insert_with(|| QueryHistory {
-            query_id: p.id.clone(),
-            ..Default::default()
-        });
+        let q = self
+            .queries
+            .entry(p.id.clone())
+            .or_insert_with(|| QueryHistory {
+                query_id: p.id.clone(),
+                ..Default::default()
+            });
         q.on_run(&p.run_id);
         if p.name.is_some() {
             q.name = p.name.clone();
@@ -283,11 +298,16 @@ impl Streaming {
 
     pub fn ingest_sql(&mut self, execs: &[ExecutionData]) {
         for e in execs {
-            let Some(sb) = batch_from_sql(e) else { continue };
-            let q = self.queries.entry(sb.query_id.clone()).or_insert_with(|| QueryHistory {
-                query_id: sb.query_id.clone(),
-                ..Default::default()
-            });
+            let Some(sb) = batch_from_sql(e) else {
+                continue;
+            };
+            let q = self
+                .queries
+                .entry(sb.query_id.clone())
+                .or_insert_with(|| QueryHistory {
+                    query_id: sb.query_id.clone(),
+                    ..Default::default()
+                });
             q.on_run(&sb.run_id);
             if q.name.is_none() {
                 q.name = sb.name;
@@ -336,7 +356,11 @@ const BEHIND_MIN: usize = 3;
 impl<'a> QueryStats<'a> {
     pub fn of(q: &'a QueryHistory) -> Self {
         let batches: Vec<&Batch> = q.batches.values().collect();
-        let mut sorted: Vec<i64> = batches.iter().map(|b| b.duration_ms).filter(|d| *d > 0).collect();
+        let mut sorted: Vec<i64> = batches
+            .iter()
+            .map(|b| b.duration_ms)
+            .filter(|d| *d > 0)
+            .collect();
         sorted.sort_unstable();
         let pct = |p: f64| -> i64 {
             if sorted.is_empty() {
@@ -351,7 +375,8 @@ impl<'a> QueryStats<'a> {
             sorted.iter().sum::<i64>() / sorted.len() as i64
         };
 
-        let with_progress: Vec<&Progress> = batches.iter().filter_map(|b| b.progress.as_ref()).collect();
+        let with_progress: Vec<&Progress> =
+            batches.iter().filter_map(|b| b.progress.as_ref()).collect();
         let latest_p = with_progress.last().copied();
         let recent: Vec<&&Progress> = with_progress
             .iter()
@@ -366,13 +391,20 @@ impl<'a> QueryStats<'a> {
         let behind = recent.len() >= BEHIND_MIN && slow >= BEHIND_MIN;
 
         // Batches per minute over the window, from progress timestamps.
-        let times: Vec<i64> = with_progress.iter().filter_map(|p| parse_iso_ms(&p.timestamp)).collect();
+        let times: Vec<i64> = with_progress
+            .iter()
+            .filter_map(|p| parse_iso_ms(&p.timestamp))
+            .collect();
         let batches_per_min = match (times.first(), times.last()) {
-            (Some(a), Some(b)) if b > a && times.len() > 1 => (times.len() - 1) as f64 * 60_000.0 / (b - a) as f64,
+            (Some(a), Some(b)) if b > a && times.len() > 1 => {
+                (times.len() - 1) as f64 * 60_000.0 / (b - a) as f64
+            }
             _ => 0.0,
         };
 
-        let series = |f: &dyn Fn(&Progress) -> u64| -> Vec<u64> { with_progress.iter().map(|p| f(p)).collect() };
+        let series = |f: &dyn Fn(&Progress) -> u64| -> Vec<u64> {
+            with_progress.iter().map(|p| f(p)).collect()
+        };
         QueryStats {
             latest: batches.last().copied(),
             mean_ms,
@@ -385,7 +417,10 @@ impl<'a> QueryStats<'a> {
             state_bytes: latest_p.map_or(0, Progress::state_bytes),
             watermark_lag_ms: latest_p.and_then(Progress::watermark_lag_ms),
             batches_per_min,
-            durations: batches.iter().map(|b| b.duration_ms.max(0) as u64).collect(),
+            durations: batches
+                .iter()
+                .map(|b| b.duration_ms.max(0) as u64)
+                .collect(),
             input_series: series(&|p| p.input_rows_per_second.max(0.0).round() as u64),
             processed_series: series(&|p| p.processed_rows_per_second.max(0.0).round() as u64),
             state_series: series(&|p| p.state_rows().max(0) as u64),
@@ -466,14 +501,23 @@ mod tests {
         let pr = p.feed(one).expect("single line");
         assert_eq!(pr.batch_id, 7);
         assert_eq!(pr.trigger_ms(), 480);
-        assert!(p.feed("}").is_none(), "stray brace after a finished block is ignored");
+        assert!(
+            p.feed("}").is_none(),
+            "stray brace after a finished block is ignored"
+        );
     }
 
     #[test]
     fn iso_timestamps() {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00.000Z"), Some(0));
-        assert_eq!(parse_iso_ms("2026-09-25T10:00:05.000Z"), Some(1_790_330_405_000));
-        assert_eq!(parse_iso_ms("2026-09-25T10:00:05.5GMT"), Some(1_790_330_405_500));
+        assert_eq!(
+            parse_iso_ms("2026-09-25T10:00:05.000Z"),
+            Some(1_790_330_405_000)
+        );
+        assert_eq!(
+            parse_iso_ms("2026-09-25T10:00:05.5GMT"),
+            Some(1_790_330_405_500)
+        );
         assert_eq!(parse_iso_ms("nope"), None);
     }
 
@@ -492,11 +536,13 @@ mod tests {
                 name: Some("orders-agg".into())
             })
         );
-        assert!(batch_from_sql(&ExecutionData {
-            description: "count at Main.scala:40".into(),
-            ..Default::default()
-        })
-        .is_none());
+        assert!(
+            batch_from_sql(&ExecutionData {
+                description: "count at Main.scala:40".into(),
+                ..Default::default()
+            })
+            .is_none()
+        );
     }
 
     fn progress(batch: i64, input: f64, processed: f64) -> Progress {

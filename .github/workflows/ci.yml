@@ -37,3 +37,19 @@ jobs:
       - run: cargo build --release --locked
       # The binary must at least start and print its help on every OS.
       - run: cargo run --release --locked -- --help
+
+  streaming-job:
+    name: streaming-job builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: streaming-job
+      # The Spark Connect client compiles its protos at build time.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo clippy --manifest-path streaming-job/Cargo.toml -- -D warnings
+      - run: cargo run --manifest-path streaming-job/Cargo.toml -- --help

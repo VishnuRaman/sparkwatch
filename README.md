@@ -99,11 +99,15 @@ needed.
 
 `TARGET` can be any of, for a driver pod in `Running` phase:
 
-- the app name — the operator's `sparkoperator.k8s.io/app-name` label, or the
-  `spark-app-name` label `spark-submit` sets (`my-etl`);
-- the driver pod's name (`my-etl-driver`, or whatever yours is called, e.g.
-  `spark-driver`);
-- the pod name without its `-driver` suffix.
+- the app name — the operator's `sparkoperator.k8s.io/app-name` label
+  (`SparkApplication`), its `sparkoperator.k8s.io/connect-name` label
+  (`SparkConnect` server), or the `spark-app-name` label `spark-submit` sets;
+- the driver pod's name (`my-etl-driver`, `spark-connect-server`, or whatever
+  yours is called);
+- the pod name without its `-driver` / `-server` suffix.
+
+Spark Connect servers created by the operator's `SparkConnect` resource are
+listed alongside regular drivers (they carry `spark-role=connect-server`).
 
 Not sure which? Leave it off: the picker's `ID` column is the app name and
 `NAME` is the pod, and either works. A name that doesn't match fails with
@@ -136,6 +140,8 @@ malformed config is an error, not silently ignored; `--targets` lists what
 it found.
 
 ## Keys
+
+(The one-page version of everything below is [CHEATSHEET.md](CHEATSHEET.md).)
 
 | Key | Action |
 |---|---|
@@ -332,6 +338,15 @@ with no sort, and a streaming app retains up to 1000 micro-batches, so
 sparkwatch asks only for what is new or recent each poll and keeps the last
 500 in memory. A query evicted by the driver since you listed it says so when
 opened.
+
+## Demo workload
+
+[`streaming-job/`](streaming-job/) is a long-running Structured Streaming
+job in Rust, submitted over Spark Connect, built to give sparkwatch something
+worth watching: a synthetic order stream written raw to parquet, a windowed
+per-customer aggregation with a deliberately hot key (skew), and an optional
+query that fails on purpose (failures). See its README for how to run it
+against a local Spark Connect server or one on Kubernetes.
 
 ## Development
 

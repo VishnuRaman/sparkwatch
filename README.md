@@ -97,9 +97,17 @@ lists the running drivers, and when you pick one spawns
 torn down when you switch apps or quit. No separate port-forward terminal
 needed.
 
-The name matches the operator's `sparkoperator.k8s.io/app-name` label, the
-`spark-app-name` label set by `spark-submit`, or the driver pod name
-(`my-etl-driver`), so any of those work as `TARGET`.
+`TARGET` can be any of, for a driver pod in `Running` phase:
+
+- the app name — the operator's `sparkoperator.k8s.io/app-name` label, or the
+  `spark-app-name` label `spark-submit` sets (`my-etl`);
+- the driver pod's name (`my-etl-driver`, or whatever yours is called, e.g.
+  `spark-driver`);
+- the pod name without its `-driver` suffix.
+
+Not sure which? Leave it off: the picker's `ID` column is the app name and
+`NAME` is the pod, and either works. A name that doesn't match fails with
+the list of drivers that are running.
 
 ### Config file
 

@@ -210,7 +210,11 @@ fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 format!("#{} ", job.job_id).cyan(),
-                job.name.chars().take(60).collect::<String>().into(),
+                super::display_name(&job.name, job.description.as_deref())
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+                    .into(),
                 format!("  {}/{} tasks", job.num_completed_tasks, job.num_tasks).dark_gray(),
             ])),
             label,

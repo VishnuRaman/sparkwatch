@@ -2,7 +2,8 @@
 
 use super::fmt_millis;
 use super::{
-    fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style, table_block, warn_if,
+    display_name, fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style,
+    table_block, warn_if,
 };
 use crate::spark::{ExecutionData, ExecutorSummary, JobData, StageData};
 use ratatui::{
@@ -26,7 +27,12 @@ pub fn draw_jobs(
             Row::new(vec![
                 Cell::from(j.job_id.to_string()),
                 Cell::from(j.status.clone()).style(status_style(&j.status)),
-                Cell::from(j.name.chars().take(48).collect::<String>()),
+                Cell::from(
+                    display_name(&j.name, j.description.as_deref())
+                        .chars()
+                        .take(48)
+                        .collect::<String>(),
+                ),
                 Cell::from(short_time(&j.submission_time)),
                 Cell::from(format!("{}/{}", j.num_completed_tasks, j.num_tasks)),
                 Cell::from(j.num_failed_tasks.to_string()).style(warn_if(j.num_failed_tasks)),
@@ -88,7 +94,12 @@ pub fn draw_stages(
                     }
                 )),
                 Cell::from(st.status.clone()).style(status_style(&st.status)),
-                Cell::from(st.name.chars().take(40).collect::<String>()),
+                Cell::from(
+                    display_name(&st.name, st.description.as_deref())
+                        .chars()
+                        .take(40)
+                        .collect::<String>(),
+                ),
                 Cell::from(format!("{}/{}", st.num_complete_tasks, st.num_tasks)),
                 Cell::from(fmt_bytes(st.input_bytes)),
                 Cell::from(fmt_bytes(st.shuffle_read_bytes)),

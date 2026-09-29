@@ -215,7 +215,7 @@ async fn start_agg(spark: &SparkSession, cli: &Cli) -> Result<StreamingQuery> {
 /// Spark retries the task four times, then fails the stage and the query.
 async fn start_poison(spark: &SparkSession, cli: &Cli) -> Result<StreamingQuery> {
     let guard = format!(
-        "CASE WHEN order_id % {} = 0 THEN raise_error(concat('poison order ', order_id)) ELSE order_id END",
+        "CASE WHEN order_id > 0 AND order_id % {} = 0 THEN raise_error(concat('poison order ', order_id)) ELSE order_id END",
         cli.poison_every
     );
     orders(spark, cli)?

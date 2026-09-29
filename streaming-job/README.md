@@ -77,4 +77,7 @@ driver log. Ctrl-C stops the queries cleanly.
 
 Make it fall behind on purpose with a rate the cluster can't keep up with
 (`--rows-per-second 200000 --partitions 2`), or make it fail with
-`--poison-every 50000`.
+`--poison-every 20000`: the `orders-poison` query raises on the 20 000th order
+(~10 s), Spark fails the task 4 times, then the stage, job and query; the job
+restarts it with a fresh checkpoint, so the failure repeats every ~20 s.
+Watch it on sparkwatch's red strip and Failures tab (`6`).

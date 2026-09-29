@@ -8,6 +8,16 @@ Talks to the Spark REST API (`/api/v1`), so it works against a running driver,
 the History Server, or — via `kubectl port-forward` — driver pods on
 Kubernetes (Spark Operator or plain `spark-submit`).
 
+## Compatibility
+
+Any Spark 3.0 or newer, live driver or History Server, on YARN, standalone or
+Kubernetes; Spark 4.x included. Everything comes from the REST API and the
+driver log, both stable since 3.0. Version-specific details are handled
+(`isBlacklisted`/`isExcluded`, thread-dump encodings, no SQL error text before
+4.1 — the failed stage's reason is used instead; the failed-task filter is
+applied client-side for servers older than 3.1). The demo job needs a Spark
+Connect server (3.4+), but that's only the demo.
+
 ## Install
 
 Prebuilt binaries (macOS arm64/x86_64, Linux x86_64/arm64 as static musl,

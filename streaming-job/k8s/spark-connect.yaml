@@ -1,0 +1,91 @@
+# A Spark Connect server on Kubernetes via the Kubeflow Spark Operator's
+# SparkConnect resource (operator >= 2.2), plus a volume shared by the
+# server and its executors for streaming checkpoints and parquet output.
+#
+#   kubectl apply -f k8s/spark-connect.yaml
+#   kubectl wait sparkconnect/spark-connect --for=jsonpath='{.status.state}'=Ready --timeout=5m
+#   kubectl port-forward svc/spark-connect-server 15002:15002 &
+#   ./target/release/sparkwatch-streaming-job --output /data/streaming-job
+#   sparkwatch --k8s spark-connect
+#
+# Namespace: the operator only reconciles the namespaces it was started with
+# (`--namespaces=default` in a default install), so this lives in `default`.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spark-connect-data
+  namespace: default
+spec:
+  # ReadWriteOnce is enough on a single-node cluster (kind, minikube, Docker
+  # Desktop): every pod lands on the same node. On a real cluster use a
+  # ReadWriteMany class (NFS, EFS, …) or an object store path instead.
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: sparkoperator.k8s.io/v1alpha1
+kind: SparkConnect
+metadata:
+  name: spark-connect
+  namespace: default
+spec:
+  sparkVersion: 4.0.1
+  image: docker.io/apache/spark:4.0.1
+  sparkConf:
+    spark.connect.grpc.binding.port: "15002"
+    # Keep executor pods around after they exit so their logs stay readable
+    # (sparkwatch's log viewer explains this when a pod is gone).
+    spark.kubernetes.executor.deleteOnTermination: "false"
+    spark.sql.streaming.ui.enabled: "true"
+    spark.sql.shuffle.partitions: "16"
+    # Small executors for a laptop-sized cluster.
+    spark.executor.memoryOverhead: "256m"
+  server:
+    cores: 1
+    memory: 1g
+    template:
+      spec:
+        serviceAccount: spark-operator-spark
+        containers:
+          - name: spark-kubernetes-driver
+            image: docker.io/apache/spark:4.0.1
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests: { cpu: "1", memory: 1536Mi }
+              limits: { cpu: "2", memory: 1536Mi }
+            volumeMounts:
+              - name: data
+                mountPath: /data
+        volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: spark-connect-data
+        securityContext:
+          runAsUser: 185
+          runAsGroup: 185
+          fsGroup: 185
+          runAsNonRoot: true
+  executor:
+    instances: 2
+    cores: 1
+    memory: 1g
+    template:
+      spec:
+        containers:
+          - name: spark-kubernetes-executor
+            image: docker.io/apache/spark:4.0.1
+            imagePullPolicy: IfNotPresent
+            volumeMounts:
+              - name: data
+                mountPath: /data
+        volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: spark-connect-data
+        securityContext:
+          runAsUser: 185
+          runAsGroup: 185
+          fsGroup: 185
+          runAsNonRoot: true

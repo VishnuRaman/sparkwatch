@@ -247,10 +247,14 @@ impl SparkClient {
         attempt: i64,
         length: usize,
     ) -> Result<Vec<TaskData>> {
-        self.get(&format!(
+        // Spark < 3.1 ignores `status=` and returns every task; keep only the
+        // failed ones ourselves so an old server can't feed successes to the
+        // alert log.
+        let tasks: Vec<TaskData> = self.get(&format!(
             "/applications/{app_id}/stages/{stage_id}/{attempt}/taskList?status=failed&length={length}"
         ))
-        .await
+        .await?;
+        Ok(tasks.into_iter().filter(|t| t.status == "FAILED").collect())
     }
 }
 

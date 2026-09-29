@@ -87,6 +87,31 @@ pub fn status_style(status: &str) -> Style {
     }
 }
 
+/// What to call a job or stage. Spark's `name` is the user-code call site,
+/// which is `run at <unknown>:0` whenever there is no user code on the
+/// driver's stack (Spark Connect, streaming micro-batches). The job
+/// description is better: streaming sets it to
+/// `<query>\nid = …\nrunId = …\nbatch = N`, and `setJobDescription` users
+/// put their own text there.
+pub fn display_name(name: &str, description: Option<&str>) -> String {
+    let Some(d) = description.map(str::trim).filter(|d| !d.is_empty()) else {
+        return name.to_string();
+    };
+    let mut lines = d.lines().map(str::trim);
+    let first = lines.next().unwrap_or(name).to_string();
+    let batch = d
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("batch = "))
+        .map(|b| format!(" · batch {b}"))
+        .unwrap_or_default();
+    // A streaming description whose first line is an `id = …` means the query
+    // had no name; fall back to the call site plus the batch number.
+    if first.starts_with("id = ") {
+        return format!("{name}{batch}");
+    }
+    format!("{first}{batch}")
+}
+
 /// Unicode bar, useful inside a table cell where a Gauge cannot go.
 pub fn mini_bar(ratio: f64, width: usize) -> String {
     let filled = ((ratio.clamp(0.0, 1.0)) * width as f64).round() as usize;
@@ -511,4 +536,36 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         None => Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
     };
     f.render_widget(Paragraph::new(text), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_name;
+
+    #[test]
+    fn job_names_prefer_the_description() {
+        assert_eq!(
+            display_name("run at <unknown>:0", None),
+            "run at <unknown>:0"
+        );
+        assert_eq!(
+            display_name(
+                "run at <unknown>:0",
+                Some("orders-agg\nid = q\nrunId = r\nbatch = 4123")
+            ),
+            "orders-agg · batch 4123"
+        );
+        assert_eq!(
+            display_name("run at <unknown>:0", Some("id = q\nrunId = r\nbatch = 7")),
+            "run at <unknown>:0 · batch 7"
+        );
+        assert_eq!(
+            display_name("count at Main.scala:40", Some("nightly load")),
+            "nightly load"
+        );
+        assert_eq!(
+            display_name("count at Main.scala:40", Some("  ")),
+            "count at Main.scala:40"
+        );
+    }
 }

@@ -29,7 +29,10 @@ pub struct Driver {
 impl Driver {
     /// All the names a user might reasonably type to mean this driver.
     pub fn matches(&self, name: &str) -> bool {
-        self.app_name == name || self.pod == name || self.pod.trim_end_matches("-driver") == name
+        self.app_name == name
+            || self.pod == name
+            || self.pod.trim_end_matches("-driver") == name
+            || self.pod.trim_end_matches("-server") == name
     }
 
     /// Present a driver like a History Server entry so the picker can show it.
@@ -59,7 +62,16 @@ fn kubectl(namespace: Option<&str>) -> Command {
 /// Running driver pods in the namespace, newest first.
 pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
     let out = kubectl(namespace)
-        .args(["get", "pods", "-l", "spark-role=driver", "-o", "json"])
+        // A Spark Connect server run by the operator's SparkConnect resource
+        // is a driver too, just labelled differently.
+        .args([
+            "get",
+            "pods",
+            "-l",
+            "spark-role in (driver,connect-server)",
+            "-o",
+            "json",
+        ])
         .output()
         .await
         .context("running kubectl (is it on PATH?)")?;
@@ -82,10 +94,17 @@ pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
             let pod_name = meta["name"].as_str().unwrap_or_default().to_string();
             let label = |k: &str| labels[k].as_str().map(str::to_string);
             Driver {
-                // The operator's label first; plain spark-submit only sets the second.
+                // The operator's labels first (SparkApplication, then SparkConnect);
+                // plain spark-submit only sets `spark-app-name`.
                 app_name: label("sparkoperator.k8s.io/app-name")
+                    .or_else(|| label("sparkoperator.k8s.io/connect-name"))
                     .or_else(|| label("spark-app-name"))
-                    .unwrap_or_else(|| pod_name.trim_end_matches("-driver").to_string()),
+                    .unwrap_or_else(|| {
+                        pod_name
+                            .trim_end_matches("-driver")
+                            .trim_end_matches("-server")
+                            .to_string()
+                    }),
                 spark_version: label("spark-version").unwrap_or_default(),
                 started: pod["status"]["startTime"]
                     .as_str()
@@ -304,5 +323,13 @@ mod tests {
         assert!(d.matches("my-etl"));
         assert!(d.matches("my-etl-driver"));
         assert!(!d.matches("my-other-etl"));
+        let server = Driver {
+            pod: "spark-connect-server".into(),
+            app_name: "spark-connect".into(),
+            spark_version: String::new(),
+            started: String::new(),
+        };
+        assert!(server.matches("spark-connect"));
+        assert!(server.matches("spark-connect-server"));
     }
 }

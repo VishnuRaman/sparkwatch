@@ -154,25 +154,27 @@ impl AlertLog {
         }
 
         for j in s.jobs.iter().filter(|j| j.status == "FAILED") {
-            // The failed stage(s) carry the reason; point at the newest one.
-            let stage = s
-                .stages
-                .iter()
-                .filter(|st| st.status == "FAILED" && j.stage_ids.contains(&st.stage_id))
-                .max_by_key(|st| st.stage_id)
-                .map(|st| st.key());
+            // The failed stage carries the reason; point at the newest one.
+            let failed = failed_stage(s, &j.stage_ids);
+            let counts = format!(
+                "{} of {} stages failed, {} tasks failed",
+                j.num_failed_stages,
+                j.stage_ids.len(),
+                j.num_failed_tasks
+            );
+            let detail = match &failed {
+                Some((key, Some(reason))) => {
+                    format!("{counts}\nstage {}.{}: {reason}", key.0, key.1)
+                }
+                _ => counts,
+            };
             self.push(Alert {
                 key: format!("job:{}", j.job_id),
                 kind: Kind::Job,
                 first_seen: Instant::now(),
                 title: format!("Job #{} failed · {}", j.job_id, j.name),
-                detail: Some(format!(
-                    "{} of {} stages failed, {} tasks failed",
-                    j.num_failed_stages,
-                    j.stage_ids.len(),
-                    j.num_failed_tasks
-                )),
-                stage,
+                detail: Some(detail),
+                stage: failed.map(|(key, _)| key),
                 executor_id: None,
             });
         }
@@ -206,13 +208,29 @@ impl AlertLog {
         }
 
         for q in s.sql.iter().flatten().filter(|q| q.status == "FAILED") {
+            // Spark < 4.1 has no `errorMessage` on /sql; the execution's
+            // failed job → failed stage → failureReason is where the error is.
+            let job_stage_ids: Vec<i64> = s
+                .jobs
+                .iter()
+                .filter(|j| q.failed_job_ids.contains(&j.job_id))
+                .flat_map(|j| j.stage_ids.iter().copied())
+                .collect();
+            let failed = failed_stage(s, &job_stage_ids);
+            let detail = match (&q.error_message, &failed) {
+                (Some(e), _) if !e.trim().is_empty() => Some(e.clone()),
+                (_, Some((key, Some(reason)))) => {
+                    Some(format!("stage {}.{}: {reason}", key.0, key.1))
+                }
+                _ => None,
+            };
             self.push(Alert {
                 key: format!("sql:{}", q.id),
                 kind: Kind::Sql,
                 first_seen: Instant::now(),
                 title: format!("Query #{} failed · {}", q.id, q.title()),
-                detail: q.error_message.clone(),
-                stage: None,
+                detail,
+                stage: failed.map(|(key, _)| key),
                 executor_id: None,
             });
         }
@@ -240,6 +258,15 @@ impl AlertLog {
             executor_id: Some(t.executor_id.clone()),
         });
     }
+}
+
+/// The newest FAILED stage among `stage_ids`, with its `failureReason`.
+fn failed_stage(s: &Snapshot, stage_ids: &[i64]) -> Option<((i64, i64), Option<String>)> {
+    s.stages
+        .iter()
+        .filter(|st| st.status == "FAILED" && stage_ids.contains(&st.stage_id))
+        .max_by_key(|st| (st.stage_id, st.attempt_id))
+        .map(|st| (st.key(), st.failure_reason.clone()))
 }
 
 #[cfg(test)]
@@ -307,9 +334,16 @@ mod tests {
 
         let kinds: Vec<Kind> = log.newest_first().map(|a| a.kind).collect();
         assert_eq!(kinds[0], Kind::Task); // ingested last → newest
-        // Job alert points at its failed stage so the tab can jump there.
+        // Job alert points at its failed stage so the tab can jump there,
+        // and carries the stage's reason.
         let job = log.newest_first().find(|a| a.kind == Kind::Job).unwrap();
         assert_eq!(job.stage, Some((4, 0)));
+        assert!(
+            job.detail
+                .as_deref()
+                .unwrap()
+                .ends_with("stage 4.0: Job aborted")
+        );
 
         log.acknowledge();
         assert_eq!(log.unacked(), 0);
@@ -348,5 +382,46 @@ mod tests {
             log.newest_first().next().unwrap().stage,
             Some((MAX_ALERTS as i64 + 49, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod sql_reason_tests {
+    use super::*;
+    use crate::spark::{ExecutionData, JobData, StageData};
+
+    #[test]
+    fn sql_failure_without_error_message_borrows_the_stage_reason() {
+        let mut log = AlertLog::default();
+        let snap = Snapshot {
+            stages: vec![StageData {
+                stage_id: 31,
+                status: "FAILED".into(),
+                failure_reason: Some("Job aborted due to stage failure: poison order 20000".into()),
+                ..Default::default()
+            }],
+            jobs: vec![JobData {
+                job_id: 22,
+                status: "FAILED".into(),
+                stage_ids: vec![30, 31],
+                ..Default::default()
+            }],
+            sql: Some(vec![ExecutionData {
+                id: 22,
+                status: "FAILED".into(),
+                description: "orders-poison\nid = q\nrunId = r\nbatch = 3".into(),
+                failed_job_ids: vec![22],
+                error_message: None, // Spark 4.0 doesn't send one
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        log.ingest(&snap);
+        let sql = log.newest_first().find(|a| a.kind == Kind::Sql).unwrap();
+        assert_eq!(
+            sql.detail_line(),
+            "stage 31.0: Job aborted due to stage failure: poison order 20000"
+        );
+        assert_eq!(sql.stage, Some((31, 0)), "s opens the failed stage");
     }
 }

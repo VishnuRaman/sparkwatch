@@ -7,6 +7,7 @@
 //!
 //! [targets.prod]
 //! k8s = true
+//! context = "gke_my-project_europe-west1_prod"   # optional kubeconfig context
 //! namespace = "spark"
 //! app = "my-etl"            # optional: skip the picker
 //!
@@ -40,6 +41,8 @@ pub struct Target {
     /// Spark UI / History Server URL. Mutually exclusive with `k8s`.
     pub url: Option<String>,
     pub k8s: bool,
+    /// kubeconfig context to use (default: the current one).
+    pub context: Option<String>,
     pub namespace: Option<String>,
     /// With `url`: a Spark app id. With `k8s`: a SparkApplication name.
     pub app: Option<String>,
@@ -118,6 +121,7 @@ mod tests {
             Target {
                 url: None,
                 k8s: true,
+                context: None,
                 namespace: Some("spark".into()),
                 app: Some("my-etl".into())
             }

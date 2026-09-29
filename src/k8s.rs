@@ -50,18 +50,41 @@ impl Driver {
     }
 }
 
-fn kubectl(namespace: Option<&str>) -> Command {
-    let mut cmd = Command::new("kubectl");
-    if let Some(ns) = namespace {
-        cmd.args(["-n", ns]);
+/// Which cluster and namespace every `kubectl` call targets. Both default to
+/// the kubeconfig's current context / namespace when `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kube {
+    pub namespace: Option<String>,
+    pub context: Option<String>,
+}
+
+impl Kube {
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new("kubectl");
+        if let Some(ctx) = &self.context {
+            cmd.args(["--context", ctx]);
+        }
+        if let Some(ns) = &self.namespace {
+            cmd.args(["-n", ns]);
+        }
+        cmd.stdin(Stdio::null());
+        cmd
     }
-    cmd.stdin(Stdio::null());
-    cmd
+
+    /// For the header: `k8s:prod/spark`, `k8s:<current>/spark`, …
+    pub fn describe(&self) -> String {
+        format!(
+            "k8s:{}/{}",
+            self.context.as_deref().unwrap_or("<current>"),
+            self.namespace.as_deref().unwrap_or("<current>")
+        )
+    }
 }
 
 /// Running driver pods in the namespace, newest first.
-pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
-    let out = kubectl(namespace)
+pub async fn list_drivers(kube: &Kube) -> Result<Vec<Driver>> {
+    let out = kube
+        .cmd()
         // A Spark Connect server run by the operator's SparkConnect resource
         // is a driver too, just labelled differently.
         .args([
@@ -119,8 +142,8 @@ pub async fn list_drivers(namespace: Option<&str>) -> Result<Vec<Driver>> {
     Ok(drivers)
 }
 
-pub async fn find_driver(namespace: Option<&str>, name: &str) -> Result<Driver> {
-    let drivers = list_drivers(namespace).await?;
+pub async fn find_driver(kube: &Kube, name: &str) -> Result<Driver> {
+    let drivers = list_drivers(kube).await?;
     drivers
         .iter()
         .find(|d| d.matches(name))
@@ -142,13 +165,14 @@ pub async fn find_driver(namespace: Option<&str>, name: &str) -> Result<Driver> 
 /// if it still exists. Spark labels executor pods with `spark-exec-id` and
 /// `spark-app-selector` (= the Spark app id); the operator keeps those.
 pub async fn find_executor_pod(
-    namespace: Option<&str>,
+    kube: &Kube,
     spark_app_id: &str,
     exec_id: &str,
 ) -> Result<Option<String>> {
     let selector =
         format!("spark-role=executor,spark-exec-id={exec_id},spark-app-selector={spark_app_id}");
-    let out = kubectl(namespace)
+    let out = kube
+        .cmd()
         .args(["get", "pods", "-l", &selector, "-o", "json"])
         .output()
         .await
@@ -182,13 +206,13 @@ pub struct LogStream {
 
 impl LogStream {
     pub async fn start(
-        namespace: Option<&str>,
+        kube: &Kube,
         pod: &str,
         container: Option<&str>,
         previous: bool,
         tail: usize,
     ) -> Result<Self> {
-        let mut cmd = kubectl(namespace);
+        let mut cmd = kube.cmd();
         cmd.args(["logs", "-f", &format!("--tail={tail}")]);
         if previous {
             cmd.arg("--previous");
@@ -236,8 +260,9 @@ pub struct PortForward {
 impl PortForward {
     /// Forward a free local port to the driver's UI and wait until kubectl
     /// reports it is listening.
-    pub async fn to_driver(namespace: Option<&str>, pod: &str) -> Result<Self> {
-        let mut child = kubectl(namespace)
+    pub async fn to_driver(kube: &Kube, pod: &str) -> Result<Self> {
+        let mut child = kube
+            .cmd()
             .args([
                 "port-forward",
                 &format!("pod/{pod}"),
@@ -310,6 +335,23 @@ mod tests {
             Some(54321)
         );
         assert_eq!(parse_forwarding_line("Handling connection for 54321"), None);
+    }
+
+    #[test]
+    fn context_and_namespace_become_kubectl_flags() {
+        let k = Kube {
+            namespace: Some("spark".into()),
+            context: Some("gke-prod".into()),
+        };
+        let cmd = k.cmd();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--context", "gke-prod", "-n", "spark"]);
+        assert_eq!(k.describe(), "k8s:gke-prod/spark");
+        assert_eq!(Kube::default().describe(), "k8s:<current>/<current>");
     }
 
     #[test]

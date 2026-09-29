@@ -35,6 +35,7 @@ Examples:
   sparkwatch http://history:18080 -a app-123  History Server; watch one app
   sparkwatch --k8s -n spark                   pick a running driver pod
   sparkwatch --k8s -n spark my-etl            watch the SparkApplication my-etl
+  sparkwatch --k8s --context prod -n spark    another cluster from your kubeconfig
   sparkwatch prod                             a target from ~/.config/sparkwatch.toml
 
 Config file (~/.config/sparkwatch.toml or $XDG_CONFIG_HOME/sparkwatch.toml):
@@ -43,6 +44,7 @@ Config file (~/.config/sparkwatch.toml or $XDG_CONFIG_HOME/sparkwatch.toml):
   timeout = 5
   [targets.prod]
   k8s = true
+  context = \"prod\"       # optional kubeconfig context
   namespace = \"spark\"
   app = \"my-etl\"          # optional
   [targets.history]
@@ -60,6 +62,10 @@ struct Cli {
     /// Kubernetes namespace (default: the current kubectl context's)
     #[arg(short = 'n', long)]
     namespace: Option<String>,
+
+    /// kubeconfig context to use with --k8s (default: the current one)
+    #[arg(long, value_name = "NAME")]
+    context: Option<String>,
 
     /// Application id to watch; skips the picker when the endpoint lists several
     #[arg(short, long, conflicts_with = "k8s")]
@@ -99,6 +105,7 @@ fn resolve_target(mut cli: Cli, cfg: &config::Config) -> Cli {
     if t.k8s {
         cli.k8s = true;
         cli.namespace = cli.namespace.or(t.namespace);
+        cli.context = cli.context.or(t.context);
         cli.target = t.app;
         cli.app = None;
     } else {
@@ -149,12 +156,13 @@ async fn main() -> Result<()> {
 
     // What the header shows as the endpoint, and which app (if any) to start on.
     let (source, endpoint, watch) = if cli.k8s {
-        let endpoint = format!(
-            "k8s:{}",
-            cli.namespace.as_deref().unwrap_or("<current namespace>")
-        );
-        let source = Source::Kube {
+        let kube = k8s::Kube {
             namespace: cli.namespace,
+            context: cli.context,
+        };
+        let endpoint = kube.describe();
+        let source = Source::Kube {
+            kube,
             timeout,
             conn: None,
         };
@@ -499,7 +507,7 @@ mod tests {
 
     fn cfg() -> config::Config {
         config::parse(
-            "[targets.prod]\nk8s = true\nnamespace = \"spark\"\napp = \"my-etl\"\n[targets.history]\nurl = \"http://h:18080\"\napp = \"app-1\"",
+            "[targets.prod]\nk8s = true\ncontext = \"gke-prod\"\nnamespace = \"spark\"\napp = \"my-etl\"\n[targets.history]\nurl = \"http://h:18080\"\napp = \"app-1\"",
         )
         .unwrap()
     }
@@ -509,6 +517,7 @@ mod tests {
         let c = resolve_target(cli(&["prod"]), &cfg());
         assert!(c.k8s);
         assert_eq!(c.namespace.as_deref(), Some("spark"));
+        assert_eq!(c.context.as_deref(), Some("gke-prod"));
         assert_eq!(c.target.as_deref(), Some("my-etl"));
 
         let c = resolve_target(cli(&["history"]), &cfg());
@@ -519,8 +528,12 @@ mod tests {
 
     #[test]
     fn explicit_flags_win_and_unknown_names_pass_through() {
-        let c = resolve_target(cli(&["prod", "-n", "other"]), &cfg());
+        let c = resolve_target(
+            cli(&["prod", "-n", "other", "--context", "staging"]),
+            &cfg(),
+        );
         assert_eq!(c.namespace.as_deref(), Some("other"));
+        assert_eq!(c.context.as_deref(), Some("staging"));
         let c = resolve_target(cli(&["http://x:4040"]), &cfg());
         assert_eq!(c.target.as_deref(), Some("http://x:4040"));
         // With --k8s the positional is an app name, even if a target shares it.

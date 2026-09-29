@@ -68,7 +68,8 @@ sparkwatch [OPTIONS] [TARGET]
 |---|---|
 | `TARGET` | Spark UI or History Server URL, or a target name from the config file. With `--k8s`: the SparkApplication name. |
 | `--k8s` | Find Spark driver pods with `kubectl` and port-forward to them. |
-| `-n, --namespace <NS>` | Kubernetes namespace (default: the current kubectl context's). Requires `--k8s`. |
+| `-n, --namespace <NS>` | Kubernetes namespace (default: the current kubectl context's). |
+| `--context <NAME>` | kubeconfig context to use with `--k8s` (default: the current one). |
 | `-a, --app <ID>` | Spark application id to watch; skips the picker on a History Server. |
 | `-i, --interval <SECS>` | Poll interval (default `2`, or `[defaults].interval`). |
 | `-t, --timeout <SECS>` | HTTP timeout (default `5`, or `[defaults].timeout`). |
@@ -135,6 +136,7 @@ timeout = 5
 
 [targets.prod]
 k8s = true
+context = "gke_my-project_europe-west1_prod"   # optional kubeconfig context
 namespace = "spark"
 app = "my-etl"            # optional: skip the picker
 

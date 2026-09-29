@@ -5,7 +5,7 @@
 //! is sequential: one fetch per cycle, then sleep until the interval elapses
 //! or a request wakes it early.
 
-use crate::k8s::{self, LogStream, PortForward};
+use crate::k8s::{self, Kube, LogStream, PortForward};
 use crate::logview::LogTarget;
 use crate::spark::{
     ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail,
@@ -194,9 +194,9 @@ impl SqlCache {
 pub enum Source {
     /// A URL: live driver UI or History Server.
     Http(SparkClient),
-    /// Driver pods in a namespace, reached via `kubectl port-forward`.
+    /// Driver pods in a cluster/namespace, reached via `kubectl port-forward`.
     Kube {
-        namespace: Option<String>,
+        kube: Kube,
         timeout: Duration,
         /// The forward + client for the driver currently being watched.
         conn: Option<KubeConn>,
@@ -216,7 +216,7 @@ pub struct KubeConn {
 /// What a log stream needs to know about where the app runs.
 enum LogSource {
     Kube {
-        namespace: Option<String>,
+        kube: Kube,
         spark_app_id: String,
         driver_pod: String,
     },
@@ -227,7 +227,7 @@ impl Source {
     async fn list(&self) -> Result<Vec<ApplicationInfo>> {
         match self {
             Source::Http(client) => client.applications().await,
-            Source::Kube { namespace, .. } => Ok(k8s::list_drivers(namespace.as_deref())
+            Source::Kube { kube, .. } => Ok(k8s::list_drivers(kube)
                 .await?
                 .iter()
                 .map(k8s::Driver::as_application)
@@ -241,13 +241,13 @@ impl Source {
         match self {
             Source::Http(client) => Ok((client.clone(), key.to_string())),
             Source::Kube {
-                namespace,
+                kube,
                 timeout,
                 conn,
             } => {
                 if conn.as_ref().is_none_or(|c| c.app_name != key) {
                     *conn = None; // drop the old forward before opening another
-                    *conn = Some(connect(namespace.as_deref(), key, *timeout).await?);
+                    *conn = Some(connect(kube, key, *timeout).await?);
                 }
                 let c = conn.as_ref().expect("connected above");
                 Ok((c.client.clone(), c.spark_app_id.clone()))
@@ -258,12 +258,10 @@ impl Source {
     fn log_source(&self) -> Result<LogSource> {
         match self {
             Source::Http(client) => Ok(LogSource::Http(client.clone())),
-            Source::Kube {
-                namespace, conn, ..
-            } => {
+            Source::Kube { kube, conn, .. } => {
                 let c = conn.as_ref().context("not connected to a driver yet")?;
                 Ok(LogSource::Kube {
-                    namespace: namespace.clone(),
+                    kube: kube.clone(),
                     spark_app_id: c.spark_app_id.clone(),
                     driver_pod: c.driver_pod.clone(),
                 })
@@ -284,9 +282,9 @@ impl Source {
     }
 }
 
-async fn connect(namespace: Option<&str>, app_name: &str, timeout: Duration) -> Result<KubeConn> {
-    let driver = k8s::find_driver(namespace, app_name).await?;
-    let forward = PortForward::to_driver(namespace, &driver.pod).await?;
+async fn connect(kube: &Kube, app_name: &str, timeout: Duration) -> Result<KubeConn> {
+    let driver = k8s::find_driver(kube, app_name).await?;
+    let forward = PortForward::to_driver(kube, &driver.pod).await?;
     let client = SparkClient::new(forward.base_url(), timeout)?;
     let spark_app_id = client
         .applications()
@@ -511,15 +509,14 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
     };
     match src {
         LogSource::Kube {
-            namespace,
+            kube,
             spark_app_id,
             driver_pod,
         } => {
-            let ns = namespace.as_deref();
             let (pod, default_container) = if target.executor_id == "driver" {
                 (driver_pod, k8s::DRIVER_CONTAINER)
             } else {
-                match k8s::find_executor_pod(ns, &spark_app_id, &target.executor_id).await {
+                match k8s::find_executor_pod(&kube, &spark_app_id, &target.executor_id).await {
                     Ok(Some(p)) => (p, k8s::EXECUTOR_CONTAINER),
                     Ok(None) => {
                         return status(
@@ -536,7 +533,8 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
             let mut container: Option<&str> = None;
             loop {
                 let mut stream =
-                    match LogStream::start(ns, &pod, container, target.previous, LOG_TAIL).await {
+                    match LogStream::start(&kube, &pod, container, target.previous, LOG_TAIL).await
+                    {
                         Ok(s) => s,
                         Err(e) => return status(format!("{e:#}")).await,
                     };
@@ -612,15 +610,12 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
     let mut parser = ProgressParser::new();
     match src {
         LogSource::Kube {
-            namespace,
-            driver_pod,
-            ..
+            kube, driver_pod, ..
         } => {
-            let ns = namespace.as_deref();
             let mut container: Option<&str> = None;
             loop {
                 let mut stream =
-                    match LogStream::start(ns, &driver_pod, container, false, TAP_TAIL).await {
+                    match LogStream::start(&kube, &driver_pod, container, false, TAP_TAIL).await {
                         Ok(s) => s,
                         Err(e) => return status(format!("{e:#}")).await,
                     };

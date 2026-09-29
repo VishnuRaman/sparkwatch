@@ -20,6 +20,7 @@ can't see. The narrative version is [README.md](README.md).
 ```
 -a, --app <ID>         Spark app id (History Server) — skips the picker
 -n, --namespace <NS>   Kubernetes namespace (default: current kubectl context's)
+    --context <NAME>   kubeconfig context to use with --k8s (default: current)
 -i, --interval <S>     poll interval, default 2 (or [defaults].interval)
 -t, --timeout <S>      HTTP timeout, default 5
     --config <PATH>    config file (default ~/.config/sparkwatch.toml)
@@ -38,7 +39,8 @@ can't see. The narrative version is [README.md](README.md).
   `spark-app-selector=<spark app id>`.
 - Sidecars: `kubectl logs` refuses pods with several containers; sparkwatch retries with
   `-c spark-kubernetes-driver` / `-c spark-kubernetes-executor`.
-- Auth is whatever your kubeconfig does (OIDC, exec plugins, cloud CLIs) — it just runs `kubectl`.
+- Auth is whatever your kubeconfig does (OIDC, exec plugins, cloud CLIs) — it just runs `kubectl`,
+  with `--context <NAME>` if given, so several clusters in one kubeconfig need no switching.
 
 ### Config file `~/.config/sparkwatch.toml`
 ```toml
@@ -48,6 +50,7 @@ timeout = 5
 
 [targets.kind]                  # sparkwatch kind
 k8s = true
+context = "kind-spark"          # optional; any kubeconfig context
 namespace = "default"
 app = "spark-connect"           # optional: skip the picker
 
@@ -297,7 +300,27 @@ executor) → `L` (its log, pre-filtered) → `t` if it's hung.
 
 Same thing from the other end: `3`, `Enter` on a `✗` stage (opens on its failed tasks), `j`/`k`, `L`.
 
-## 5. Thresholds and colours
+## 5. Glossary (the Spark words on these screens)
+| Term | Meaning | Where it shows |
+|---|---|---|
+| **Job** | one action (`count`, `write`, a micro-batch); made of stages | `2` |
+| **Stage** | a set of identical tasks between two shuffles; `9.0` = stage 9, attempt 0 (retries make new attempts) | `3` |
+| **Task** | one stage's work on one partition, run on one executor core | drill-down task table |
+| **Shuffle** | data moved between executors when a stage needs rows regrouped by key (joins, groupBy, repartition); "shuffle write" leaves a stage, "shuffle read" enters the next | Stages, drill-down, SQL `Exchange` nodes |
+| **Spill** | a task ran out of execution memory and wrote its working set (sort/aggregation/shuffle buffers) to local disk, then read it back — slow, and the usual step before an OOM. Causes: too few partitions, a skewed key, undersized executors | magenta `SPILL` on Stages; `mem spill` / `disk spill` rows in the drill-down; `spill size` on SQL nodes |
+| **Skew** | a few partitions carry far more data or time than the rest (a hot key): one task runs on while the others sit idle | drill-down `⚠ ×N` |
+| **Straggler** | a single task much slower than its siblings (≥ 3× median) — skew, a slow node, or GC | yellow task rows |
+| **Speculative task** | Spark's own copy of a suspected straggler launched elsewhere; first to finish wins | task table note |
+| **GC** | JVM garbage collection; time the executor spent not running your code. Above ~10 % = memory pressure | Overview, Executors, stage header |
+| **Executor excluded** (`excl`) | the scheduler stopped giving an executor tasks after repeated failures on it (formerly "blacklisted") | Executors, Failures |
+| **removeReason** | why an executor went away — `exit code 137` = killed for memory by Kubernetes/YARN | Executors host column, Failures |
+| **Storage memory** | the part of executor memory holding cached RDD/DataFrame blocks (vs execution memory for shuffles/sorts) | `8`, Overview |
+| **Micro-batch / trigger** | Structured Streaming processes input in batches; the trigger interval is how often; trigger duration is how long one took | `7`, SQL rows |
+| **Watermark** | how late an event may arrive and still be counted; the lag is how far event time trails processing | `7` |
+| **State** | rows a streaming aggregation/join keeps between batches (state store); grows until the watermark evicts them | `7` |
+| **Physical plan** | the operator tree Spark actually runs (`Exchange`, `HashAggregate`, `Scan`…) | `5` `Enter` |
+
+## 6. Thresholds and colours
 | Signal | Rule |
 |---|---|
 | GC red | GC time > 10 % of task time (Overview, Executors, stage header) |
@@ -310,7 +333,7 @@ Same thing from the other end: `3`, `Enter` on a `✗` stage (opens on its faile
 | Partial cache yellow | cached partitions < total |
 | `excl` | executor excluded by the scheduler (`isExcluded` / `isBlacklisted`) |
 
-## 6. Compatibility and what it can't see
+## 7. Compatibility and what it can't see
 Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubernetes; 4.x included).
 
 - **History Server**: no logs, no thread dumps, no storage; SQL and stages are fine; the Streaming tab
@@ -326,7 +349,7 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 - Polling: each cycle is 4–5 GETs plus ≤ 4 for an open drill-down plus ≤ 5 for new failures; a History
   Server is slow, so raise `-i` there.
 
-## 7. Troubleshooting sparkwatch itself
+## 8. Troubleshooting sparkwatch itself
 | Symptom | Meaning / fix |
 |---|---|
 | `ERROR` badge, footer `GET … connection refused` | driver gone or port-forward died; under `--k8s` it reconnects on the next poll |
@@ -338,7 +361,7 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 | Keys ignored right after start | still on the picker / "Connecting" screen; wait for `LIVE` |
 | Anything odd with input | `SPARKWATCH_KEYLOG=/tmp/keys.log sparkwatch …` logs every key press with a timestamp |
 
-## 8. Spark Connect demo on Kubernetes (kind + Spark Operator)
+## 9. Spark Connect demo on Kubernetes (kind + Spark Operator)
 ```bash
 # once: create the server and wait for it
 kubectl apply -f streaming-job/k8s/spark-connect.yaml
@@ -394,7 +417,7 @@ kubectl get pods -l sparkoperator.k8s.io/connect-name=spark-connect -o wide
 kubectl describe sparkconnect spark-connect | tail -30
 ```
 
-## 9. Development
+## 10. Development
 ```bash
 cargo test                            # unit tests
 python3 dev/mock_spark.py --single &  # fake Spark API on :4040 (also --no-sql; no flag = two apps → picker)

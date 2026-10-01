@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Terminal monitor for Apache Spark applications: a Spark UI you can use over SSH"
 repository = "https://github.com/VishnuRaman/sparkwatch"
+license = "Apache-2.0"
 readme = "README.md"
 keywords = ["spark", "tui", "monitoring", "kubernetes"]
 categories = ["command-line-utilities"]

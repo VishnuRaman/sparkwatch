@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
     };
     let list_scroll = sel.saturating_sub(list_rows.saturating_sub(1));
     let [panel, list, foot] = Layout::vertical([
-        Constraint::Min(14),
+        Constraint::Min(20),
         Constraint::Length(if list_rows > 0 {
             list_rows as u16 + 2
         } else {
@@ -154,13 +154,15 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [head, charts, detail, recent] = Layout::vertical([
+    let [head, charts, charts2, detail, recent] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(7),
+        Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Min(4),
     ])
     .areas(inner);
+    draw_charts2(f, charts2, &st);
 
     // ---- header: latest batch and the verdict
     let latest = st.latest;
@@ -373,6 +375,75 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
 
     draw_recent_batches(f, recent, q, &st);
+}
+
+/// Second row of charts: where the time goes, and the watermark's story.
+fn draw_charts2(f: &mut Frame, area: Rect, st: &QueryStats) {
+    let [a, b, c, d] = Layout::horizontal([Constraint::Percentage(25); 4]).areas(area);
+    let w = |r: Rect| r.width.saturating_sub(2) as usize;
+    let last = |v: &[u64]| v.last().copied().unwrap_or(0);
+    let max = |v: &[u64]| v.iter().max().copied().unwrap_or(0);
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.add_batch_series, w(a)))
+            .style(Style::default().fg(Color::Cyan))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " addBatch (the work) · {} · max {} ",
+                fmt_millis(last(&st.add_batch_series) as i64),
+                fmt_millis(max(&st.add_batch_series) as i64)
+            ))),
+        a,
+    );
+    let overhead_hot =
+        last(&st.overhead_series) > last(&st.add_batch_series) && last(&st.overhead_series) > 0;
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.overhead_series, w(b)))
+            .style(Style::default().fg(if overhead_hot {
+                Color::Red
+            } else {
+                Color::Blue
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " planning + offsets + commits · {}{} ",
+                fmt_millis(last(&st.overhead_series) as i64),
+                if overhead_hot {
+                    " · more than the work: driver-side overhead"
+                } else {
+                    ""
+                }
+            ))),
+        b,
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.lag_series, w(c)))
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " watermark lag · {} ",
+                if last(&st.lag_series) > 0 {
+                    fmt_millis(last(&st.lag_series) as i64)
+                } else {
+                    "-".into()
+                }
+            ))),
+        c,
+    );
+    let dropped_total: u64 = st.dropped_series.iter().sum();
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.dropped_series, w(d)))
+            .style(Style::default().fg(if dropped_total > 0 {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " rows dropped by watermark · {} in window ",
+                fmt_num(dropped_total as i64)
+            ))),
+        d,
+    );
 }
 
 /// One row per batch, newest first: the per-batch history that the

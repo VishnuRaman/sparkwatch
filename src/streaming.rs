@@ -2,11 +2,11 @@
 //! micro-batch SQL executions, since the REST API does not expose it.
 
 use crate::spark::ExecutionData;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// One `StreamingQueryProgress`, as logged by `ProgressReporter`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Progress {
     pub id: String,
@@ -28,7 +28,7 @@ pub struct Progress {
     pub sink: SinkProgress,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StateOperator {
     pub operator_name: String,
@@ -38,7 +38,7 @@ pub struct StateOperator {
     pub num_rows_dropped_by_watermark: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SourceProgress {
     pub description: String,
@@ -47,7 +47,7 @@ pub struct SourceProgress {
     pub processed_rows_per_second: f64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SinkProgress {
     pub description: String,
@@ -183,11 +183,16 @@ pub struct SqlBatch {
 }
 
 pub fn batch_from_sql(e: &ExecutionData) -> Option<SqlBatch> {
+    parse_description(&e.description)
+}
+
+/// The same, from any job/stage/execution description.
+pub fn parse_description(description: &str) -> Option<SqlBatch> {
     let mut query_id = None;
     let mut run_id = None;
     let mut batch_id = None;
     let mut name = None;
-    for line in e.description.lines().map(str::trim) {
+    for line in description.lines().map(str::trim) {
         if let Some(v) = line.strip_prefix("id = ") {
             query_id = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("runId = ") {
@@ -208,21 +213,39 @@ pub fn batch_from_sql(e: &ExecutionData) -> Option<SqlBatch> {
 
 // ------------------------------------------------------------------ model
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Batch {
     pub batch_id: i64,
     pub duration_ms: i64,
     /// From the SQL execution: RUNNING | COMPLETED | FAILED; empty if only
     /// the log reported it.
     pub status: String,
+    /// The SQL execution's submission time, when known.
+    pub submitted: String,
     pub progress: Option<Progress>,
+}
+
+impl Batch {
+    /// When the batch ran, with a second of slack either side, for slicing
+    /// the driver log. From the progress event when there is one, else from
+    /// the SQL execution.
+    pub fn window_ms(&self) -> Option<(i64, i64)> {
+        let (start, len) = match &self.progress {
+            Some(p) => (
+                parse_iso_ms(&p.timestamp)?,
+                p.trigger_ms().max(self.duration_ms),
+            ),
+            None => (parse_iso_ms(&self.submitted)?, self.duration_ms),
+        };
+        Some((start - 1000, start + len.max(0) + 1000))
+    }
 }
 
 /// Batches kept per query; a day of 5 s micro-batches would be 17k, so
 /// this is a window, not a history.
 pub const MAX_BATCHES: usize = 300;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct QueryHistory {
     pub query_id: String,
     pub run_id: String,
@@ -270,6 +293,14 @@ pub struct Streaming {
 impl Streaming {
     pub fn is_empty(&self) -> bool {
         self.queries.is_empty()
+    }
+
+    /// Queries in display order (by name), the order the tab's list and
+    /// its selection index use.
+    pub fn sorted(&self) -> Vec<&QueryHistory> {
+        let mut v: Vec<&QueryHistory> = self.queries.values().collect();
+        v.sort_by_key(|q| q.label());
+        v
     }
 
     /// A query restarted from a fresh checkpoint gets a new query id but
@@ -367,6 +398,9 @@ impl Streaming {
                 }
             });
             b.status = e.status.clone();
+            if !e.submission_time.is_empty() {
+                b.submitted = e.submission_time.clone();
+            }
             if b.progress.is_none() {
                 b.duration_ms = e.duration;
             }
@@ -394,6 +428,14 @@ pub struct QueryStats<'a> {
     pub input_series: Vec<u64>,
     pub processed_series: Vec<u64>,
     pub state_series: Vec<u64>,
+    /// `addBatch` ms per batch: the actual work.
+    pub add_batch_series: Vec<u64>,
+    /// Everything else in `durationMs` (planning, offsets, commits): overhead.
+    pub overhead_series: Vec<u64>,
+    /// Watermark lag ms per batch (0 when unknown).
+    pub lag_series: Vec<u64>,
+    /// Rows dropped by the watermark per batch.
+    pub dropped_series: Vec<u64>,
 }
 
 /// `behind` needs this many of the last `BEHIND_WINDOW` batches slow.
@@ -471,6 +513,23 @@ impl<'a> QueryStats<'a> {
             input_series: series(&|p| p.input_rows_per_second.max(0.0).round() as u64),
             processed_series: series(&|p| p.processed_rows_per_second.max(0.0).round() as u64),
             state_series: series(&|p| p.state_rows().max(0) as u64),
+            add_batch_series: series(&|p| {
+                p.duration_ms.get("addBatch").copied().unwrap_or(0).max(0) as u64
+            }),
+            overhead_series: series(&|p| {
+                p.duration_ms
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "addBatch" && k.as_str() != "triggerExecution")
+                    .map(|(_, v)| v.max(&0))
+                    .sum::<i64>() as u64
+            }),
+            lag_series: series(&|p| p.watermark_lag_ms().unwrap_or(0).max(0) as u64),
+            dropped_series: series(&|p| {
+                p.state_operators
+                    .iter()
+                    .map(|o| o.num_rows_dropped_by_watermark.max(0))
+                    .sum::<i64>() as u64
+            }),
         }
     }
 }

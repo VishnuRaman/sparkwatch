@@ -136,7 +136,44 @@ pub fn draw(
 
 /// Task completion rate and concurrency over the last few minutes.
 fn draw_trends(f: &mut Frame, area: Rect, history: &VecDeque<Sample>) {
-    let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
+    let [left, right, execs] = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .areas(area);
+
+    // Executors alive over the window: dynamic-allocation churn or a node
+    // dying shows up as a step; removals are counted in the title.
+    let alive: Vec<u64> = history
+        .iter()
+        .map(|h| h.alive_executors.max(0) as u64)
+        .collect();
+    let now_alive = alive.last().copied().unwrap_or(0);
+    let peak_alive = alive.iter().max().copied().unwrap_or(0);
+    let removed_in_window = match (history.front(), history.back()) {
+        (Some(a), Some(b)) => (b.removed_executors - a.removed_executors).max(0),
+        _ => 0,
+    };
+    f.render_widget(
+        Sparkline::default()
+            .data(fit(&alive, execs.width))
+            .max(peak_alive.max(1))
+            .style(Style::default().fg(if removed_in_window > 0 {
+                Color::Red
+            } else {
+                Color::Cyan
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " Executors: {now_alive} alive (peak {peak_alive}){} ",
+                if removed_in_window > 0 {
+                    format!(" · {removed_in_window} removed")
+                } else {
+                    String::new()
+                }
+            ))),
+        execs,
+    );
 
     // Completed tasks are cumulative; the rate is the delta between polls.
     // Stored in tenths so a slow 0.4 tasks/s stage still draws a bar.

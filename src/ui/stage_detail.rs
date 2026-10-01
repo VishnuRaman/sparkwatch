@@ -41,7 +41,7 @@ pub fn draw(f: &mut Frame, area: Rect, p: Props) {
 
     let has_failure = d.stage.failure_reason.is_some();
     let [head, middle, bottom] = Layout::vertical([
-        Constraint::Length(if has_failure { 6 } else { 5 }),
+        Constraint::Length(if has_failure { 7 } else { 6 }),
         Constraint::Percentage(45),
         Constraint::Min(6),
     ])
@@ -72,11 +72,46 @@ fn draw_head(f: &mut Frame, area: Rect, d: &StageDetail) {
     f.render_widget(block, area);
 
     let [info, gauge, reason] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(inner);
+
+    // Locality over the tasks we fetched (slowest + failed): PROCESS_LOCAL is
+    // data on the same executor, ANY means it had to be pulled across.
+    let mut locality: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for t in d.slowest.iter().chain(&d.failed) {
+        if !t.task_locality.is_empty() {
+            *locality.entry(t.task_locality.as_str()).or_default() += 1;
+        }
+    }
+    let sampled = d.slowest.len() + d.failed.len();
+    let locality_line = if locality.is_empty() {
+        "locality -".to_string()
+    } else {
+        let order = [
+            "PROCESS_LOCAL",
+            "NODE_LOCAL",
+            "NO_PREF",
+            "RACK_LOCAL",
+            "ANY",
+        ];
+        let mut parts: Vec<String> = order
+            .iter()
+            .filter_map(|k| locality.get(k).map(|n| format!("{k} {n}")))
+            .collect();
+        for (k, n) in &locality {
+            if !order.contains(k) {
+                parts.push(format!("{k} {n}"));
+            }
+        }
+        format!(
+            "locality (of {sampled} sampled tasks) {}",
+            parts.join(" · ")
+        )
+    };
+    let mostly_remote = locality.get("ANY").copied().unwrap_or(0) * 2 > sampled.max(1);
 
     let gc_pct = if st.executor_run_time > 0 {
         100.0 * st.jvm_gc_time as f64 / st.executor_run_time as f64
@@ -131,6 +166,19 @@ fn draw_head(f: &mut Frame, area: Rect, d: &StageDetail) {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default()
+                },
+            ),
+        ]),
+        Line::from(vec![
+            "records ".dark_gray(),
+            format!("in {} · out {}", st.input_records, st.output_records).into(),
+            "  ".into(),
+            Span::styled(
+                locality_line,
+                if mostly_remote {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Gray)
                 },
             ),
         ]),

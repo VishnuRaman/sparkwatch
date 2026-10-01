@@ -1,6 +1,9 @@
 //! Rendering. `draw` is the single entry point; each view lives in its own
 //! submodule and shares the formatting helpers defined here.
 
+mod batches;
+pub mod environment;
+mod exec_memory;
 mod failures;
 mod logs;
 mod overview;
@@ -9,13 +12,14 @@ pub mod sql_detail;
 mod stage_detail;
 mod storage;
 mod streaming;
+mod summary;
 mod tables;
 mod threads;
 
 use crate::alerts::Alert;
 use crate::app::{
-    App, Tab, View, filtered_title, visible_alerts, visible_executors, visible_jobs, visible_rdds,
-    visible_sql, visible_stages,
+    App, Tab, View, batch_failures_of, batch_stages_of, batches_newest_first, filtered_title,
+    visible_alerts, visible_executors, visible_jobs, visible_rdds, visible_sql, visible_stages,
 };
 use ratatui::{
     Frame,
@@ -131,16 +135,8 @@ pub struct Labels {
 
 /// `(name, runId)` from a streaming job/stage description.
 fn streaming_run(description: &str) -> Option<(String, String)> {
-    let mut name = None;
-    let mut run = None;
-    for (i, l) in description.lines().map(str::trim).enumerate() {
-        if i == 0 && !l.contains(" = ") {
-            name = Some(l.to_string());
-        } else if let Some(r) = l.strip_prefix("runId = ") {
-            run = Some(r.to_string());
-        }
-    }
-    Some((name?, run?))
+    let d = crate::streaming::parse_description(description)?;
+    Some((d.name?, d.run_id))
 }
 
 impl Labels {
@@ -259,6 +255,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(f.area());
 
+    // The summary borrows all of `app`; build it before the destructure below.
+    let sections_for_draw = if app.view == View::Summary {
+        app.summary_sections()
+    } else {
+        Vec::new()
+    };
     draw_header(f, header, app);
     if strip_h > 0 {
         failures::draw_strip(f, strip, &app.alerts);
@@ -300,6 +302,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         streaming: streaming_state,
         streaming_status,
         streaming_sel,
+        batch_query,
+        batches_cursor,
+        batch_id,
+        batch_stages,
+        environment,
+        env_error,
+        env_scroll,
+        env_lines,
+        summary_scroll,
+        summary_lines,
         ..
     } = app;
 
@@ -361,6 +373,68 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             storage::draw_detail(f, body, rdd_detail.as_ref(), detail_error.as_deref());
             return;
         }
+        View::Summary => {
+            let sections = sections_for_draw;
+            summary::draw(f, body, &sections, *summary_scroll, summary_lines);
+            return;
+        }
+        View::ExecutorMemory => {
+            let empty = crate::spark::Snapshot::default();
+            let snap = snapshot.as_ref().unwrap_or(&empty);
+            let rows = visible_executors(snap, filters.get(&Tab::Executors).map(String::as_str));
+            exec_memory::draw(f, body, &rows, environment.as_ref(), &mut executors.state);
+            return;
+        }
+        View::Batches | View::Batch => {
+            let q = batch_query
+                .as_ref()
+                .and_then(|id| streaming_state.queries.get(id));
+            let Some(q) = q else {
+                f.render_widget(
+                    Paragraph::new("query no longer known")
+                        .block(Block::default().borders(Borders::ALL)),
+                    body,
+                );
+                return;
+            };
+            let st = crate::streaming::QueryStats::of(q);
+            if *view == View::Batches {
+                batches::draw_list(
+                    f,
+                    body,
+                    q,
+                    &batches_newest_first(q),
+                    &st,
+                    &mut batches_cursor.state,
+                );
+                return;
+            }
+            let Some(b) = batch_id.and_then(|id| q.batches.get(&id)) else {
+                f.render_widget(
+                    Paragraph::new("batch no longer in the window")
+                        .block(Block::default().borders(Borders::ALL)),
+                    body,
+                );
+                return;
+            };
+            let empty = crate::spark::Snapshot::default();
+            let snap = snapshot.as_ref().unwrap_or(&empty);
+            let stages = batch_stages_of(snap, q, b.batch_id);
+            let failures = batch_failures_of(alerts, snap, q, b.batch_id);
+            batches::draw_detail(
+                f,
+                body,
+                batches::DetailProps {
+                    query: q,
+                    batch: b,
+                    stats: &st,
+                    stages: &stages,
+                    failures: &failures,
+                    stage_state: &mut batch_stages.state,
+                },
+            );
+            return;
+        }
         View::Main => {}
     }
 
@@ -384,6 +458,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             streaming_state,
             streaming_status.as_deref(),
             *streaming_sel,
+        );
+        return;
+    }
+    if *tab == Tab::Environment {
+        let fl = filters.get(&Tab::Environment).map(String::as_str);
+        *env_lines = environment
+            .as_ref()
+            .map_or(0, |e| environment::lines(e, fl).len());
+        environment::draw(
+            f,
+            body,
+            environment.as_ref(),
+            env_error.as_deref(),
+            fl,
+            *env_scroll,
         );
         return;
     }
@@ -449,7 +538,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             );
             storage::draw_list(f, body, snap, &rows, title, &mut rdds.state)
         }
-        Tab::Failures | Tab::Streaming => unreachable!("handled above"),
+        Tab::Failures | Tab::Streaming | Tab::Environment => unreachable!("handled above"),
     }
 }
 
@@ -479,7 +568,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             | View::Alert
             | View::Logs
             | View::Threads
-            | View::Rdd,
+            | View::Rdd
+            | View::Batches
+            | View::Batch
+            | View::ExecutorMemory
+            | View::Summary,
             Some(s),
         ) => format!(
             "{} [{}] @ {} · every {}s · updated {age}",
@@ -495,7 +588,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             | View::Alert
             | View::Logs
             | View::Threads
-            | View::Rdd,
+            | View::Rdd
+            | View::Batches
+            | View::Batch
+            | View::ExecutorMemory
+            | View::Summary,
             None,
         ) => format!(
             "[{}] @ {} · every {}s · updated {age}",
@@ -583,6 +680,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    if let Some(n) = &app.notice {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {n} "),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))),
+            area,
+        );
+        return;
+    }
     let help = match app.view {
         View::Picker if app.watching.is_some() => {
             " q quit · j/k move · Enter watch · Esc back · r refresh "
@@ -592,16 +699,19 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             " q quit · tab/←→ switch · j/k move · Enter full text · s open stage · L logs · x acknowledge · a apps "
         }
         View::Main if app.tab == Tab::Streaming => {
-            " q quit · tab/←→ switch · j/k select query · x ack failures · a apps · r refresh · p pause "
+            " q quit · tab/←→ switch · j/k select query · Enter batches · x ack failures · a apps · r refresh · p pause "
         }
         View::Main if app.tab == Tab::Executors => {
-            " q quit · tab/←→ switch · j/k move · / filter · L logs · t threads · x ack failures · a apps · r refresh · p pause "
+            " q quit · tab/←→ switch · j/k move · / filter · L logs · t threads · m memory · x ack failures · a apps · r refresh "
+        }
+        View::Main if app.tab == Tab::Environment => {
+            " q quit · tab/←→ switch · j/k PgUp/PgDn scroll · / search · c clear · a apps · r refresh "
         }
         View::Main if app.tab == Tab::Storage => {
             " q quit · tab/←→ switch · j/k move · / filter · Enter distribution · a apps · r refresh · p pause "
         }
         View::Main => {
-            " q quit · tab/←→ switch · j/k move · / filter · Enter open · x ack failures · a apps · r refresh · p pause · +/- interval "
+            " q quit · tab/←→ switch · j/k move · / filter · Enter open · S summary · D dump · x ack · a apps · r refresh · p pause "
         }
         View::Stage => {
             " Esc back · j/k tasks · f failed/slowest · L logs of task's executor · r refresh · p pause · q quit "
@@ -617,10 +727,19 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         View::Alert => " Esc back · j/k scroll · s open stage · L logs · x acknowledge · q quit ",
         View::Rdd => " Esc back · r refresh · q quit ",
+        View::Batches => " Esc back · j/k · Enter batch detail · g/G · q quit ",
+        View::ExecutorMemory => " Esc back · j/k executor · L logs · t threads · q quit ",
+        View::Summary => " Esc back · j/k scroll · D dump bundle · r refresh · q quit ",
+        View::Batch => {
+            " Esc back · j/k stages · Enter stage drill-down · L driver log for this batch · q quit "
+        }
     };
     let error = match app.view {
         View::Stage | View::Sql => app.detail_error.as_ref().or(app.last_error.as_ref()),
         View::Rdd => app.detail_error.as_ref().or(app.last_error.as_ref()),
+        View::Batches | View::Batch | View::ExecutorMemory | View::Summary => {
+            app.last_error.as_ref()
+        }
         View::Alert | View::Logs | View::Threads => None,
         _ => app.last_error.as_ref(),
     };

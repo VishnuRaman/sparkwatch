@@ -78,6 +78,9 @@ pub struct LogView {
     pub status: Option<String>,
     /// Lines the source has delivered in total (for the title).
     pub received: usize,
+    /// Only lines whose timestamp falls in `[start, end]` (epoch ms) are
+    /// shown; lines without a timestamp follow the line before them.
+    pub window: Option<(i64, i64)>,
 }
 
 impl LogView {
@@ -88,6 +91,21 @@ impl LogView {
             follow: true,
             ..Default::default()
         };
+    }
+
+    pub fn open_window(
+        &mut self,
+        target: LogTarget,
+        filter: Option<String>,
+        window: Option<(i64, i64)>,
+    ) {
+        self.open(target, filter);
+        self.window = window;
+        // A window is a slice of the past: start at its beginning, not the tail.
+        if window.is_some() {
+            self.follow = false;
+            self.scroll = 0;
+        }
     }
 
     pub fn close(&mut self) {
@@ -121,17 +139,26 @@ impl LogView {
         self.lines.len()
     }
 
-    /// Lines that pass the filter, in order.
+    /// Lines that pass the time window and the text filter, in order.
     pub fn visible(&self) -> Vec<&str> {
-        match &self.filter {
-            None => self.lines.iter().map(String::as_str).collect(),
-            Some(f) => self
-                .lines
-                .iter()
-                .filter(|l| l.to_lowercase().contains(f.as_str()))
-                .map(String::as_str)
-                .collect(),
-        }
+        let mut in_window = self.window.is_none();
+        self.lines
+            .iter()
+            .filter(|l| {
+                if let Some((start, end)) = self.window
+                    && let Some(t) = line_time_ms(l)
+                {
+                    in_window = (start..=end).contains(&t);
+                }
+                in_window
+            })
+            .filter(|l| {
+                self.filter
+                    .as_ref()
+                    .is_none_or(|f| l.to_lowercase().contains(f.as_str()))
+            })
+            .map(String::as_str)
+            .collect()
     }
 
     /// The slice to draw for a viewport `height` rows tall, and the index
@@ -199,8 +226,47 @@ impl LogView {
 
     pub fn clear_filter(&mut self) {
         self.filter = None;
+        self.window = None;
         self.follow = true;
     }
+}
+
+/// The timestamp at the start of a Spark log line, as epoch millis (UTC).
+/// Spark's default log4j pattern is `yy/MM/dd HH:mm:ss`; ISO-8601
+/// (`yyyy-MM-dd HH:mm:ss,SSS` / `T`) is the other common one.
+pub fn line_time_ms(line: &str) -> Option<i64> {
+    let b = line.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|x| x.iter().all(u8::is_ascii_digit));
+    if b.len() >= 17
+        && digits(0..2)
+        && b[2] == b'/'
+        && digits(3..5)
+        && b[5] == b'/'
+        && digits(6..8)
+        && b[8] == b' '
+    {
+        let iso = format!(
+            "20{}-{}-{}T{}",
+            &line[0..2],
+            &line[3..5],
+            &line[6..8],
+            &line[9..17]
+        );
+        return crate::streaming::parse_iso_ms(&iso);
+    }
+    if b.len() >= 19
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && (b[10] == b' ' || b[10] == b'T')
+    {
+        let iso = format!("{}T{}", &line[0..10], &line[11..19]);
+        return crate::streaming::parse_iso_ms(&iso);
+    }
+    None
 }
 
 /// The first "word" of an error message, for pre-setting the log filter when
@@ -282,6 +348,40 @@ mod tests {
         v.append(vec!["x".into(); 3]);
         assert_eq!(v.total(), MAX_LINES);
         assert_eq!(v.scroll, before - 3);
+    }
+
+    #[test]
+    fn time_window_keeps_lines_in_range_and_their_continuations() {
+        let mut v = view_with(0);
+        v.append(vec![
+            "26/10/01 18:03:13 INFO before".into(),
+            "26/10/01 18:03:15 INFO Starting batch 4".into(),
+            "  continuation of the line above".into(),
+            "26/10/01 18:03:16 ERROR Exception in task 3.0".into(),
+            "\tat org.apache.spark.x(A.scala:1)".into(),
+            "26/10/01 18:03:20 INFO after".into(),
+        ]);
+        let t = |s: &str| line_time_ms(s).unwrap();
+        v.window = Some((t("26/10/01 18:03:14 x"), t("26/10/01 18:03:17 x")));
+        v.follow = false;
+        assert_eq!(
+            v.visible(),
+            [
+                "26/10/01 18:03:15 INFO Starting batch 4",
+                "  continuation of the line above",
+                "26/10/01 18:03:16 ERROR Exception in task 3.0",
+                "\tat org.apache.spark.x(A.scala:1)",
+            ]
+        );
+        assert_eq!(
+            line_time_ms("2026-10-01 18:03:15,123 INFO x"),
+            line_time_ms("26/10/01 18:03:15 INFO x")
+        );
+        assert_eq!(
+            line_time_ms("2026-10-01T18:03:15.000Z x"),
+            line_time_ms("26/10/01 18:03:15 x")
+        );
+        assert_eq!(line_time_ms("no timestamp here"), None);
     }
 
     #[test]

@@ -8,8 +8,8 @@
 use crate::k8s::{self, Kube, LogStream, PortForward};
 use crate::logview::LogTarget;
 use crate::spark::{
-    ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail,
-    ThreadStackTrace, logs,
+    ApplicationEnvironmentInfo, ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot,
+    SparkClient, StageDetail, TaskMetricDistributions, ThreadStackTrace, logs,
 };
 use crate::streaming::{Progress, ProgressParser};
 use anyhow::{Context, Result};
@@ -38,6 +38,13 @@ pub enum Request {
     FetchThreads(String),
     /// Start following the driver log for streaming progress (idempotent).
     TapProgress,
+    /// `taskSummary` for these stage attempts (the summary's slowest stages).
+    FetchStageSummaries(Vec<(i64, i64)>),
+    /// Log tails for the dump bundle: the driver and these executors.
+    DumpLogs {
+        executors: Vec<String>,
+        lines: usize,
+    },
     /// Tear down (kills any port-forward) and exit.
     Shutdown,
 }
@@ -73,6 +80,11 @@ pub enum Message {
     },
     /// A micro-batch's progress from the driver log tap.
     Progress(Progress),
+    /// `GET /environment`, once per app.
+    Environment(Result<ApplicationEnvironmentInfo, String>),
+    StageSummaries(Vec<((i64, i64), Option<TaskMetricDistributions>)>),
+    /// `(file name, lines)` per log, for the bundle.
+    LogDump(Vec<(String, Vec<String>)>),
     /// What the tap is doing, or why it can't.
     ProgressStatus(String),
 }
@@ -101,6 +113,9 @@ pub enum DetailData {
 #[derive(Default)]
 struct AppState {
     sql: SqlCache,
+    /// The environment is static: fetched once per app, re-fetched on `r`
+    /// only if the first attempt failed.
+    env_fetched: bool,
     /// The driver's stderr `executorLogs` URL (YARN/standalone), for the tap.
     driver_log_url: Option<String>,
     /// Failed-task count already fetched per stage attempt, so the error
@@ -448,6 +463,31 @@ impl Poller {
                 }
             }
             Request::CloseLogs => self.close_logs(),
+            Request::FetchStageSummaries(keys) => {
+                let mut out = Vec::new();
+                if let Some(key) = self.watch.clone()
+                    && let Ok((client, spark_id)) = self.source.resolve(&key).await
+                {
+                    for (id, attempt) in keys {
+                        let d = client
+                            .task_summary(&spark_id, id, attempt)
+                            .await
+                            .ok()
+                            .flatten();
+                        out.push(((id, attempt), d));
+                    }
+                }
+                let _ = self.msg_tx.send(Message::StageSummaries(out)).await;
+            }
+            Request::DumpLogs { executors, lines } => {
+                let dump = match self.source.log_source() {
+                    Ok(src) => {
+                        collect_log_tails(src, &self.state.driver_log_url, &executors, lines).await
+                    }
+                    Err(_) => Vec::new(),
+                };
+                let _ = self.msg_tx.send(Message::LogDump(dump)).await;
+            }
             Request::TapProgress => {
                 if self.tap.as_ref().is_some_and(|h| !h.is_finished()) {
                     return false; // already tapping
@@ -488,6 +528,61 @@ impl Poller {
         }
         false
     }
+}
+
+/// One-shot tails of the driver's and each executor's log, for `--dump`.
+async fn collect_log_tails(
+    src: LogSource,
+    driver_url: &Option<String>,
+    executors: &[String],
+    lines: usize,
+) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    match src {
+        LogSource::Kube {
+            kube,
+            spark_app_id,
+            driver_pod,
+        } => {
+            match k8s::log_tail(&kube, &driver_pod, k8s::DRIVER_CONTAINER, lines).await {
+                Ok(l) => out.push(("driver.log".into(), l)),
+                Err(e) => out.push(("driver.log".into(), vec![format!("<not available: {e:#}>")])),
+            }
+            for id in executors {
+                let name = format!("executor-{id}.log");
+                match k8s::find_executor_pod(&kube, &spark_app_id, id).await {
+                    Ok(Some(pod)) => match k8s::log_tail(&kube, &pod, k8s::EXECUTOR_CONTAINER, lines).await {
+                        Ok(l) => out.push((name, l)),
+                        Err(e) => out.push((name, vec![format!("<not available: {e:#}>")])),
+                    },
+                    Ok(None) => out.push((name, vec!["<pod gone — set spark.kubernetes.executor.deleteOnTermination=false to keep executor logs>".into()])),
+                    Err(e) => out.push((name, vec![format!("<not available: {e:#}>")])),
+                }
+            }
+        }
+        LogSource::Http(client) => {
+            // Only the driver's URL is known here; executors' come with the
+            // snapshot, which the UI has — it passes them as ids, so for HTTP
+            // sources the dump carries the driver tail only.
+            if let Some(url) = driver_url {
+                match client.fetch_text(&logs::with_tail(url)).await {
+                    Ok(body) => {
+                        let mut l: Vec<String> = logs::extract_log_text(&body)
+                            .lines()
+                            .map(str::to_string)
+                            .collect();
+                        let keep = l.len().saturating_sub(lines);
+                        l.drain(..keep);
+                        out.push(("driver.log".into(), l));
+                    }
+                    Err(e) => {
+                        out.push(("driver.log".into(), vec![format!("<not available: {e:#}>")]))
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------- log streams
@@ -756,6 +851,7 @@ async fn fetch(
     if let Ok(tail) = sql_tail {
         state.sql.merge(tail);
     }
+    let mut msgs_extra: Vec<Message> = Vec::new();
     let snapshot = match snapshot {
         Ok(mut s) => {
             s.sql = state.sql.view();
@@ -764,6 +860,11 @@ async fn fetch(
                 .iter()
                 .find(|e| e.id == "driver")
                 .and_then(|e| e.log_url("stderr"));
+            if !state.env_fetched {
+                let env = client.environment(&spark_id).await.map_err(err);
+                state.env_fetched = env.is_ok();
+                msgs_extra.push(Message::Environment(env));
+            }
             // Needs the stage list, so it runs after the snapshot, not with it.
             s.failed_tasks = fetch_failed_tasks(&client, &spark_id, &s, state).await;
             Ok(s)
@@ -777,5 +878,6 @@ async fn fetch(
     if let Some((detail, result)) = detail {
         msgs.push(Message::Detail { detail, result });
     }
+    msgs.extend(msgs_extra);
     msgs
 }

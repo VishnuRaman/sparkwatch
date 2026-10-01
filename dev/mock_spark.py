@@ -284,6 +284,42 @@ RDDS = [
      "partitions": []},
 ]
 
+ENVIRONMENT = {
+    "runtime": {"javaVersion": "17.0.16 (Eclipse Adoptium)", "javaHome": "/opt/java/openjdk", "scalaVersion": "version 2.13.16"},
+    "sparkProperties": [
+        ["spark.app.id", "app-20260923-0001"], ["spark.app.name", "etl-nightly"],
+        ["spark.executor.memory", "4g"], ["spark.executor.cores", "4"], ["spark.executor.memoryOverhead", "512m"],
+        ["spark.executor.instances", "2"], ["spark.driver.memory", "2g"],
+        ["spark.sql.shuffle.partitions", "200"], ["spark.sql.adaptive.enabled", "true"],
+        ["spark.dynamicAllocation.enabled", "false"], ["spark.memory.fraction", "0.6"],
+        ["spark.sql.streaming.checkpointLocation", "s3a://bucket/checkpoints"],
+        ["spark.eventLog.enabled", "true"], ["spark.eventLog.dir", "s3a://bucket/spark-events"],
+        ["spark.kubernetes.executor.deleteOnTermination", "false"],
+        ["spark.serializer", "org.apache.spark.serializer.KryoSerializer"],
+        ["spark.master", "k8s://https://10.96.0.1:443"], ["spark.submit.deployMode", "cluster"],
+    ],
+    "hadoopProperties": [["fs.s3a.connection.maximum", "96"], ["fs.s3a.endpoint", "s3.eu-west-1.amazonaws.com"]],
+    "systemProperties": [["java.version", "17.0.16"], ["user.timezone", "UTC"], ["SPARK_SUBMIT", "true"]],
+    "metricsProperties": [["*.sink.servlet.class", "org.apache.spark.metrics.sink.MetricsServlet"]],
+    "classpathEntries": [["/opt/spark/conf", "System Classpath"], ["/opt/spark/jars/spark-core_2.13-4.0.1.jar", "System Classpath"]],
+    "resourceProfiles": [{"id": 0,
+                          "executorResources": {"memory": {"resourceName": "memory", "amount": 4096},
+                                                "memoryOverhead": {"resourceName": "memoryOverhead", "amount": 512},
+                                                "offHeap": {"resourceName": "offHeap", "amount": 0},
+                                                "cores": {"resourceName": "cores", "amount": 4}},
+                          "taskResources": {"cpus": {"resourceName": "cpus", "amount": 1.0}}}],
+}
+
+PEAK = {"JVMHeapMemory": 3 * GiB, "JVMOffHeapMemory": 180 * MiB, "OnHeapExecutionMemory": 900 * MiB,
+        "OffHeapExecutionMemory": 0, "OnHeapStorageMemory": 1536 * MiB, "OffHeapStorageMemory": 0,
+        "OnHeapUnifiedMemory": 2300 * MiB, "OffHeapUnifiedMemory": 0, "DirectPoolMemory": 64 * MiB,
+        "MappedPoolMemory": 0, "ProcessTreeJVMRSSMemory": 3700 * MiB, "ProcessTreeJVMVMemory": 6 * GiB,
+        "ProcessTreePythonRSSMemory": 0, "ProcessTreePythonVMemory": 0, "ProcessTreeOtherRSSMemory": 0,
+        "ProcessTreeOtherVMemory": 0, "MinorGCCount": 420, "MinorGCTime": 180000, "MajorGCCount": 6,
+        "MajorGCTime": 60000, "ConcurrentGCCount": 0, "ConcurrentGCTime": 0, "TotalGCTime": 240000}
+MEMORY = {"usedOnHeapStorageMemory": 1536 * MiB, "usedOffHeapStorageMemory": 0,
+          "totalOnHeapStorageMemory": 2300 * MiB, "totalOffHeapStorageMemory": 0}
+
 # Completed-task counters tick up on every poll so the sparklines move.
 TICK = {"n": 0}
 
@@ -329,10 +365,16 @@ class H(BaseHTTPRequestHandler):
         if rest.startswith("executors/") and rest.endswith("/threads"):
             eid = rest.split("/")[1]
             return THREADS if eid in ("1", "3", "driver") else None
+        if rest == "environment":
+            return ENVIRONMENT
         if rest == "allexecutors":
             TICK["n"] += 1
             execs = json.loads(json.dumps(EXECS))
             execs[1]["completedTasks"] += TICK["n"] * 7
+            for e in execs:
+                if e["id"] != "driver":
+                    e["memoryMetrics"] = MEMORY
+                    e["peakMemoryMetrics"] = PEAK
             return execs
         return None
 

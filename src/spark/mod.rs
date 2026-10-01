@@ -211,6 +211,26 @@ impl SparkClient {
             .await
     }
 
+    /// Task metric quantiles of one stage attempt (`None` before any task
+    /// completed). Used by the summary for the slowest stages.
+    pub async fn task_summary(
+        &self,
+        app_id: &str,
+        stage_id: i64,
+        attempt: i64,
+    ) -> Result<Option<TaskMetricDistributions>> {
+        self.get_opt(&format!(
+            "/applications/{app_id}/stages/{stage_id}/{attempt}/taskSummary?quantiles={SUMMARY_QUANTILES}"
+        ))
+        .await
+    }
+
+    /// The Environment tab's data. Static for the life of an app.
+    pub async fn environment(&self, app_id: &str) -> Result<ApplicationEnvironmentInfo> {
+        self.get(&format!("/applications/{app_id}/environment"))
+            .await
+    }
+
     /// Live thread dump of an executor. `None` where it is not served (the
     /// History Server, or an executor that is gone).
     pub async fn threads(

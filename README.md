@@ -1,36 +1,62 @@
 # sparkwatch
 
-A terminal UI for monitoring Apache Spark applications. Same data as the Spark
-web UI, without the clicking: live tables of jobs, stages and executors, task
-throughput over time, and a picker for hopping between applications.
+A terminal UI for monitoring Apache Spark applications — live driver,
+History Server, or driver pods on Kubernetes — with the things the Spark web
+UI makes you dig for brought to the front:
 
-Talks to the Spark REST API (`/api/v1`), so it works against a running driver,
-the History Server, or — via `kubectl port-forward` — driver pods on
-Kubernetes (Spark Operator or plain `spark-submit`).
+- **Failures that don't scroll away.** Every failed task, stage, job, SQL
+  execution and lost executor is kept for the life of the process, with its
+  full error, and one key opens the executor's log filtered to it.
+- **Skew and stragglers flagged for you.** The stage drill-down marks a task
+  metric whose max is 3× its median, the executor that is 2× slower than the
+  rest, and the tasks that dragged.
+- **Structured Streaming without clicking per batch.** Trigger duration,
+  input vs processed rate, watermark lag and state size per query, every
+  batch in a table, a `FALLING BEHIND` flag, and a drill-down from a batch to
+  its stages, failures and log window.
+- **A summary for an app you weren't watching**, and a bundle (`summary.md`
+  + JSON + log tails) to attach to a ticket.
+
+<!-- screenshot: docs/sparkwatch.png (Overview or Streaming tab) -->
+
+Everything comes from the Spark REST API (`/api/v1`) and the driver log;
+nothing is installed on the cluster.
+
+## Quick start
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VishnuRaman/sparkwatch/main/install.sh | sh
+sparkwatch http://localhost:4040        # a running driver
+sparkwatch --k8s -n spark               # Kubernetes: pick a driver pod
+```
+
+Then `1`–`9` switch tabs, `Enter` drills in, `Esc` backs out, `S` shows the
+summary, `q` quits. [CHEATSHEET.md](CHEATSHEET.md) is the one-page version of
+everything below.
 
 ## Compatibility
 
-Any Spark 3.0 or newer, live driver or History Server, on YARN, standalone or
-Kubernetes; Spark 4.x included. Everything comes from the REST API and the
-driver log, both stable since 3.0. Version-specific details are handled
-(`isBlacklisted`/`isExcluded`, thread-dump encodings, no SQL error text before
-4.1 — the failed stage's reason is used instead; the failed-task filter is
-applied client-side for servers older than 3.1). The demo job needs a Spark
-Connect server (3.4+), but that's only the demo.
+Any Spark 3.0 or newer, on YARN, standalone or Kubernetes; Spark 4.x
+included. Version differences are handled (`isBlacklisted`/`isExcluded`,
+thread-dump encodings, the missing SQL error text on Spark ≤ 4.0 — the
+failed stage's reason is used instead). What a source can't provide:
+
+| | Live driver | History Server |
+|---|---|---|
+| Jobs, stages, executors, SQL, environment, summary, bundle | ✓ | ✓ |
+| Streaming batch ids, status, durations | ✓ | ✓ |
+| Streaming rates, watermark, state (from the driver log) | ✓ | – |
+| Logs, thread dumps, storage | ✓ | – |
+
+The demo job needs a Spark Connect server (3.4+), but that's only the demo.
 
 ## Install
 
 Prebuilt binaries (macOS arm64/x86_64, Linux x86_64/arm64 as static musl,
 Windows x86_64) are attached to every
-[release](https://github.com/VishnuRaman/sparkwatch/releases). On macOS or
-Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/VishnuRaman/sparkwatch/main/install.sh | sh
-```
-
-That verifies the SHA256 and installs to `~/.local/bin` (or `/usr/local/bin`
-as root); `SPARKWATCH_VERSION=v0.1.0` pins a version,
+[release](https://github.com/VishnuRaman/sparkwatch/releases). The install
+script above verifies the SHA256 and installs to `~/.local/bin` (or
+`/usr/local/bin` as root); `SPARKWATCH_VERSION=v0.1.0` pins a version,
 `SPARKWATCH_INSTALL_DIR` changes the location. On Windows, unzip the
 `x86_64-pc-windows-msvc` asset somewhere on your `PATH`.
 
@@ -40,23 +66,8 @@ From source, with a Rust toolchain (1.88+):
 cargo install --path .
 ```
 
-For `--k8s` mode, `kubectl` must be on your `PATH` and pointed at the right
-cluster. The binary is a single file with no other dependencies (TLS via
-rustls, no OpenSSL).
-
-### Releasing
-
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `clippy -D
-warnings` and the tests on Linux, macOS and Windows for every push. To cut a
-release, bump `version` in `Cargo.toml`, then tag it:
-
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-`.github/workflows/release.yml` refuses a tag that doesn't match
-`Cargo.toml`, builds the five targets, and publishes a GitHub release with
-the archives, `SHA256SUMS` and generated notes.
+The binary is a single file with no other dependencies (TLS via rustls, no
+OpenSSL). `--k8s` mode shells out to `kubectl`, which must be on your `PATH`.
 
 ## Usage
 
@@ -75,6 +86,9 @@ sparkwatch [OPTIONS] [TARGET]
 | `-t, --timeout <SECS>` | HTTP timeout (default `5`, or `[defaults].timeout`). |
 | `--config <PATH>` | Config file (default `~/.config/sparkwatch.toml`). |
 | `--targets` | List configured targets and exit. |
+| `--dump` | Headless: connect, collect one snapshot (and streaming progress for ~10 s), write a bundle into `--out`, exit. |
+| `--out <DIR>` | Where bundles go (default `.`). |
+| `--dump-logs <N>` | Log lines per executor in a bundle (default 2000; 0 = none). |
 
 ### Live driver
 
@@ -93,41 +107,41 @@ sparkwatch http://history-host:18080 -a app-20260923-0001
 ```
 
 With several applications listed you get a picker; `Enter` watches the
-highlighted one, `a` brings the picker back at any time.
+highlighted one, `a` brings the picker back at any time. For a finished
+application the summary opens by itself.
 
 ### Kubernetes
 
 ```bash
-sparkwatch --k8s -n spark             # pick a running driver pod
-sparkwatch --k8s -n spark my-etl      # watch the SparkApplication "my-etl"
+sparkwatch --k8s -n spark                       # pick a running driver pod
+sparkwatch --k8s -n spark my-etl                # watch the SparkApplication "my-etl"
+sparkwatch --k8s -n spark --context prod-gke    # a specific kubeconfig context
 ```
 
-sparkwatch runs `kubectl get pods -l spark-role=driver` in the namespace,
-lists the running drivers, and when you pick one spawns
-`kubectl port-forward pod/<driver> 0:4040` on a free local port. The forward is
-torn down when you switch apps or quit. No separate port-forward terminal
-needed.
+sparkwatch lists the running driver pods in the namespace (`spark-role`
+`driver` or `connect-server`, so Spark Operator `SparkApplication`s,
+`SparkConnect` servers and plain `spark-submit` all show up), and when you
+pick one spawns `kubectl port-forward pod/<driver> 0:4040` on a free local
+port. The forward is torn down when you switch apps or quit; if it dies it is
+re-established on the next poll. No separate port-forward terminal, and
+nothing else to set up — the same command works against GKE, EKS or kind as
+long as `kubectl` does.
 
-`TARGET` can be any of, for a driver pod in `Running` phase:
+`TARGET` can be the app name (the operator's `sparkoperator.k8s.io/app-name`
+or `connect-name` label, or `spark-submit`'s `spark-app-name`), the driver
+pod's name, or the pod name without its `-driver` / `-server` suffix. Not
+sure which? Leave it off: the picker's `ID` column is the app name and
+`NAME` is the pod, and either works. A name that doesn't match fails with the
+list of drivers that are running.
 
-- the app name — the operator's `sparkoperator.k8s.io/app-name` label
-  (`SparkApplication`), its `sparkoperator.k8s.io/connect-name` label
-  (`SparkConnect` server), or the `spark-app-name` label `spark-submit` sets;
-- the driver pod's name (`my-etl-driver`, `spark-connect-server`, or whatever
-  yours is called);
-- the pod name without its `-driver` / `-server` suffix.
-
-Spark Connect servers created by the operator's `SparkConnect` resource are
-listed alongside regular drivers (they carry `spark-role=connect-server`).
-
-Not sure which? Leave it off: the picker's `ID` column is the app name and
-`NAME` is the pod, and either works. A name that doesn't match fails with
-the list of drivers that are running.
+It uses your kubeconfig and needs, in the namespace: `get`/`list` on `pods`,
+`create` on `pods/portforward`, and `get` on `pods/log` (for the Logs view and
+the Streaming tab). Nothing is written to the cluster.
 
 ### Config file
 
 Name your clusters once in `~/.config/sparkwatch.toml` (or
-`$XDG_CONFIG_HOME/sparkwatch.toml`):
+`$XDG_CONFIG_HOME/sparkwatch.toml`); it is read whenever it exists:
 
 ```toml
 [defaults]
@@ -153,222 +167,162 @@ it found.
 
 ## Keys
 
-(The one-page version of everything below is [CHEATSHEET.md](CHEATSHEET.md).)
-
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`8` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming / Storage |
-| `/` | Filter the table on Jobs / Stages / Executors / SQL / Failures / Storage (typed in the footer; `Enter` applies) |
-| `c` | Clear the table filter |
-| `j` `k` `↓` `↑` | Move selection |
-| `PgUp` `PgDn` | Move selection by 10 |
-| `g` `G` `Home` `End` | First / last row |
-| `Enter` | Picker: watch the application · Jobs: show only that job's stages · Stages: open the stage drill-down · SQL: open the query's plan · Failures: full error text |
+| `1`–`9` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming / Storage / Env |
+| `j` `k` `↓` `↑` · `PgUp` `PgDn` · `g` `G` | Move selection · by 10 · first / last |
+| `Enter` | Picker: watch · Jobs: show that job's stages · Stages / SQL / Streaming query / batch: open the drill-down · Failures: full error text |
+| `Esc` | Back: closes a drill-down, then the table filter, then the job filter, then quits |
+| `/` · `c` | Filter the table (typed in the footer, `Enter` applies) · clear it |
+| `S` | Summary — what happened since the app started |
+| `D` | Write a bundle (summary, snapshot, failures, streaming history, environment, log tails) into `--out` |
+| `m` | Executors: peak memory per region against the executor's budget |
+| `L` | Logs of the selected executor, of the executor a failed task ran on, or of the one an alert concerns |
+| `t` | Thread dump of the selected executor |
 | `x` | Acknowledge new failures (clears the red strip; the log is kept) |
 | `s` | Failures: open the stage the selected failure belongs to, on its failed tasks |
-| `L` | Logs of the selected executor (Executors tab), of the executor a failed task ran on (stage drill-down, filtered to the error), or of the executor an alert concerns (Failures) |
-| `t` | Thread dump of the selected executor (Executors tab, or from the log view) |
 | `f` | Stage drill-down: switch between slowest and failed tasks |
-| `Tab` / `p` | SQL drill-down: switch scrolling between plan and nodes / plan-only view |
 | `a` | Open the application picker |
-| `Esc` | Back: closes a drill-down, then the table filter, then the job filter, then quits |
-| `r` | Refresh now |
-| `p` | Pause / resume polling |
-| `+` `-` | Poll interval up / down (1–60 s) |
+| `r` · `p` · `+` `-` | Refresh now · pause / resume polling · poll interval up / down (1–60 s) |
 | `q` `Ctrl-C` | Quit |
-
-## Tabs
-
-- **Overview** — application info, cluster totals (cores, storage, shuffle,
-  GC share flagged when over 10 %), sparklines of tasks/s and active tasks over
-  the last few minutes, a progress gauge per running job.
-- **Jobs** — status, task and stage counts, failures, progress. Names come
-  from the job description when Spark set one (streaming batches read
-  `orders-agg · batch 4123`; `setJobDescription` text is shown verbatim),
-  else from the SQL execution the job belongs to (`sql #12 · SELECT …`, which
-  is what Spark Connect actions get), else the call site. Names fill the
-  column width rather than being cut at a fixed length.
-- **Stages** — active stages first; task counts, input, shuffle read/write,
-  spill (highlighted), progress. Named like jobs (description → SQL
-  execution → call site).
-- **Executors** — up/dead, host, running tasks vs cores, failed tasks, storage
-  memory, GC share, shuffle read.
-- **SQL** — one row per Spark SQL execution (a query, or a micro-batch of a
-  streaming query), newest first: status, query text / call site, submitted,
-  duration, job counts (`▶` running `✓` succeeded `✗` failed), error. On an app
-  without `/sql` (RDD-only, or Spark < 3.0) the tab says so instead of erroring.
-- **Failures** — everything that went wrong since sparkwatch started, newest
-  first, and it stays even after Spark forgets it. See below.
-- **Streaming** — Structured Streaming queries: batch durations, input vs
-  processing rate, watermark lag, state size, with a `FALLING BEHIND` flag.
-  See below.
-- **Storage** — storage memory used vs available across executors (and which
-  one is fullest), then every cached RDD / DataFrame: partitions cached vs
-  total (yellow when partial — the rest gets recomputed), storage level,
-  memory and disk. `Enter` shows how one RDD is spread across executors:
-  partitions, bytes, share, and how full that executor's storage is. The
-  History Server has no storage data.
-
-### Filtering
-
-`/` on any table tab opens a filter in the footer; type a substring and
-`Enter`. It matches what you'd expect for the tab — job/stage name and
-status, executor id/host/state/removal reason, query text and error, alert
-title and detail, RDD name and level — case-insensitively, and the title
-shows `Stages (12 of 340) · filter: writer`. Filters are per tab and stay
-until `c` or `Esc`. On a streaming app with thousands of micro-batches, `/`
-then `FAILED` on the SQL tab is the quickest way to the ones that matter.
-
-Dead executors show their `removeReason` next to the host on the Executors
-tab, executors the scheduler has excluded show `excl`, and failed stages carry
-a `✗` on the Stages tab.
 
 The header shows `LIVE`, `PAUSED` or `ERROR`; on an error the last good data
 stays on screen and the message appears in the footer.
 
-## Stage drill-down
+## Tabs
 
-`Enter` on a stage opens it. It refreshes at the poll interval like everything
-else, so it is fine to leave open on a running stage.
+- **Overview** — application info, cluster totals (cores, storage, shuffle,
+  GC share flagged over 10 %), sparklines of tasks/s, active tasks and
+  executors alive (red when any were removed in the window), a progress gauge
+  per running job.
+- **Jobs** — status, task and stage counts, failures, progress. Names come
+  from the job description, the SQL execution the job belongs to, or the call
+  site, whichever Spark provides; streaming batches read `orders-agg · batch
+  4123`. `Enter` narrows the Stages tab to the job.
+- **Stages** — active first; tasks, input, shuffle read/write, spill
+  (highlighted), progress, `✗` on failed stages. `Enter` opens the
+  drill-down.
+- **Executors** — up/dead (with the `removeReason`), host, running tasks vs
+  cores, failed tasks, storage memory, GC share, shuffle read, age. `L` logs,
+  `t` threads, `m` memory detail.
+- **SQL** — one row per execution (a query, or a micro-batch), newest first:
+  status, text, submitted, duration, job counts, error. `Enter` opens the
+  plan.
+- **Failures** — everything that went wrong since sparkwatch started, newest
+  first; it stays even after Spark forgets it.
+- **Streaming** — Structured Streaming queries with charts, the recent
+  batches, and `Enter` into any batch.
+- **Storage** — storage memory across executors, every cached RDD /
+  DataFrame with partitions cached vs total (yellow when partial), `Enter`
+  for its spread across executors.
+- **Env** — the performance-relevant settings pinned at the top (executor
+  memory / overhead / cores, shuffle partitions, AQE, dynamic allocation,
+  checkpoint location…), then every Spark / Hadoop / system property. `/`
+  searches keys and values.
 
-- **Header** — status, pool, task counts, input/shuffle/spill totals, GC share,
-  a progress gauge, and the `failureReason` if the stage failed.
-- **Task metrics** — p5/p25/p50/p75/p95/max for duration, GC, scheduler
-  delay, input, shuffle read/write, fetch wait, spill and peak memory, from
-  Spark's own `taskSummary` quantiles (so it is exact even for 100k-task
-  stages). A metric whose max is 3× or more its median is flagged `⚠ ×N` —
-  that is your skewed partition.
-- **Executors** — per-executor tasks, time, mean task time, shuffle read,
-  spill. An executor is flagged red, with the reason, when it has failed
-  tasks, was excluded for the stage, or its mean task time is 2× the stage
-  mean — that is your bad node.
-- **Tasks** — the 100 slowest tasks with stragglers (3× median) in yellow, or
-  with `f` the failed tasks with their error message. A failed stage opens on
-  its failures directly.
+`/` on any table filters by what you'd expect for the tab (name and status,
+executor id/host/reason, query text and error…), case-insensitively; the
+title shows `Stages (12 of 340) · filter: writer`. Filters are per tab.
 
-`Enter` on a job narrows the Stages tab to that job's stages; `Esc` clears it.
+## Drill-downs
 
-## Failures
+**Stage** (`Enter` on a stage) — header with totals, GC share, locality
+summary and the `failureReason`; p5/p25/p50/p75/p95/max for duration, GC,
+scheduler delay, input, shuffle, fetch wait, spill and peak memory from
+Spark's own `taskSummary` (exact even for 100k-task stages), with a metric
+whose max is 3× its median flagged `⚠ ×N`; per-executor tasks, time, shuffle
+and spill with a bad executor flagged red and the reason; the 100 slowest
+tasks with stragglers in yellow, or with `f` the failed tasks and their
+errors. `L` on a failed task opens its executor's log filtered to the
+exception. Refreshes at the poll interval, so it is fine to leave open.
 
-The Spark UI only shows a failure where it happened, and only while the API
-still retains it. sparkwatch derives an alert from every poll for:
+**Failures** — an alert is derived on every poll for a `FAILED` stage, job
+or SQL execution, a lost or excluded executor, and every failed task with
+its full error (pulled from `taskList?status=failed` when a stage's failure
+count grows, at most 5 stages × 20 tasks per poll). Deduplicated, kept for
+the life of the process (last 1000). A red strip under the header counts the
+new ones until `x`; `Enter` shows the full text, `s` opens the stage on its
+failed tasks, `L` the executor's log.
 
-- a stage in `FAILED` (with its `failureReason`),
-- a job in `FAILED`,
-- an executor that is gone with a `removeReason` (`Container killed…`,
-  `OOMKilled…`, decommission),
-- an executor the scheduler has excluded,
-- a SQL execution in `FAILED` (with its error),
-- every failed task, with its full error message — pulled from
-  `taskList?status=failed` whenever a stage's failure count grows (at most 5
-  stages × 20 tasks per poll, so a mass failure can't flood the driver).
+**Streaming** — there is no REST API for Structured Streaming, so the tab
+combines the micro-batch SQL executions (batch ids, status, duration; works
+on the History Server) with the driver log's `Streaming query made progress`
+events (rates, watermark, state; the driver must log at INFO for
+`org.apache.spark.sql.execution.streaming`). The log is followed from the
+first visit for as long as the app is watched. Per query: trigger duration
+with mean/p95/max, input vs processed rows/s, watermark lag, state rows and
+memory, `addBatch` vs planning/offsets/commit overhead, rows dropped by the
+watermark, sparklines of each, the latest `durationMs` breakdown, and a
+**Recent batches** table. A query processing slower than its input for most
+of the last five batches is marked **FALLING BEHIND**. A restart from a fresh
+checkpoint is treated as the same query. `Enter` on a query lists every batch
+kept; `Enter` on a batch shows its numbers against the query's mean and p95,
+the **stages that ran for it** (`Enter` → stage drill-down), the **failures
+of this batch**, and `L` for the **driver log sliced to the batch's time
+window**.
 
-Alerts are deduplicated and kept for the life of the process (last 1000).
-While there are new ones a red strip sits under the header with the count
-and the latest one; `x` acknowledges. The **Failures** tab lists them all;
-`Enter` shows the full text (stack frames dimmed), `s` opens the stage the
-failure belongs to, straight on its failed tasks.
+**Executor memory** (`m`) — peak heap (and its share of
+`spark.executor.memory`, red from 90 %), off-heap, execution, storage,
+direct buffers, process RSS for the JVM and Python workers, GC time; the
+selected executor's peaks drawn against its budget from the resource profile
+with a verdict — *heap near its maximum* (raise `spark.executor.memory`, or
+more partitions) versus *RSS near the container limit while the heap is not*
+(raise `spark.executor.memoryOverhead`). That's the difference between the
+two causes of exit code 137. RSS needs
+`spark.executor.processTreeMetrics.enabled`.
 
-## Streaming
+**SQL** (`Enter` on an execution) — status, duration, job ids, error; the
+physical plan with operators highlighted (`p` full-screen) next to every
+plan node with its three most telling metrics (output rows, spill, peak
+memory, time…), `Tab` switching scroll focus.
 
-Structured Streaming has no REST API (the `/streaming/*` endpoints are the
-old DStreams), so the tab rebuilds what the web UI's Structured Streaming
-page shows from two sources:
+**Logs** (`L`) — follows the tail; scrolling up stops following, `F`
+resumes; `/` filters the whole buffer (last 20 000 lines), `w` wraps.
+Under `--k8s` it is `kubectl logs -f` on the driver or executor pod, `P`
+switches to `--previous` (where a crash's reason is; a dead executor opens
+there directly), and a pod that is gone says so — executor pods are deleted
+on exit unless `spark.kubernetes.executor.deleteOnTermination=false`, worth
+setting for anything long-running. On YARN / standalone it is the
+`executorLogs` page Spark reports, re-fetched as a tail, `o` switching
+stderr / stdout.
 
-- **The driver log.** Every micro-batch is logged at INFO as
-  `Streaming query made progress: {…}` with the full `StreamingQueryProgress`
-  JSON. On the first visit to the tab sparkwatch starts following the driver
-  log (a second `kubectl logs -f` under `--k8s`; the driver's `executorLogs`
-  stderr page on YARN/standalone, re-read every 5 s) and keeps following for
-  as long as the app is watched, so batches accumulate while you look at
-  other tabs. The driver must log at INFO for
-  `org.apache.spark.sql.execution.streaming`.
-- **SQL executions.** Each micro-batch is also a SQL execution whose
-  description carries the query id, run id and batch number. That gives
-  batch ids, status and duration everywhere — including the History Server —
-  with no log access, just not the rates or the watermark.
+**Thread dump** (`t`) — live, grouped: **BLOCKED** threads first with the
+lock holder, then waiting, then **RUNNABLE** with Spark frames ahead of idle
+pool threads; `e` expands, `/` filters by thread or frame, `r` refreshes.
 
-Per query: latest batch, trigger duration (with mean/p95/max over the last
-300 batches and batches/min), input rows/s vs processed rows/s, watermark lag,
-state rows and memory; sparklines of trigger duration, input vs processed
-rate, and state size; the latest batch's `durationMs` breakdown (`addBatch`,
-`getBatch`, `queryPlanning`, `walCommit`…), sources and sink; and a
-**Recent batches** table — one row per batch, newest first: status, trigger
-(yellow when above the query's p95), input rows, in/s, processed/s (red when
-behind), state rows, `addBatch` time, watermark lag, time. Failed batches
-are red rows. When processing has been slower than input for most of the
-last five batches the query is marked **FALLING BEHIND** and the tab title
-turns red.
+## Summary and bundles
 
-With several queries, a list under the panel shows them all (sorted by
-name, selected one marked); `j`/`k` select. The list takes at most a third
-of the screen and scrolls to keep the selection visible, so a server hosting
-dozens of streams stays usable. A query restarted from a fresh checkpoint
-(new query id, same name) is treated as the same query — one entry, its
-batches starting over — and stale data from the superseded id is ignored;
-when a name has had several runs, its jobs and stages carry a
-`· run xxxxxxxx` suffix so two "batch 4" rows from different runs can be
-told apart.
+`S` opens a one-screen **summary**: failures by kind with the most common
+reasons, the slowest stages with skew flagged, executors lost and why, the
+worst GC, executors whose peak heap is near `spark.executor.memory`,
+storage, each streaming query's batch timing / lag / failed batches, and the
+key settings. For a finished application it opens by itself — the "what
+happened while I was away" view.
 
-## Logs
+`D` writes the same summary as `summary.md` into
+`sparkwatch-<app>-<timestamp>/` under `--out`, with `snapshot.json`,
+`failures.json`, `streaming.json`, `environment.json` and
+`logs/driver.log` + `logs/executor-N.log` tails (`--dump-logs`). That's what
+to attach to a ticket. Headless, for cron or CI:
 
-`L` on an executor (the `driver` row too) opens its log, following the tail
-as lines arrive. Scrolling up stops following; `F` (or scrolling back to the
-end) resumes. `/` types a case-insensitive filter — `ERROR`, `OutOfMemory`,
-a task id — applied to the whole buffer (last 20 000 lines); `c` clears it,
-`w` toggles wrapping, `Esc` goes back to where you were. ERROR/exception
-lines are red, WARN yellow.
+```bash
+sparkwatch --k8s -n spark my-etl --dump --out /var/tmp/spark-dumps
+```
 
-Where the lines come from depends on how sparkwatch reached the app:
+## Troubleshooting
 
-- **`--k8s`** — `kubectl logs -f --tail=2000` on the driver pod, or on the
-  executor's pod (found by its `spark-exec-id` / `spark-app-selector`
-  labels). Pods with sidecars are handled (it retries naming Spark's
-  container). `P` switches to `--previous`, the container before the last
-  restart — which is where the reason for a crash is; a dead executor opens
-  on `--previous` straight away. If the executor's pod is gone the view says
-  so: executor pods are deleted on exit unless the app sets
-  `spark.kubernetes.executor.deleteOnTermination=false`, which is worth
-  doing for anything long-running.
-- **YARN / standalone** — the `executorLogs` URLs Spark reports (NodeManager
-  or worker log pages), re-fetched every 3 s as a 256 KiB tail. `o` switches
-  between `stderr` (Spark's own logging) and `stdout`.
-- **History Server** — no logs are available; the view says so.
+| Symptom | Meaning / fix |
+|---|---|
+| Sits on `Connecting` | the driver UI isn't answering on that port (`spark.ui.enabled`, `spark.ui.port`); under `--k8s`, the pod isn't `Running` |
+| `ERROR` badge, `connection refused` in the footer | driver gone or port-forward died; under `--k8s` it reconnects on the next poll |
+| `no running driver for 'x' (running: …)` | the name matches no running driver; use one listed, or omit it for the picker |
+| Streaming tab shows durations but no rates / watermark | the driver isn't logging at INFO for `org.apache.spark.sql.execution.streaming` |
+| Logs say `pod gone` | the executor's pod was deleted on exit; set `spark.kubernetes.executor.deleteOnTermination=false` |
+| Empty Storage / Logs / Threads | History Server — those aren't in the event log |
+| Keys do nothing right after start | still on the picker / "Connecting" screen; wait for `LIVE` |
 
-From a **failed task** in the stage drill-down, `L` opens the executor it
-ran on with the filter pre-set to the exception name, so the OOM you just saw
-in the task table is one key away from its context in the log. Same from a
-task or executor alert on the Failures tab.
-
-## Thread dump
-
-`t` on an executor fetches a live thread dump (`/executors/{id}/threads`)
-and groups it: **BLOCKED** threads first, with which thread holds the lock
-they want, then threads **waiting on a lock**, then **RUNNABLE**, with the
-ones inside Spark code (cyan frames) ahead of idle pool threads. Eight
-frames per thread; `e` expands to all. `/` filters by thread name or frame
-(`HashAggregate`, `BlockManager`…), `r` refreshes, `L` jumps to that
-executor's log. Not available through the History Server.
-
-## SQL drill-down
-
-`Enter` on a SQL execution opens it: status, submission time, duration, the
-job ids it ran (running / succeeded / failed) and the error if it failed.
-Below, side by side (stacked on a narrow terminal):
-
-- **Physical plan** — the `planDescription` Spark reports, operators
-  highlighted, scrollable with `j`/`k`/`PgUp`/`PgDn`/`g`/`G`. `p` gives it the
-  whole screen.
-- **Nodes** — every plan node with its three most telling metrics (output
-  rows, spill, peak memory, time, bytes…), spill in magenta when non-zero.
-  `Tab` moves scrolling focus between the two panes.
-
-The list is fetched incrementally: Spark's `/sql` endpoint is oldest-first
-with no sort, and a streaming app retains up to 1000 micro-batches, so
-sparkwatch asks only for what is new or recent each poll and keeps the last
-500 in memory. A query evicted by the driver since you listed it says so when
-opened.
+More in [CHEATSHEET.md § 8](CHEATSHEET.md).
 
 ## Demo workload
 
@@ -376,8 +330,8 @@ opened.
 job in Rust, submitted over Spark Connect, built to give sparkwatch something
 worth watching: a synthetic order stream written raw to parquet, a windowed
 per-customer aggregation with a deliberately hot key (skew), and an optional
-query that fails on purpose (failures). See its README for how to run it
-against a local Spark Connect server or one on Kubernetes.
+query that fails on purpose (failures). Its README covers running it against
+a local Spark Connect server or one on Kubernetes.
 
 ## Development
 
@@ -388,19 +342,22 @@ cargo run
 cargo test
 ```
 
-The mock serves on `localhost:4040` and never needs a cluster.
+The mock serves on `localhost:4040` and never needs a cluster. The headless
+smoke-test harness (pty + terminal-emulator replay) is in
+[CHEATSHEET.md § 10](CHEATSHEET.md).
 
-Headless smoke test (no tmux needed): give the binary a pty with `script`,
-feed it keystrokes, then replay the capture through a terminal emulator and
-assert on the reconstructed screens:
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `clippy -D
+warnings` and the tests on Linux, macOS and Windows for every push. To cut a
+release, bump `version` in `Cargo.toml`, then tag it:
 
 ```bash
-pip install pyte
-(sleep 3; printf '6'; sleep 1; printf 'q') | script -q out.txt sh -c 'stty cols 170 rows 50; ./target/debug/sparkwatch'
-python3 dev/screens.py out.txt 170 50 'Failures (11, 11 new)' '!ERROR'   # '!' = must be absent
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
-Give the app a few seconds before the first key — until the first poll lands
-it is on the picker / "Connecting" screen, where tab keys do nothing.
-`SPARKWATCH_KEYLOG=/path` appends every key press it receives, with a
-timestamp, which tells "key ignored" from "key never arrived" apart.
+`release.yml` refuses a tag that doesn't match `Cargo.toml`, builds the five
+targets, and publishes a GitHub release with the archives, `SHA256SUMS` and
+generated notes.
+
+## License
+
+[Apache-2.0](LICENSE).

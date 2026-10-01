@@ -200,6 +200,11 @@ pub fn draw_executors(
                     Style::default()
                 }),
                 Cell::from(fmt_bytes(e.total_shuffle_read)),
+                Cell::from(executor_age(e)).style(if e.is_active {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Red)
+                }),
             ])
         })
         .collect();
@@ -216,16 +221,34 @@ pub fn draw_executors(
             Constraint::Length(11),
             Constraint::Length(7),
             Constraint::Length(10),
+            Constraint::Length(12),
         ],
     )
     .header(header_row(&[
-        "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R",
+        "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R", "AGE",
     ]))
     .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 
     f.render_stateful_widget(table, area, state);
+}
+
+/// How long the executor has been around, or how long ago it went.
+fn executor_age(e: &ExecutorSummary) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let since = |ts: &str| crate::streaming::parse_iso_ms(ts).map(|t| (now - t).max(0));
+    match (&e.remove_time, since(&e.add_time)) {
+        (Some(rt), _) => match since(rt) {
+            Some(ago) => format!("gone {}", fmt_millis(ago)),
+            None => "gone".into(),
+        },
+        (None, Some(age)) => fmt_millis(age),
+        _ => "-".into(),
+    }
 }
 
 pub fn draw_sql(

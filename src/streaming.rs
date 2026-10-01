@@ -95,6 +95,21 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
         .trim_end_matches("GMT")
         .trim_end_matches("UTC");
     let (date, time) = s.split_once('T')?;
+    // A numeric offset (`+02:00`, `+0000`, `-05:00`), as log4j's JSON
+    // layout writes: strip it and shift the result back to UTC.
+    let (time, offset_ms) = match time.rfind(['+', '-']) {
+        Some(i) => {
+            let (t, off) = time.split_at(i);
+            let digits: String = off[1..].chars().filter(char::is_ascii_digit).collect();
+            let (h, m) = (
+                digits.get(0..2)?.parse::<i64>().ok()?,
+                digits.get(2..4)?.parse::<i64>().ok()?,
+            );
+            let sign = if off.starts_with('-') { -1 } else { 1 };
+            (t, sign * (h * 60 + m) * 60 * 1000)
+        }
+        None => (time, 0),
+    };
     let mut d = date.split('-').map(|p| p.parse::<i64>());
     let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
     let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
@@ -110,7 +125,7 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    Some(((days * 24 + h) * 60 + mi) * 60 * 1000 + sec * 1000 + millis)
+    Some(((days * 24 + h) * 60 + mi) * 60 * 1000 + sec * 1000 + millis - offset_ms)
 }
 
 /// Epoch millis → `2026-09-25T10:00:00Z` (the inverse of [`parse_iso_ms`],
@@ -147,6 +162,27 @@ pub fn fmt_clock(ms: i64) -> String {
 
 const MARKER: &str = "Streaming query made progress:";
 
+/// A structured-logging line (`{"ts":…,"level":…,"msg":…}`) → its `msg`.
+/// Cheap rejection first: nearly every line isn't one.
+pub fn structured_msg(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    if !t.starts_with('{') || !t.contains("\"msg\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    v.get("msg")?.as_str().map(str::to_string)
+}
+
+/// A structured-logging line's `ts` as epoch millis.
+pub fn structured_ts_ms(line: &str) -> Option<i64> {
+    let t = line.trim_start();
+    if !t.starts_with('{') || !t.contains("\"ts\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    parse_iso_ms(v.get("ts")?.as_str()?)
+}
+
 /// Finds progress blocks in a stream of log lines. Spark pretty-prints the
 /// JSON over many lines, so lines are buffered until the braces balance.
 #[derive(Default)]
@@ -162,6 +198,19 @@ impl ProgressParser {
     }
 
     pub fn feed(&mut self, line: &str) -> Option<Progress> {
+        // Spark 4 structured logging (`log4j2-json-layout`): one JSON object
+        // per line with the message, newlines and all, in `msg`. Unwrap it
+        // and read the message as if it had been logged as text.
+        if let Some(msg) = structured_msg(line) {
+            if !msg.contains(MARKER) {
+                return None;
+            }
+            let mut out = None;
+            for l in msg.lines() {
+                out = self.feed(l).or(out);
+            }
+            return out;
+        }
         if let Some(i) = line.find(MARKER) {
             // A new block; whatever was buffered was truncated.
             self.buf.clear();
@@ -673,6 +722,34 @@ mod tests {
             Some(1_790_330_405_500)
         );
         assert_eq!(parse_iso_ms("nope"), None);
+    }
+
+    #[test]
+    fn iso_offsets_shift_to_utc() {
+        let utc = parse_iso_ms("2026-09-25T10:00:05.000Z").unwrap();
+        assert_eq!(parse_iso_ms("2026-09-25T10:00:05.000+0000"), Some(utc));
+        assert_eq!(parse_iso_ms("2026-09-25T12:00:05.000+02:00"), Some(utc));
+        assert_eq!(parse_iso_ms("2026-09-25T05:00:05-05:00"), Some(utc));
+    }
+
+    #[test]
+    fn structured_log_lines_are_unwrapped() {
+        let progress = r#"{\n  \"id\" : \"q1\",\n  \"runId\" : \"r1\",\n  \"name\" : \"orders\",\n  \"timestamp\" : \"2026-09-25T10:00:05.000Z\",\n  \"batchId\" : 7,\n  \"numInputRows\" : 20,\n  \"inputRowsPerSecond\" : 2.0,\n  \"processedRowsPerSecond\" : 4.0,\n  \"durationMs\" : { \"addBatch\" : 300, \"triggerExecution\" : 400 },\n  \"stateOperators\" : [ ],\n  \"sources\" : [ ],\n  \"sink\" : { \"description\" : \"x\", \"numOutputRows\" : 20 }\n}"#;
+        let line = format!(
+            r#"{{"ts":"2026-09-25T10:00:05.123+0000","level":"INFO","msg":"Streaming query made progress: {progress}","logger":"MicroBatchExecution"}}"#
+        );
+        let mut p = ProgressParser::new();
+        assert!(p.feed(r#"{"ts":"2026-09-25T10:00:04.000Z","level":"INFO","msg":"Committed offsets for batch 7","logger":"MicroBatchExecution"}"#).is_none());
+        let got = p
+            .feed(&line)
+            .expect("progress parsed from a structured line");
+        assert_eq!(got.batch_id, 7);
+        assert_eq!(got.num_input_rows, 20);
+        assert_eq!(
+            structured_ts_ms(&line),
+            parse_iso_ms("2026-09-25T10:00:05.123Z")
+        );
+        assert_eq!(structured_msg("26/10/01 18:03:15 INFO plain line"), None);
     }
 
     #[test]

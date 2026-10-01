@@ -272,6 +272,9 @@ impl LogView {
 /// Spark's default log4j pattern is `yy/MM/dd HH:mm:ss`; ISO-8601
 /// (`yyyy-MM-dd HH:mm:ss,SSS` / `T`) is the other common one.
 pub fn line_time_ms(line: &str) -> Option<i64> {
+    if line.starts_with('{') {
+        return crate::streaming::structured_ts_ms(line);
+    }
     let b = line.as_bytes();
     let digits =
         |r: std::ops::Range<usize>| b.get(r).is_some_and(|x| x.iter().all(u8::is_ascii_digit));
@@ -458,6 +461,10 @@ mod tests {
             line_time_ms("26/10/01 18:03:15 x")
         );
         assert_eq!(line_time_ms("no timestamp here"), None);
+        assert_eq!(
+            line_time_ms(r#"{"ts":"2026-10-01T18:03:15.000Z","level":"INFO","msg":"x"}"#),
+            line_time_ms("26/10/01 18:03:15 INFO x")
+        );
     }
 
     #[test]

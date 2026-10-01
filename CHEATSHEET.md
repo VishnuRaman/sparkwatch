@@ -417,7 +417,10 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 - **History Server**: no logs, no thread dumps, no storage; SQL and stages are fine; the Streaming tab
   shows batch durations only (from SQL executions).
 - **Streaming rates / watermark** need the driver log at INFO; with log4j at WARN the tab keeps the
-  SQL-derived durations and says so.
+  SQL-derived durations and says so. Both log formats are read: the classic pattern layout
+  (`yy/MM/dd HH:mm:ss INFO …`) and Spark 4's structured JSON lines (`{"ts":…,"level":…,"msg":…}`).
+  They also need a log at all: `--k8s` (pod logs) or YARN/standalone (`executorLogs` page); a plain
+  URL to a driver on Kubernetes has neither, so only the SQL-derived columns fill.
 - **Logs on YARN/standalone** are a re-fetched tail, not a stream; **on Kubernetes** a dead executor's
   pod is deleted unless `spark.kubernetes.executor.deleteOnTermination=false`.
 - **Thread dumps** only for live executors reachable from the driver.

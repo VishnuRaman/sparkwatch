@@ -233,8 +233,12 @@ batches/min, `input rows/s` vs `processed rows/s` — **`▲ FALLING BEHIND` whe
 than input in ≥ 3 of the last 5 batches** — watermark lag, state rows and memory. Sparklines:
 trigger duration, input vs processed rate (stacked, same scale), state size. Then the latest batch's
 `durationMs` breakdown — `addBatch` (the actual work), `getBatch`, `latestOffset`, `queryPlanning`,
-`walCommit`, `commitOffsets` — its sources (rows, rates) and sink. A restarted query (new runId)
-drops its old window. Several queries: `j`/`k` select, the rest show one summary line each.
+`walCommit`, `commitOffsets` — its sources (rows, rates) and sink; and a **Recent batches** table,
+newest first: status, trigger (yellow above p95), input rows, in/s, processed/s (red when behind),
+state rows, `addBatch`, watermark lag, time; failed batches red. A restarted query (new runId, or a
+fresh checkpoint = new query id with the same name) keeps one entry and starts its window over;
+stale data from the old id is ignored, and its jobs/stages get a `· run xxxxxxxx` suffix. Several
+queries: a name-sorted list under the panel (≤ ⅓ of the screen, scrolls with the selection), `j`/`k`.
 
 Reading it: trigger ≈ trigger interval and growing = the batch can't finish in time; `addBatch`
 dominating = executor-side work (go to `3`); `queryPlanning`/`walCommit` dominating = driver-side
@@ -303,7 +307,7 @@ Same thing from the other end: `3`, `Enter` on a `✗` stage (opens on its faile
 ## 5. Glossary (the Spark words on these screens)
 | Term | Meaning | Where it shows |
 |---|---|---|
-| **Job** | one action (`count`, `write`, a micro-batch); made of stages | `2` |
+| **Job** | one action (`count`, `write`, a micro-batch); made of stages. Named from its description (`orders-agg · batch 4123`), else its SQL execution (`sql #12 · SELECT …`), else the call site (`run at <unknown>:0` = no user code on the driver's stack, e.g. Spark Connect) | `2` |
 | **Stage** | a set of identical tasks between two shuffles; `9.0` = stage 9, attempt 0 (retries make new attempts) | `3` |
 | **Task** | one stage's work on one partition, run on one executor core | drill-down task table |
 | **Shuffle** | data moved between executors when a stage needs rows regrouped by key (joins, groupBy, repartition); "shuffle write" leaves a stage, "shuffle read" enters the next | Stages, drill-down, SQL `Exchange` nodes |
@@ -420,7 +424,7 @@ kubectl describe sparkconnect spark-connect | tail -30
 ## 10. Development
 ```bash
 cargo test                            # unit tests
-python3 dev/mock_spark.py --single &  # fake Spark API on :4040 (also --no-sql; no flag = two apps → picker)
+python3 dev/mock_spark.py --single &  # fake Spark API on :4040 (also --no-sql, --many-queries; no flag = two apps → picker)
 cargo run
 # headless smoke test: pty + terminal-emulator replay (pip install pyte)
 (sleep 5; printf '6'; sleep 1; printf 'q') | script -q out.txt sh -c 'stty cols 170 rows 50; ./target/debug/sparkwatch'

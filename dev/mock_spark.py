@@ -166,6 +166,12 @@ SQL = [
               400, running=[7], submitted="2026-09-25T10:08:44.000GMT"),
 ]
 SQL_ENABLED = "--no-sql" not in sys.argv
+if "--many-queries" in sys.argv:
+    # Twenty streaming queries, one micro-batch each, to exercise the Streaming tab's query list.
+    for i in range(20):
+        SQL.append(execution(100 + i, "COMPLETED",
+                             "stream-%02d\nid = q%02d\nrunId = r%02d\nbatch = %d" % (i, i, i, 10 + i),
+                             500 + i * 10, ok=[200 + i], submitted="2026-09-25T10:09:%02d.000GMT" % i))
 
 def logs_for(eid):
     return {"stdout": "http://127.0.0.1:4040/node/containerlogs/container_%s/vishnu/stdout?start=-4096" % eid,

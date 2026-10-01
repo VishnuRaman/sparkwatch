@@ -183,9 +183,15 @@ it found.
 - **Overview** — application info, cluster totals (cores, storage, shuffle,
   GC share flagged when over 10 %), sparklines of tasks/s and active tasks over
   the last few minutes, a progress gauge per running job.
-- **Jobs** — status, task and stage counts, failures, progress.
+- **Jobs** — status, task and stage counts, failures, progress. Names come
+  from the job description when Spark set one (streaming batches read
+  `orders-agg · batch 4123`; `setJobDescription` text is shown verbatim),
+  else from the SQL execution the job belongs to (`sql #12 · SELECT …`, which
+  is what Spark Connect actions get), else the call site. Names fill the
+  column width rather than being cut at a fixed length.
 - **Stages** — active stages first; task counts, input, shuffle read/write,
-  spill (highlighted), progress.
+  spill (highlighted), progress. Named like jobs (description → SQL
+  execution → call site).
 - **Executors** — up/dead, host, running tasks vs cores, failed tasks, storage
   memory, GC share, shuffle read.
 - **SQL** — one row per Spark SQL execution (a query, or a micro-batch of a
@@ -287,10 +293,23 @@ Per query: latest batch, trigger duration (with mean/p95/max over the last
 300 batches and batches/min), input rows/s vs processed rows/s, watermark lag,
 state rows and memory; sparklines of trigger duration, input vs processed
 rate, and state size; the latest batch's `durationMs` breakdown (`addBatch`,
-`getBatch`, `queryPlanning`, `walCommit`…), sources and sink. When
-processing has been slower than input for most of the last five batches the
-query is marked **FALLING BEHIND** and the tab title turns red. `j`/`k`
-select between queries when there are several.
+`getBatch`, `queryPlanning`, `walCommit`…), sources and sink; and a
+**Recent batches** table — one row per batch, newest first: status, trigger
+(yellow when above the query's p95), input rows, in/s, processed/s (red when
+behind), state rows, `addBatch` time, watermark lag, time. Failed batches
+are red rows. When processing has been slower than input for most of the
+last five batches the query is marked **FALLING BEHIND** and the tab title
+turns red.
+
+With several queries, a list under the panel shows them all (sorted by
+name, selected one marked); `j`/`k` select. The list takes at most a third
+of the screen and scrolls to keep the selection visible, so a server hosting
+dozens of streams stays usable. A query restarted from a fresh checkpoint
+(new query id, same name) is treated as the same query — one entry, its
+batches starting over — and stale data from the superseded id is ignored;
+when a name has had several runs, its jobs and stages carry a
+`· run xxxxxxxx` suffix so two "batch 4" rows from different runs can be
+told apart.
 
 ## Logs
 

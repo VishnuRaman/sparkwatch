@@ -66,10 +66,18 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
     let others = queries.len().saturating_sub(1);
 
     // Selected query gets the panel; the rest one summary row each.
+    // The list never takes more than a third of the screen; it scrolls so
+    // the selected query is always in view.
+    let list_rows = if others > 0 {
+        queries.len().min((area.height as usize / 3).max(3))
+    } else {
+        0
+    };
+    let list_scroll = sel.saturating_sub(list_rows.saturating_sub(1));
     let [panel, list, foot] = Layout::vertical([
         Constraint::Min(14),
-        Constraint::Length(if others > 0 {
-            queries.len() as u16 + 2
+        Constraint::Length(if list_rows > 0 {
+            list_rows as u16 + 2
         } else {
             0
         }),
@@ -109,12 +117,20 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
                 line
             })
             .collect();
+        let title = if list_rows < queries.len() {
+            format!(
+                " Queries ({}) · showing {}-{} · j/k select ",
+                queries.len(),
+                list_scroll + 1,
+                (list_scroll + list_rows).min(queries.len())
+            )
+        } else {
+            format!(" Queries ({}) · j/k select ", queries.len())
+        };
         f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Queries ({}) · j/k select ", queries.len())),
-            ),
+            Paragraph::new(lines)
+                .scroll((list_scroll as u16, 0))
+                .block(Block::default().borders(Borders::ALL).title(title)),
             list,
         );
     }

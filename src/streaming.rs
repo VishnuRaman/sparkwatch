@@ -257,6 +257,10 @@ impl QueryHistory {
 #[derive(Default)]
 pub struct Streaming {
     pub queries: BTreeMap<String, QueryHistory>,
+    /// Query name → the query id currently carrying it.
+    current: HashMap<String, String>,
+    /// Query ids superseded by a restart; their (cached) data is stale.
+    retired: std::collections::HashSet<String>,
     /// How many progress events the log tap has delivered.
     pub progress_events: usize,
     /// Batches seen only through SQL executions (no log tap).
@@ -268,9 +272,45 @@ impl Streaming {
         self.queries.is_empty()
     }
 
+    /// A query restarted from a fresh checkpoint gets a new query id but
+    /// keeps its name, and Spark allows only one active query per name, so
+    /// a same-named query under a different id is the same logical query.
+    /// Returns whether data for `id` should be ingested: the current id
+    /// always; a never-seen id takes over (batches start again, as with a
+    /// new run); an id that was superseded is stale and is ignored — the SQL
+    /// cache and the HTTP log tail keep re-presenting old incarnations.
+    fn admit(&mut self, id: &str, name: Option<&str>) -> bool {
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return !self.retired.contains(id);
+        };
+        match self.current.get(name) {
+            Some(cur) if cur == id => true,
+            _ if self.retired.contains(id) => false,
+            Some(cur) => {
+                let old = cur.clone();
+                self.retired.insert(old.clone());
+                if let Some(mut q) = self.queries.remove(&old) {
+                    q.query_id = id.to_string();
+                    q.run_id.clear();
+                    q.batches.clear();
+                    self.queries.insert(id.to_string(), q);
+                }
+                self.current.insert(name.to_string(), id.to_string());
+                true
+            }
+            None => {
+                self.current.insert(name.to_string(), id.to_string());
+                true
+            }
+        }
+    }
+
     /// Returns false for a duplicate (same run and batch already known
     /// with progress), which the HTTP re-fetch produces constantly.
     pub fn ingest_progress(&mut self, p: Progress) -> bool {
+        if !self.admit(&p.id, p.name.as_deref()) {
+            return false;
+        }
         let q = self
             .queries
             .entry(p.id.clone())
@@ -297,10 +337,17 @@ impl Streaming {
     }
 
     pub fn ingest_sql(&mut self, execs: &[ExecutionData]) {
-        for e in execs {
+        // Oldest first, so the newest incarnation of a restarted query is the
+        // one that ends up current.
+        let mut ordered: Vec<&ExecutionData> = execs.iter().collect();
+        ordered.sort_by_key(|e| e.id);
+        for e in ordered {
             let Some(sb) = batch_from_sql(e) else {
                 continue;
             };
+            if !self.admit(&sb.query_id, sb.name.as_deref()) {
+                continue;
+            }
             let q = self
                 .queries
                 .entry(sb.query_id.clone())
@@ -602,5 +649,73 @@ mod tests {
         p.run_id = "r2".into();
         s.ingest_progress(p);
         assert_eq!(s.queries["q"].batches.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn p(id: &str, run: &str, name: &str, batch: i64) -> Progress {
+        Progress {
+            id: id.into(),
+            run_id: run.into(),
+            name: Some(name.into()),
+            batch_id: batch,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_data_for_a_superseded_id_is_ignored() {
+        let mut s = Streaming::default();
+        s.ingest_progress(p("q1", "r1", "orders-poison", 4));
+        s.ingest_progress(p("q2", "r2", "orders-poison", 0));
+        // The HTTP tail / SQL cache re-present the old incarnation every poll.
+        assert!(!s.ingest_progress(p("q1", "r1", "orders-poison", 4)));
+        assert_eq!(s.queries.len(), 1);
+        assert!(s.queries.contains_key("q2"));
+        assert_eq!(
+            s.queries["q2"].batches.len(),
+            1,
+            "q2's batches survive the stale replay"
+        );
+
+        // SQL executions arrive newest-first; the newest id must still win.
+        let exec = |id: i64, qid: &str, batch: i64| ExecutionData {
+            id,
+            description: format!("orders-poison\nid = {qid}\nrunId = r\nbatch = {batch}"),
+            status: "COMPLETED".into(),
+            ..Default::default()
+        };
+        let mut s2 = Streaming::default();
+        s2.ingest_sql(&[exec(30, "new", 1), exec(29, "new", 0), exec(12, "old", 4)]);
+        assert_eq!(s2.queries.len(), 1);
+        assert!(s2.queries.contains_key("new"));
+        assert_eq!(
+            s2.queries["new"]
+                .batches
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        // and the same list again changes nothing
+        s2.ingest_sql(&[exec(30, "new", 1), exec(29, "new", 0), exec(12, "old", 4)]);
+        assert_eq!(s2.queries["new"].batches.len(), 2);
+    }
+
+    #[test]
+    fn same_name_new_id_is_one_query_not_two() {
+        let mut s = Streaming::default();
+        s.ingest_progress(p("q1", "r1", "orders-poison", 4));
+        s.ingest_progress(p("q2", "r2", "orders-poison", 0)); // fresh checkpoint restart
+        s.ingest_progress(p("q2", "r2", "orders-poison", 1));
+        assert_eq!(s.queries.len(), 1, "one logical query");
+        let q = &s.queries["q2"];
+        assert_eq!(q.batches.keys().copied().collect::<Vec<_>>(), [0, 1]);
+        // Differently named queries stay separate.
+        s.ingest_progress(p("q3", "r3", "orders-raw", 9));
+        assert_eq!(s.queries.len(), 2);
     }
 }

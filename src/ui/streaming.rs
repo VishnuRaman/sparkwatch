@@ -58,14 +58,21 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
         return;
     }
 
-    let queries: Vec<&QueryHistory> = s.queries.values().collect();
+    // By name, so j/k and the selected index don't shift when a restarted
+    // query comes back under a new (random) id.
+    let mut queries: Vec<&QueryHistory> = s.queries.values().collect();
+    queries.sort_by_key(|q| q.label());
     let sel = selected.min(queries.len() - 1);
     let others = queries.len().saturating_sub(1);
 
     // Selected query gets the panel; the rest one summary row each.
     let [panel, list, foot] = Layout::vertical([
         Constraint::Min(14),
-        Constraint::Length(if others > 0 { others as u16 + 2 } else { 0 }),
+        Constraint::Length(if others > 0 {
+            queries.len() as u16 + 2
+        } else {
+            0
+        }),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -131,10 +138,11 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [head, charts, detail] = Layout::vertical([
+    let [head, charts, detail, recent] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(7),
-        Constraint::Min(3),
+        Constraint::Length(6),
+        Constraint::Min(4),
     ])
     .areas(inner);
 
@@ -341,15 +349,107 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
             p.timestamp.clone().into(),
         ]));
     } else {
-        lines.push(Line::from("latest batches: ".dark_gray()));
-        for b in q.batches.values().rev().take(5) {
-            lines.push(Line::from(vec![
-                format!("  batch {} ", b.batch_id).into(),
-                fmt_millis(b.duration_ms).into(),
-                "  ".into(),
-                Span::styled(b.status.clone(), super::status_style(&b.status)),
-            ]));
-        }
+        lines.push(Line::from(
+            "no progress event for the latest batch — rates and breakdown need the driver log"
+                .dark_gray(),
+        ));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
+
+    draw_recent_batches(f, recent, q, &st);
+}
+
+/// One row per batch, newest first: the per-batch history that the
+/// Structured Streaming UI page has and the REST API does not.
+fn draw_recent_batches(f: &mut Frame, area: Rect, q: &QueryHistory, st: &QueryStats) {
+    use ratatui::widgets::{Cell, Row, Table};
+
+    let rows: Vec<Row> =
+        q.batches
+            .values()
+            .rev()
+            .take(area.height.saturating_sub(3) as usize)
+            .map(|b| {
+                let p = b.progress.as_ref();
+                let status = if b.status.is_empty() {
+                    "-"
+                } else {
+                    b.status.as_str()
+                };
+                let slow = st.p95_ms > 0 && b.duration_ms > st.p95_ms;
+                let behind = p.is_some_and(|p| {
+                    p.num_input_rows > 0 && p.processed_rows_per_second < p.input_rows_per_second
+                });
+                let row = Row::new(vec![
+                    Cell::from(b.batch_id.to_string()),
+                    Cell::from(status).style(super::status_style(status)),
+                    Cell::from(fmt_millis(b.duration_ms)).style(if slow {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    }),
+                    Cell::from(p.map_or("-".into(), |p| fmt_num(p.num_input_rows))),
+                    Cell::from(p.map_or("-".into(), |p| fmt_rate(p.input_rows_per_second))),
+                    Cell::from(p.map_or("-".into(), |p| fmt_rate(p.processed_rows_per_second)))
+                        .style(if behind {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        }),
+                    Cell::from(p.map_or("-".into(), |p| fmt_num(p.state_rows()))),
+                    Cell::from(p.map_or("-".into(), |p| {
+                        p.duration_ms
+                            .get("addBatch")
+                            .map(|v| fmt_millis(*v))
+                            .unwrap_or_else(|| "-".into())
+                    })),
+                    Cell::from(p.map_or("-".into(), |p| {
+                        p.watermark_lag_ms()
+                            .map(fmt_millis)
+                            .unwrap_or_else(|| "-".into())
+                    })),
+                    Cell::from(p.map_or(String::new(), |p| {
+                        p.timestamp.chars().skip(11).take(8).collect::<String>()
+                    })),
+                ]);
+                if status == "FAILED" {
+                    row.style(Style::default().fg(Color::Red))
+                } else {
+                    row
+                }
+            })
+            .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(8),
+        ],
+    )
+    .header(super::header_row(&[
+        "BATCH",
+        "STATUS",
+        "TRIGGER",
+        "INPUT ROWS",
+        "IN/S",
+        "PROCESSED/S",
+        "STATE ROWS",
+        "ADDBATCH",
+        "WM LAG",
+        "AT",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Recent batches ({} kept) · yellow trigger = above p95 · red rate = behind ",
+        q.batches.len()
+    )));
+    f.render_widget(table, area);
 }

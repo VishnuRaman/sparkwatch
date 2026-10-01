@@ -24,6 +24,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Tabs},
 };
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------- formatting
 
@@ -89,27 +90,121 @@ pub fn status_style(status: &str) -> Style {
 
 /// What to call a job or stage. Spark's `name` is the user-code call site,
 /// which is `run at <unknown>:0` whenever there is no user code on the
-/// driver's stack (Spark Connect, streaming micro-batches). The job
-/// description is better: streaming sets it to
-/// `<query>\nid = …\nrunId = …\nbatch = N`, and `setJobDescription` users
-/// put their own text there.
-pub fn display_name(name: &str, description: Option<&str>) -> String {
-    let Some(d) = description.map(str::trim).filter(|d| !d.is_empty()) else {
-        return name.to_string();
-    };
-    let mut lines = d.lines().map(str::trim);
-    let first = lines.next().unwrap_or(name).to_string();
-    let batch = d
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("batch = "))
-        .map(|b| format!(" · batch {b}"))
-        .unwrap_or_default();
-    // A streaming description whose first line is an `id = …` means the query
-    // had no name; fall back to the call site plus the batch number.
-    if first.starts_with("id = ") {
-        return format!("{name}{batch}");
+/// driver's stack (Spark Connect, streaming micro-batches). Better sources,
+/// in order: the job description (streaming sets it to
+/// `<query>\nid = …\nrunId = …\nbatch = N`; `setJobDescription` users put
+/// their own text there), then the SQL execution the job belongs to.
+pub fn display_name(name: &str, description: Option<&str>, sql_hint: Option<&str>) -> String {
+    if let Some(d) = description.map(str::trim).filter(|d| !d.is_empty()) {
+        let first = d.lines().next().unwrap_or(name).trim();
+        let batch = d
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("batch = "))
+            .map(|b| format!(" · batch {b}"))
+            .unwrap_or_default();
+        // A streaming description whose first line is `id = …` means the
+        // query had no name; use the SQL hint or call site plus the batch.
+        if !first.starts_with("id = ") {
+            return format!("{first}{batch}");
+        }
+        let base = sql_hint.unwrap_or(name);
+        return format!("{base}{batch}");
     }
-    format!("{first}{batch}")
+    match sql_hint {
+        Some(h) if name.contains("<unknown>") => h.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Per-job and per-stage labels derived from the SQL executions of a
+/// snapshot (`sql #12 · SELECT …`), for jobs and stages whose own name is
+/// just `run at <unknown>:0`.
+#[derive(Default)]
+pub struct Labels {
+    pub jobs: HashMap<i64, String>,
+    pub stages: HashMap<i64, String>,
+    /// Streaming query names that appear with more than one run id in this
+    /// snapshot (restarts): their rows get a `· run xxxx` suffix so that two
+    /// "batch 4" rows from different runs can be told apart.
+    pub multi_run: std::collections::HashSet<String>,
+}
+
+/// `(name, runId)` from a streaming job/stage description.
+fn streaming_run(description: &str) -> Option<(String, String)> {
+    let mut name = None;
+    let mut run = None;
+    for (i, l) in description.lines().map(str::trim).enumerate() {
+        if i == 0 && !l.contains(" = ") {
+            name = Some(l.to_string());
+        } else if let Some(r) = l.strip_prefix("runId = ") {
+            run = Some(r.to_string());
+        }
+    }
+    Some((name?, run?))
+}
+
+impl Labels {
+    pub fn from_snapshot(s: &crate::spark::Snapshot) -> Self {
+        let mut l = Labels::default();
+        let mut runs: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for d in s
+            .jobs
+            .iter()
+            .filter_map(|j| j.description.as_deref())
+            .chain(s.stages.iter().filter_map(|st| st.description.as_deref()))
+        {
+            if let Some((name, run)) = streaming_run(d) {
+                runs.entry(name).or_default().insert(run);
+            }
+        }
+        l.multi_run = runs
+            .into_iter()
+            .filter(|(_, r)| r.len() > 1)
+            .map(|(n, _)| n)
+            .collect();
+        let Some(sql) = &s.sql else { return l };
+        for e in sql {
+            let hint = format!(
+                "sql #{} · {}",
+                e.id,
+                display_name(e.title(), Some(&e.description), None)
+            );
+            for job_id in e
+                .running_job_ids
+                .iter()
+                .chain(&e.success_job_ids)
+                .chain(&e.failed_job_ids)
+            {
+                l.jobs.insert(*job_id, hint.clone());
+            }
+        }
+        for j in &s.jobs {
+            if let Some(h) = l.jobs.get(&j.job_id) {
+                for st in &j.stage_ids {
+                    l.stages.entry(*st).or_insert_with(|| h.clone());
+                }
+            }
+        }
+        l
+    }
+
+    pub fn job(&self, id: i64) -> Option<&str> {
+        self.jobs.get(&id).map(String::as_str)
+    }
+
+    pub fn stage(&self, id: i64) -> Option<&str> {
+        self.stages.get(&id).map(String::as_str)
+    }
+
+    /// Append `· run xxxx` when this description's query has restarted.
+    pub fn with_run(&self, label: String, description: Option<&str>) -> String {
+        match description.and_then(streaming_run) {
+            Some((name, run)) if self.multi_run.contains(&name) => {
+                format!("{label} · run {}", run.chars().take(8).collect::<String>())
+            }
+            _ => label,
+        }
+    }
 }
 
 /// Unicode bar, useful inside a table cell where a Gauge cannot go.
@@ -301,12 +396,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     };
 
+    let labels = Labels::from_snapshot(snap);
     match *tab {
-        Tab::Overview => overview::draw(f, body, snap, history),
+        Tab::Overview => overview::draw(f, body, snap, history, &labels),
         Tab::Jobs => {
             let rows = visible_jobs(snap, filter(Tab::Jobs));
             let title = filtered_title("Jobs", rows.len(), snap.jobs.len(), filter(Tab::Jobs));
-            tables::draw_jobs(f, body, &rows, title, &mut jobs.state)
+            tables::draw_jobs(f, body, &rows, title, &labels, &mut jobs.state)
         }
         Tab::Stages => {
             let rows = visible_stages(snap, stage_filter, filter(Tab::Stages));
@@ -315,7 +411,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             if let Some(fl) = stage_filter {
                 title = format!("{title}· job #{} · Esc to clear ", fl.job_id);
             }
-            tables::draw_stages(f, body, &rows, title, &mut stages.state)
+            tables::draw_stages(f, body, &rows, title, &labels, &mut stages.state)
         }
         Tab::Executors => {
             let rows = visible_executors(snap, filter(Tab::Executors));
@@ -540,32 +636,118 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::display_name;
+    use super::{Labels, display_name};
+    use crate::spark::{ExecutionData, JobData, Snapshot};
 
     #[test]
-    fn job_names_prefer_the_description() {
+    fn job_names_prefer_description_then_sql_then_call_site() {
         assert_eq!(
-            display_name("run at <unknown>:0", None),
+            display_name("run at <unknown>:0", None, None),
             "run at <unknown>:0"
         );
         assert_eq!(
             display_name(
                 "run at <unknown>:0",
-                Some("orders-agg\nid = q\nrunId = r\nbatch = 4123")
+                Some("orders-agg\nid = q\nrunId = r\nbatch = 4123"),
+                None
             ),
             "orders-agg · batch 4123"
         );
         assert_eq!(
-            display_name("run at <unknown>:0", Some("id = q\nrunId = r\nbatch = 7")),
-            "run at <unknown>:0 · batch 7"
+            display_name(
+                "run at <unknown>:0",
+                Some("id = q\nrunId = r\nbatch = 7"),
+                Some("sql #3 · x")
+            ),
+            "sql #3 · x · batch 7"
         );
         assert_eq!(
-            display_name("count at Main.scala:40", Some("nightly load")),
+            display_name(
+                "run at <unknown>:0",
+                None,
+                Some("sql #12 · SELECT a FROM t")
+            ),
+            "sql #12 · SELECT a FROM t"
+        );
+        // An informative call site is kept even when a SQL hint exists.
+        assert_eq!(
+            display_name(
+                "count at Main.scala:40",
+                None,
+                Some("sql #12 · count at Main.scala:40")
+            ),
+            "count at Main.scala:40"
+        );
+        assert_eq!(
+            display_name("count at Main.scala:40", Some("nightly load"), None),
             "nightly load"
         );
         assert_eq!(
-            display_name("count at Main.scala:40", Some("  ")),
+            display_name("count at Main.scala:40", Some("  "), None),
             "count at Main.scala:40"
+        );
+    }
+
+    #[test]
+    fn labels_follow_execution_to_jobs_to_stages() {
+        let snap = Snapshot {
+            sql: Some(vec![ExecutionData {
+                id: 22,
+                description: "orders-poison\nid = q\nrunId = r\nbatch = 3".into(),
+                failed_job_ids: vec![9],
+                ..Default::default()
+            }]),
+            jobs: vec![JobData {
+                job_id: 9,
+                stage_ids: vec![30, 31],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let l = Labels::from_snapshot(&snap);
+        assert_eq!(l.job(9), Some("sql #22 · orders-poison · batch 3"));
+        assert_eq!(l.stage(31), Some("sql #22 · orders-poison · batch 3"));
+        assert_eq!(l.stage(99), None);
+    }
+
+    #[test]
+    fn restarted_queries_get_a_run_suffix() {
+        let desc = |run: &str| Some(format!("orders-poison\nid = q\nrunId = {run}\nbatch = 4"));
+        let snap = Snapshot {
+            jobs: vec![
+                JobData {
+                    job_id: 1,
+                    description: desc("aaaaaaaa-1"),
+                    ..Default::default()
+                },
+                JobData {
+                    job_id: 2,
+                    description: desc("bbbbbbbb-2"),
+                    ..Default::default()
+                },
+                JobData {
+                    job_id: 3,
+                    description: Some("orders-raw\nid = x\nrunId = cccccccc\nbatch = 9".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let l = Labels::from_snapshot(&snap);
+        assert_eq!(
+            l.with_run(
+                "orders-poison · batch 4".into(),
+                desc("bbbbbbbb-2").as_deref()
+            ),
+            "orders-poison · batch 4 · run bbbbbbbb"
+        );
+        // A single-run query is left alone.
+        assert_eq!(
+            l.with_run(
+                "orders-raw · batch 9".into(),
+                snap.jobs[2].description.as_deref()
+            ),
+            "orders-raw · batch 9"
         );
     }
 }

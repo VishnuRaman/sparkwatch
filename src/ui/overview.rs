@@ -13,7 +13,13 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot, history: &VecDeque<Sample>) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    s: &Snapshot,
+    history: &VecDeque<Sample>,
+    labels: &super::Labels,
+) {
     let [top, trend, bottom] = Layout::vertical([
         Constraint::Length(9),
         Constraint::Length(5),
@@ -125,7 +131,7 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot, history: &VecDeque<Sample>)
     );
 
     draw_trends(f, trend, history);
-    draw_active_gauges(f, bottom, s);
+    draw_active_gauges(f, bottom, s, labels);
 }
 
 /// Task completion rate and concurrency over the last few minutes.
@@ -184,7 +190,7 @@ fn fit(data: &[u64], width: u16) -> Vec<u64> {
 }
 
 /// One gauge per running job, showing task completion.
-fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot) {
+fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot, labels: &super::Labels) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Running jobs ");
@@ -210,11 +216,12 @@ fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 format!("#{} ", job.job_id).cyan(),
-                super::display_name(&job.name, job.description.as_deref())
-                    .chars()
-                    .take(60)
-                    .collect::<String>()
-                    .into(),
+                super::display_name(
+                    &job.name,
+                    job.description.as_deref(),
+                    labels.job(job.job_id),
+                )
+                .into(),
                 format!("  {}/{} tasks", job.num_completed_tasks, job.num_tasks).dark_gray(),
             ])),
             label,

@@ -427,6 +427,9 @@ pub struct App {
 
     pub streaming: Streaming,
     pub streaming_status: Option<String>,
+    /// First driver log line the tap could read (epoch ms); batches before
+    /// it show durations only, and the batch views say so.
+    pub progress_log_start: Option<i64>,
     /// Selected query on the Streaming tab.
     pub streaming_sel: usize,
     /// Whether the driver log tap has been requested for this app.
@@ -510,6 +513,7 @@ impl App {
             return_view: View::Main,
             streaming: Streaming::default(),
             streaming_status: None,
+            progress_log_start: None,
             streaming_sel: 0,
             tap_requested: false,
             batch_query: None,
@@ -710,6 +714,7 @@ impl App {
             self.threads = ThreadsView::default();
             self.streaming = Streaming::default();
             self.streaming_status = None;
+            self.progress_log_start = None;
             self.streaming_sel = 0;
             self.tap_requested = false;
             self.batch_query = None;
@@ -816,6 +821,7 @@ impl App {
             stream: Stream::Stderr,
             http_url: exec.and_then(|e| e.log_url("stderr")),
             executor_id,
+            since_ms: None,
         };
         if !matches!(self.view, View::Logs | View::Threads) {
             self.return_view = self.view;
@@ -1169,9 +1175,11 @@ impl App {
         let (_, b) = self.open_batch_detail_data()?;
         let window = b.window_ms();
         let batch_id = b.batch_id;
-        let target = self.open_logs("driver".into(), None);
-        // Re-open with the window; fall back to a text hint when the batch
-        // has no timestamps to slice by.
+        let mut target = self.open_logs("driver".into(), None);
+        // Re-open with the window, and ask the stream to start there: an
+        // early batch is long gone from the last 2000 lines. Fall back to a
+        // text hint when the batch has no timestamps to slice by.
+        target.since_ms = window.map(|(start, _)| start);
         let filter = if window.is_none() {
             Some(format!("batch {batch_id}"))
         } else {
@@ -1179,6 +1187,20 @@ impl App {
         };
         self.logs.open_window(target.clone(), filter, window);
         Some(target)
+    }
+
+    /// `c` in the log view: clears the filter; when a batch window was
+    /// set, re-opens the stream from the tail so the whole log is back.
+    pub fn logs_widen(&mut self) -> Option<LogTarget> {
+        let windowed = self.logs.window.is_some();
+        self.logs.clear_filter();
+        if !windowed {
+            return None;
+        }
+        let mut t = self.logs.target.clone()?;
+        t.since_ms = None;
+        self.logs.open(t.clone(), None);
+        Some(t)
     }
 
     fn resync_batches(&mut self) {

@@ -38,6 +38,10 @@ pub struct LogTarget {
     pub stream: Stream,
     /// The `executorLogs` URL for `stream`, when the app reports one.
     pub http_url: Option<String>,
+    /// Start the stream at this time (epoch ms) instead of at the tail —
+    /// `kubectl logs --since-time`. A batch's window may be far behind the
+    /// last 2000 lines.
+    pub since_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +85,11 @@ pub struct LogView {
     /// Only lines whose timestamp falls in `[start, end]` (epoch ms) are
     /// shown; lines without a timestamp follow the line before them.
     pub window: Option<(i64, i64)>,
+    /// The stream has delivered a line dated after the window's end.
+    pub past_window: bool,
+    /// Timestamp of the first dated line the source delivered, kept or not:
+    /// when a window drops everything, this says where the log starts.
+    pub first_seen_ms: Option<i64>,
 }
 
 impl LogView {
@@ -119,6 +128,21 @@ impl LogView {
     pub fn append(&mut self, new: Vec<String>) {
         self.received += new.len();
         for l in new {
+            if self.first_seen_ms.is_none() {
+                self.first_seen_ms = line_time_ms(&l);
+            }
+            // A window is a slice of the past: once the stream is past its
+            // end, stop, so a chatty driver can't push the slice out of the
+            // buffer (`c` re-opens the whole log).
+            if let Some((_, end)) = self.window {
+                if self.past_window {
+                    continue;
+                }
+                if line_time_ms(&l).is_some_and(|t| t > end) {
+                    self.past_window = true;
+                    continue;
+                }
+            }
             if self.lines.len() == MAX_LINES {
                 self.lines.pop_front();
                 // The window slid under us; keep the same lines on screen.
@@ -137,6 +161,19 @@ impl LogView {
 
     pub fn total(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Timestamps of the oldest and newest dated lines in the buffer, to
+    /// explain an empty window ("the log we have starts after the batch").
+    pub fn time_span(&self) -> Option<(i64, i64)> {
+        let first = self.lines.iter().find_map(|l| line_time_ms(l));
+        let last = self.lines.iter().rev().find_map(|l| line_time_ms(l));
+        match (first, last) {
+            (Some(f), Some(l)) => Some((f, l)),
+            // Everything delivered was outside the window and dropped; the
+            // first line's time is still the answer to "where does it start".
+            _ => self.first_seen_ms.map(|t| (t, t)),
+        }
     }
 
     /// Lines that pass the time window and the text filter, in order.
@@ -294,6 +331,7 @@ mod tests {
                 previous: false,
                 stream: Stream::Stderr,
                 http_url: None,
+                since_ms: None,
             },
             None,
         );
@@ -348,6 +386,44 @@ mod tests {
         v.append(vec!["x".into(); 3]);
         assert_eq!(v.total(), MAX_LINES);
         assert_eq!(v.scroll, before - 3);
+    }
+
+    #[test]
+    fn window_stops_ingesting_past_its_end_so_the_slice_survives() {
+        let mut v = view_with(0);
+        let t = |s: &str| line_time_ms(s).unwrap();
+        v.window = Some((t("26/10/01 18:03:14 x"), t("26/10/01 18:03:17 x")));
+        v.append(vec![
+            "26/10/01 18:03:15 INFO in window".into(),
+            "  continuation".into(),
+            "26/10/01 18:03:30 INFO after".into(),
+            "  continuation of after".into(),
+        ]);
+        v.append(vec!["x".into(); MAX_LINES]);
+        assert!(v.past_window);
+        assert_eq!(v.total(), 2);
+        assert_eq!(v.received, 4 + MAX_LINES);
+        assert_eq!(
+            v.time_span(),
+            Some((t("26/10/01 18:03:15 x"), t("26/10/01 18:03:15 x")))
+        );
+    }
+
+    #[test]
+    fn window_entirely_before_the_log_still_knows_where_the_log_starts() {
+        let mut v = view_with(0);
+        let t = |s: &str| line_time_ms(s).unwrap();
+        v.window = Some((t("26/10/01 18:03:14 x"), t("26/10/01 18:03:17 x")));
+        v.append(vec![
+            "26/10/01 18:10:00 INFO rotated log starts here".into(),
+            "26/10/01 18:10:01 INFO more".into(),
+        ]);
+        assert_eq!(v.total(), 0);
+        assert!(v.received > 0);
+        assert_eq!(
+            v.time_span(),
+            Some((t("26/10/01 18:10:00 x"), t("26/10/01 18:10:00 x")))
+        );
     }
 
     #[test]

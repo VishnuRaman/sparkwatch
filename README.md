@@ -56,15 +56,19 @@ Prebuilt binaries (macOS arm64/x86_64, Linux x86_64/arm64 as static musl,
 Windows x86_64) are attached to every
 [release](https://github.com/VishnuRaman/sparkwatch/releases). The install
 script above verifies the SHA256 and installs to `~/.local/bin` (or
-`/usr/local/bin` as root); `SPARKWATCH_VERSION=v0.1.0` pins a version,
+`/usr/local/bin` as root); `SPARKWATCH_VERSION=v0.1.1` pins a version,
 `SPARKWATCH_INSTALL_DIR` changes the location. On Windows, unzip the
 `x86_64-pc-windows-msvc` asset somewhere on your `PATH`.
 
-From source, with a Rust toolchain (1.88+):
+From [crates.io](https://crates.io/crates/sparkwatch), with a Rust
+toolchain (1.88+):
 
 ```bash
-cargo install --path .
+cargo install sparkwatch
 ```
+
+(`cargo binstall sparkwatch` fetches the prebuilt binary instead of
+compiling.) From a checkout: `cargo install --path .`
 
 The binary is a single file with no other dependencies (TLS via rustls, no
 OpenSSL). `--k8s` mode shells out to `kubectl`, which must be on your `PATH`.
@@ -250,7 +254,10 @@ combines the micro-batch SQL executions (batch ids, status, duration; works
 on the History Server) with the driver log's `Streaming query made progress`
 events (rates, watermark, state; the driver must log at INFO for
 `org.apache.spark.sql.execution.streaming`). The log is followed from the
-first visit for as long as the app is watched. Per query: trigger duration
+first visit for as long as the app is watched; under `--k8s` it is read from
+the oldest listed batch onwards (`--since-time`, at most 6 h back), so the
+whole batch list gets its rates — on YARN only the tail is reachable, and
+older batches show durations only. Per query: trigger duration
 with mean/p95/max, input vs processed rows/s, watermark lag, state rows and
 memory, `addBatch` vs planning/offsets/commit overhead, rows dropped by the
 watermark, sparklines of each, the latest `durationMs` breakdown, and a
@@ -260,7 +267,9 @@ checkpoint is treated as the same query. `Enter` on a query lists every batch
 kept; `Enter` on a batch shows its numbers against the query's mean and p95,
 the **stages that ran for it** (`Enter` → stage drill-down), the **failures
 of this batch**, and `L` for the **driver log sliced to the batch's time
-window**.
+window** (under `--k8s` the stream starts at the batch, so a batch from
+hours ago works; on YARN only the tail is reachable, and the view says so
+when the window is before it).
 
 **Executor memory** (`m`) — peak heap (and its share of
 `spark.executor.memory`, red from 90 %), off-heap, execution, storage,
@@ -318,6 +327,7 @@ sparkwatch --k8s -n spark my-etl --dump --out /var/tmp/spark-dumps
 | `ERROR` badge, `connection refused` in the footer | driver gone or port-forward died; under `--k8s` it reconnects on the next poll |
 | `no running driver for 'x' (running: …)` | the name matches no running driver; use one listed, or omit it for the picker |
 | Streaming tab shows durations but no rates / watermark | the driver isn't logging at INFO for `org.apache.spark.sql.execution.streaming` |
+| Only recent batches have rates; tap status says `the log only reaches back to …` | the kubelet rotated the driver's container log (10 MiB default) and `kubectl logs` serves only the current file — raise `containerLogMaxSize`, or quieten `org.apache.spark.sql.execution` to WARN |
 | Logs say `pod gone` | the executor's pod was deleted on exit; set `spark.kubernetes.executor.deleteOnTermination=false` |
 | Empty Storage / Logs / Threads | History Server — those aren't in the event log |
 | Keys do nothing right after start | still on the picker / "Connecting" screen; wait for `LIVE` |

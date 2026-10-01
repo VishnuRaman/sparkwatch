@@ -37,7 +37,11 @@ pub enum Request {
     /// One-shot thread dump.
     FetchThreads(String),
     /// Start following the driver log for streaming progress (idempotent).
-    TapProgress,
+    /// `since_ms`: where the oldest listed batch starts, so the tap can read
+    /// from there; `None` lets the poller work it out from its SQL cache.
+    TapProgress {
+        since_ms: Option<i64>,
+    },
     /// `taskSummary` for these stage attempts (the summary's slowest stages).
     FetchStageSummaries(Vec<(i64, i64)>),
     /// Log tails for the dump bundle: the driver and these executors.
@@ -87,6 +91,9 @@ pub enum Message {
     LogDump(Vec<(String, Vec<String>)>),
     /// What the tap is doing, or why it can't.
     ProgressStatus(String),
+    /// Timestamp (epoch ms) of the first driver log line the tap could read:
+    /// batches before it can't get progress from the log.
+    ProgressLogStart(i64),
 }
 
 #[derive(Debug)]
@@ -488,7 +495,7 @@ impl Poller {
                 };
                 let _ = self.msg_tx.send(Message::LogDump(dump)).await;
             }
-            Request::TapProgress => {
+            Request::TapProgress { since_ms } => {
                 if self.tap.as_ref().is_some_and(|h| !h.is_finished()) {
                     return false; // already tapping
                 }
@@ -498,7 +505,11 @@ impl Poller {
                 match self.source.log_source() {
                     Ok(src) => {
                         let driver_url = self.state.driver_log_url.clone();
-                        self.tap = Some(tokio::spawn(run_tap(src, driver_url, tx)));
+                        let now = now_ms();
+                        let since = since_ms
+                            .map(|t| (t - 1000).max(now - TAP_MAX_BACK_MS))
+                            .or_else(|| tap_since(&self.state.sql, now));
+                        self.tap = Some(tokio::spawn(run_tap(src, driver_url, since, tx)));
                     }
                     Err(e) => {
                         let _ = tx.send(Message::ProgressStatus(format!("{e:#}"))).await;
@@ -626,17 +637,29 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
             // First without -c; a pod with sidecars makes kubectl refuse,
             // and then we name Spark's container.
             let mut container: Option<&str> = None;
+            let since = target.since_ms.map(crate::streaming::fmt_iso_s);
             loop {
-                let mut stream =
-                    match LogStream::start(&kube, &pod, container, target.previous, LOG_TAIL).await
-                    {
-                        Ok(s) => s,
-                        Err(e) => return status(format!("{e:#}")).await,
-                    };
+                let mut stream = match LogStream::start(
+                    &kube,
+                    &pod,
+                    container,
+                    target.previous,
+                    LOG_TAIL,
+                    since.as_deref(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return status(format!("{e:#}")).await,
+                };
                 status(format!(
-                    "streaming pod/{pod}{}{}",
+                    "streaming pod/{pod}{}{}{}",
                     container.map(|c| format!(" -c {c}")).unwrap_or_default(),
-                    if target.previous { " --previous" } else { "" }
+                    if target.previous { " --previous" } else { "" },
+                    since
+                        .as_ref()
+                        .map(|s| format!(" --since-time={s}"))
+                        .unwrap_or_default()
                 ))
                 .await;
                 let ended = pump(&mut stream, &tx).await;
@@ -689,13 +712,53 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
     }
 }
 
-/// How far back the tap reads on start: enough for a few hundred batches
-/// of pretty-printed progress.
+/// How far back the tap reads on start when it can't tell where the
+/// batches begin (no SQL executions yet, or an HTTP source).
 const TAP_TAIL: usize = 10_000;
+
+/// Never read more driver log than this on start, whatever the batch list
+/// says: a day of a chatty driver is gigabytes through the API server.
+const TAP_MAX_BACK_MS: i64 = 6 * 3600 * 1000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Where the tap should start reading the driver log: the submission time
+/// of the oldest micro-batch the batch list can show (per query, its newest
+/// `MAX_BATCHES`), minus a margin. A line-count tail is a couple of minutes
+/// of a chatty driver, and every batch before it would show durations only.
+fn tap_since(sql: &SqlCache, now: i64) -> Option<i64> {
+    let mut per_query: HashMap<String, Vec<i64>> = HashMap::new();
+    for e in sql.by_id.values() {
+        if let Some(b) = crate::streaming::batch_from_sql(e)
+            && let Some(t) = crate::streaming::parse_iso_ms(&e.submission_time)
+        {
+            per_query.entry(b.query_id).or_default().push(t);
+        }
+    }
+    let oldest = per_query
+        .values_mut()
+        .filter_map(|ts| {
+            ts.sort_unstable_by(|a, b| b.cmp(a));
+            ts.get(crate::streaming::MAX_BATCHES - 1)
+                .or(ts.last())
+                .copied()
+        })
+        .min()?;
+    Some((oldest - 1000).max(now - TAP_MAX_BACK_MS))
+}
 const TAP_HTTP_REFRESH: Duration = Duration::from_secs(5);
 
 /// Follow the driver log and forward only parsed progress events.
-async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Message>) {
+async fn run_tap(
+    src: LogSource,
+    driver_url: Option<String>,
+    since_ms: Option<i64>,
+    tx: mpsc::Sender<Message>,
+) {
     let status = |s: String| {
         let tx = tx.clone();
         async move {
@@ -708,14 +771,46 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
             kube, driver_pod, ..
         } => {
             let mut container: Option<&str> = None;
+            let since = since_ms.map(crate::streaming::fmt_iso_s);
             loop {
-                let mut stream =
-                    match LogStream::start(&kube, &driver_pod, container, false, TAP_TAIL).await {
-                        Ok(s) => s,
-                        Err(e) => return status(format!("{e:#}")).await,
-                    };
-                status(format!("following pod/{driver_pod}")).await;
+                let mut stream = match LogStream::start(
+                    &kube,
+                    &driver_pod,
+                    container,
+                    false,
+                    TAP_TAIL,
+                    since.as_deref(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return status(format!("{e:#}")).await,
+                };
+                let following = match &since {
+                    Some(s) => format!("following pod/{driver_pod} since {s}"),
+                    None => format!("following pod/{driver_pod} (last {TAP_TAIL} lines)"),
+                };
+                status(following.clone()).await;
+                let mut first_seen = false;
                 while let Ok(Some(line)) = stream.lines.next_line().await {
+                    // The kubelet serves only the container's current log
+                    // file: once it has rotated (10 MiB by default), the
+                    // log starts later than asked and the batches before
+                    // that can't get their rates. Say so rather than leave
+                    // a column of dashes unexplained.
+                    if !first_seen && let Some(t) = crate::logview::line_time_ms(&line) {
+                        first_seen = true;
+                        let _ = tx.send(Message::ProgressLogStart(t)).await;
+                        if let Some(want) = since_ms
+                            && t > want + 60_000
+                        {
+                            status(format!(
+                                "{following} — the log only reaches back to {} (rotated by the kubelet; raise containerLogMaxSize/containerLogMaxFiles), so batches before that show durations only",
+                                crate::streaming::fmt_clock(t)
+                            ))
+                            .await;
+                        }
+                    }
                     if let Some(p) = parser.feed(&line)
                         && tx.send(Message::Progress(p)).await.is_err()
                     {
@@ -880,4 +975,55 @@ async fn fetch(
     }
     msgs.extend(msgs_extra);
     msgs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(id: i64, query: &str, submitted: &str) -> ExecutionData {
+        ExecutionData {
+            id,
+            description: format!("{query}\nid = {query}\nrunId = r1\nbatch = {id}"),
+            submission_time: submitted.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tap_starts_at_the_oldest_listed_batch_with_a_margin() {
+        let mut sql = SqlCache::default();
+        for (i, t) in [
+            (1, "2026-10-01T21:24:34.000Z"),
+            (2, "2026-10-01T21:24:44.000Z"),
+            (3, "2026-10-01T21:25:00.000Z"),
+        ] {
+            sql.by_id.insert(i, batch(i, "orders-agg", t));
+        }
+        // A plain query (no batch description) doesn't count.
+        sql.by_id.insert(
+            9,
+            ExecutionData {
+                id: 9,
+                description: "SELECT 1".into(),
+                submission_time: "2026-10-01T20:00:00.000Z".into(),
+                ..Default::default()
+            },
+        );
+        let now = crate::streaming::parse_iso_ms("2026-10-01T21:40:00Z").unwrap();
+        assert_eq!(
+            tap_since(&sql, now),
+            Some(crate::streaming::parse_iso_ms("2026-10-01T21:24:33Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn tap_since_is_bounded_and_absent_without_batches() {
+        let mut sql = SqlCache::default();
+        sql.by_id
+            .insert(1, batch(1, "q", "2026-10-01T01:00:00.000Z"));
+        let now = crate::streaming::parse_iso_ms("2026-10-01T21:40:00Z").unwrap();
+        assert_eq!(tap_since(&sql, now), Some(now - TAP_MAX_BACK_MS));
+        assert_eq!(tap_since(&SqlCache::default(), now), None);
+    }
 }

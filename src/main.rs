@@ -271,6 +271,7 @@ async fn run(
                 Message::StageSummaries(v) => app.apply_stage_summaries(v),
                 Message::LogDump(logs) => app.write_dump(logs),
                 Message::ProgressStatus(s) => app.streaming_status = Some(s),
+            Message::ProgressLogStart(t) => app.progress_log_start = Some(t),
             },
             _ = tick.tick() => {}
         }
@@ -411,7 +412,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 send(req_tx, Request::CloseLogs).await;
             }
             KeyCode::Char('/') => app.logs.start_filter(),
-            KeyCode::Char('c') => app.logs.clear_filter(),
+            KeyCode::Char('c') => open_logs(app, req_tx, App::logs_widen).await,
             KeyCode::Char('w') => app.logs.wrap = !app.logs.wrap,
             KeyCode::Char('F') => app.logs.scroll_to_end(),
             KeyCode::Char('P') => open_logs(app, req_tx, App::logs_toggle_previous).await,
@@ -574,7 +575,8 @@ async fn run_headless(
                 }
                 // Streaming app: tap the driver log for progress events.
                 if tap_started.is_none() && !app.streaming.is_empty() {
-                    send(req_tx, Request::TapProgress).await;
+                    let since_ms = app.streaming.oldest_batch_ms();
+                    send(req_tx, Request::TapProgress { since_ms }).await;
                     tap_started = Some(tokio::time::Instant::now());
                 }
             }
@@ -584,6 +586,7 @@ async fn run_headless(
             }
             Message::Progress(p) => app.apply_progress(p),
             Message::ProgressStatus(s) => app.streaming_status = Some(s),
+            Message::ProgressLogStart(t) => app.progress_log_start = Some(t),
             Message::StageSummaries(v) => {
                 app.apply_stage_summaries(v);
                 have_summaries = true;
@@ -640,7 +643,8 @@ async fn run_headless(
 /// then runs for as long as this app is watched.
 async fn tap_if_streaming(app: &mut App, req_tx: &mpsc::Sender<Request>) {
     if app.tab == app::Tab::Streaming && app.want_tap() {
-        send(req_tx, Request::TapProgress).await;
+        let since_ms = app.streaming.oldest_batch_ms();
+        send(req_tx, Request::TapProgress { since_ms }).await;
     }
 }
 

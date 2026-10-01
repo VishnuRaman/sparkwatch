@@ -124,7 +124,7 @@ Storage id/name/level. Title shows `Stages (12 of 340) · filter: writer`.
 |---|---|
 | `j` `k` | move: batches in the list, stages in the drill-down |
 | `Enter` | list → batch drill-down; drill-down → stage drill-down (`Esc` returns to the batch) |
-| `L` | driver log sliced to this batch's time window (`c` in the viewer widens it) |
+| `L` | driver log sliced to this batch's time window — under `--k8s` the stream starts at the batch (`--since-time`), so early batches work too; `c` in the viewer widens back to the whole log |
 | `Esc` | back one level |
 
 ### SQL drill-down
@@ -259,8 +259,12 @@ executor's log; `x` = acknowledge. Works even while the endpoint is unreachable.
 Structured Streaming has **no REST API**, so this is rebuilt from two sources, merged per
 `(runId, batchId)`:
 1. the **driver log** — every micro-batch's `Streaming query made progress: {…}` (started on the first
-   visit and kept for the app's lifetime; `kubectl logs -f` under `--k8s`, the driver's stderr page on
-   YARN/standalone). Needs the driver logging at INFO for `org.apache.spark.sql.execution.streaming`.
+   visit and kept for the app's lifetime). Under `--k8s` it is `kubectl logs -f --since-time=<oldest
+   listed batch>` (capped at 6 h back), so every batch in the list gets its rates; on YARN/standalone
+   it is the driver's stderr page — a tail, so only recent batches do. Needs the driver logging at
+   INFO for `org.apache.spark.sql.execution.streaming`. The tab's status line says which
+   (`following pod/x since …`); a batch with `-` in the rate columns is one the log didn't cover — the
+   batch list title counts them (`· 27 before the driver log's start at 21:58:43 have durations only`).
 2. the **SQL executions** — each micro-batch's description carries query id / run id / batch number:
    batch ids, status and durations everywhere, History Server included, but no rates or watermark.
 
@@ -304,6 +308,10 @@ and the source status — `streaming pod/x`, `tail of http://… refreshed every
 `no log URLs reported by this executor`, `kubectl logs ended: …`. Buffer is the last 20 000 lines.
 Sources: `--k8s` → `kubectl logs -f --tail=2000` (driver pod, or the executor's pod); YARN/standalone →
 the `executorLogs` page, 256 KiB tail, re-fetched every 3 s; History Server → none.
+From a batch (`L` in the batch drill-down) the title shows `batch window HH:MM:SS–HH:MM:SS`; under
+`--k8s` the stream is `--since-time=<window start>` and stops ingesting past the window's end, so the
+slice can't be pushed out of the buffer. An empty window says why (the available log starts after the
+batch — a YARN tail, or a restarted container — or has no timestamps); `c` re-opens the whole log.
 
 ### Thread dump (`t`)
 `GET /executors/{id}/threads`, grouped: **BLOCKED** first (with `blocked by #id (owner)` and what each
@@ -428,6 +436,7 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 | Picker shows the app but `Enter` sits on `Connecting` | the driver UI isn't answering on 4040 inside the pod (`spark.ui.enabled`, or a different port) |
 | `a container name must be specified` | handled automatically (retries with Spark's container name) |
 | `pod gone — set …deleteOnTermination=false` | the executor's pod was deleted; only its driver-side `removeReason` survives |
+| Streaming: older batches show `-` for rows/rates; tap status says `the log only reaches back to HH:MM:SS (rotated by the kubelet…)` | the kubelet rotates a container's log at `containerLogMaxSize` (10 MiB default) and `kubectl logs` only serves the current file; a chatty driver (~750 lines / 10 s here) rotates every ~15 min. Raise it on the nodes (kind: `kubeletExtraArgs` / `kubeadmConfigPatches` with `containerLogMaxSize: 200Mi`), or quieten the driver — `log4j2` `org.apache.spark.sql.execution` at WARN, keeping `org.apache.spark.sql.execution.streaming` at INFO |
 | Keys ignored right after start | still on the picker / "Connecting" screen; wait for `LIVE` |
 | Anything odd with input | `SPARKWATCH_KEYLOG=/tmp/keys.log sparkwatch …` logs every key press with a timestamp |
 
@@ -499,3 +508,4 @@ python3 dev/screens.py out.txt 170 50 'Failures (11, 11 new)' '!ERROR'
 CI runs `cargo fmt --check`, `clippy -D warnings`, tests on Linux/macOS/Windows, and builds the demo job.
 Release: bump `version` in `Cargo.toml`, then `git tag vX.Y.Z && git push origin vX.Y.Z` — binaries
 for macOS (arm64/x86_64), Linux (x86_64/arm64, static), Windows, with `SHA256SUMS`; `install.sh` fetches them.
+Then `cargo publish` from the same commit so `cargo install sparkwatch` matches the release.

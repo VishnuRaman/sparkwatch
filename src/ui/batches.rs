@@ -6,7 +6,7 @@ use super::{
 };
 use crate::alerts::Alert;
 use crate::spark::StageData;
-use crate::streaming::{Batch, QueryHistory, QueryStats};
+use crate::streaming::{Batch, QueryHistory, QueryStats, fmt_clock};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -53,6 +53,7 @@ pub fn draw_list(
     batches: &[&Batch],
     st: &QueryStats,
     state: &mut TableState,
+    log_start: Option<i64>,
 ) {
     let rows: Vec<Row> = batches
         .iter()
@@ -132,16 +133,28 @@ pub fn draw_list(
         "ADDBATCH",
         "WM LAG",
         "AT",
-    ]))
-    .block(table_block(format!(
-        " Batches of {} · {} kept · mean {} · p95 {} · Enter for detail ",
-        q.label(),
-        batches.len(),
-        fmt_millis(st.mean_ms),
-        fmt_millis(st.p95_ms)
-    )))
-    .row_highlight_style(selected_style())
-    .highlight_symbol("▌");
+    ]));
+    // Rows with `-` for rows/rates are batches the driver log didn't cover;
+    // say where the log starts so the dashes read as a fact, not a bug.
+    let missing = batches.iter().filter(|b| b.progress.is_none()).count();
+    let coverage = match (missing, log_start) {
+        (0, _) => String::new(),
+        (n, Some(t)) => format!(
+            "· {n} before the driver log's start at {} have durations only ",
+            fmt_clock(t)
+        ),
+        (n, None) => format!("· {n} without progress from the driver log "),
+    };
+    let table = table
+        .block(table_block(format!(
+            " Batches of {} · {} kept · mean {} · p95 {} {coverage}· Enter for detail ",
+            q.label(),
+            batches.len(),
+            fmt_millis(st.mean_ms),
+            fmt_millis(st.p95_ms)
+        )))
+        .row_highlight_style(selected_style())
+        .highlight_symbol("▌");
     f.render_stateful_widget(table, area, state);
 }
 
@@ -152,6 +165,8 @@ pub struct DetailProps<'a> {
     pub stages: &'a [&'a StageData],
     pub failures: &'a [&'a Alert],
     pub stage_state: &'a mut TableState,
+    /// First driver log line the tap could read, when known.
+    pub log_start: Option<i64>,
 }
 
 pub fn draw_detail(f: &mut Frame, area: Rect, p: DetailProps) {
@@ -204,20 +219,30 @@ pub fn draw_detail(f: &mut Frame, area: Rect, p: DetailProps) {
     ])];
     match &b.progress {
         Some(pr) => {
-            let behind = pr.num_input_rows > 0 && pr.processed_rows_per_second < pr.input_rows_per_second;
+            let behind =
+                pr.num_input_rows > 0 && pr.processed_rows_per_second < pr.input_rows_per_second;
             let mut l = vec![
                 "input ".dark_gray(),
                 format!("{} rows", fmt_num(pr.num_input_rows)).into(),
                 "  ".into(),
-                Span::styled(format!("{} rows/s in", fmt_rate(pr.input_rows_per_second)), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{} rows/s in", fmt_rate(pr.input_rows_per_second)),
+                    Style::default().fg(Color::Yellow),
+                ),
                 "  vs  ".dark_gray(),
                 Span::styled(
-                    format!("{} rows/s processed", fmt_rate(pr.processed_rows_per_second)),
+                    format!(
+                        "{} rows/s processed",
+                        fmt_rate(pr.processed_rows_per_second)
+                    ),
                     Style::default().fg(if behind { Color::Red } else { Color::Green }),
                 ),
             ];
             if behind {
-                l.push(Span::styled("  ▲ behind", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                l.push(Span::styled(
+                    "  ▲ behind",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
             }
             if let Some(lag) = pr.watermark_lag_ms() {
                 l.push("  watermark lag ".dark_gray());
@@ -225,19 +250,46 @@ pub fn draw_detail(f: &mut Frame, area: Rect, p: DetailProps) {
             }
             if pr.state_rows() > 0 {
                 l.push("  state ".dark_gray());
-                l.push(format!("{} rows / {}", fmt_num(pr.state_rows()), fmt_bytes(pr.state_bytes())).into());
+                l.push(
+                    format!(
+                        "{} rows / {}",
+                        fmt_num(pr.state_rows()),
+                        fmt_bytes(pr.state_bytes())
+                    )
+                    .into(),
+                );
             }
             lines.push(Line::from(l));
-            let parts: Vec<String> = ["addBatch", "getBatch", "latestOffset", "queryPlanning", "walCommit", "commitOffsets"]
-                .iter()
-                .filter_map(|k| pr.duration_ms.get(*k).map(|v| format!("{k} {}", fmt_millis(*v))))
-                .collect();
-            lines.push(Line::from(vec!["durations ".dark_gray(), parts.join(" · ").into()]));
+            let parts: Vec<String> = [
+                "addBatch",
+                "getBatch",
+                "latestOffset",
+                "queryPlanning",
+                "walCommit",
+                "commitOffsets",
+            ]
+            .iter()
+            .filter_map(|k| {
+                pr.duration_ms
+                    .get(*k)
+                    .map(|v| format!("{k} {}", fmt_millis(*v)))
+            })
+            .collect();
+            lines.push(Line::from(vec![
+                "durations ".dark_gray(),
+                parts.join(" · ").into(),
+            ]));
             for src in &pr.sources {
                 lines.push(Line::from(vec![
                     "source ".dark_gray(),
                     src.description.clone().into(),
-                    format!("  {} rows · {}/s in · {}/s processed", fmt_num(src.num_input_rows), fmt_rate(src.input_rows_per_second), fmt_rate(src.processed_rows_per_second)).dark_gray(),
+                    format!(
+                        "  {} rows · {}/s in · {}/s processed",
+                        fmt_num(src.num_input_rows),
+                        fmt_rate(src.input_rows_per_second),
+                        fmt_rate(src.processed_rows_per_second)
+                    )
+                    .dark_gray(),
                 ]));
             }
             if !pr.sink.description.is_empty() {
@@ -248,9 +300,19 @@ pub fn draw_detail(f: &mut Frame, area: Rect, p: DetailProps) {
                 ]));
             }
         }
-        None => lines.push(Line::from(
-            "no progress event for this batch (driver log not available or not at INFO); status and duration are from its SQL execution".dark_gray(),
-        )),
+        None => {
+            let why = match p.log_start {
+                Some(t) if b.window_ms().is_some_and(|(_, end)| end < t) => format!(
+                    "the driver log sparkwatch can read starts at {} (rotated by the kubelet, or a tail), after this batch",
+                    fmt_clock(t)
+                ),
+                _ => "driver log not available, not at INFO, or not yet read this far".into(),
+            };
+            lines.push(Line::from(
+                format!("no progress event for this batch — {why}; status and duration are from its SQL execution")
+                    .dark_gray(),
+            ));
+        }
     }
     lines.push(Line::from(
         "Enter: stage drill-down · L: driver log for this batch's time window · Esc: back"

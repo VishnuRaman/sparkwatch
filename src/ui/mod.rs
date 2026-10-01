@@ -301,6 +301,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         threads_lines,
         streaming: streaming_state,
         streaming_status,
+        progress_log_start,
         streaming_sel,
         batch_query,
         batches_cursor,
@@ -406,6 +407,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     &batches_newest_first(q),
                     &st,
                     &mut batches_cursor.state,
+                    *progress_log_start,
                 );
                 return;
             }
@@ -431,6 +433,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     stages: &stages,
                     failures: &failures,
                     stage_state: &mut batch_stages.state,
+                    log_start: *progress_log_start,
                 },
             );
             return;

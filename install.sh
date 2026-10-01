@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/VishnuRaman/sparkwatch/main/install.sh | sh
 #
 # Options via environment:
-#   SPARKWATCH_VERSION=v0.1.0   pin a version (default: latest release)
+#   SPARKWATCH_VERSION=v0.1.1   pin a version (default: latest release)
 #   SPARKWATCH_INSTALL_DIR=...  where to put the binary (default: ~/.local/bin,
 #                               or /usr/local/bin when run as root)
 set -eu

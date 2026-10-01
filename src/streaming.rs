@@ -113,6 +113,36 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60 * 1000 + sec * 1000 + millis)
 }
 
+/// Epoch millis → `2026-09-25T10:00:00Z` (the inverse of [`parse_iso_ms`],
+/// to the second), for `kubectl logs --since-time`.
+pub fn fmt_iso_s(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    // Civil from days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        sod % 3600 / 60,
+        sod % 60
+    )
+}
+
+/// `HH:MM:SS` (UTC) of an epoch-millis instant, for titles.
+pub fn fmt_clock(ms: i64) -> String {
+    let sod = ms.div_euclid(1000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", sod / 3600, sod % 3600 / 60, sod % 60)
+}
+
 // ---------------------------------------------------------------- parsing
 
 const MARKER: &str = "Streaming query made progress:";
@@ -274,6 +304,24 @@ impl QueryHistory {
         while self.batches.len() > MAX_BATCHES {
             self.batches.pop_first();
         }
+    }
+}
+
+impl Streaming {
+    /// When the oldest batch still listed for any live query ran: where the
+    /// log tap should start so every listed batch gets its progress.
+    pub fn oldest_batch_ms(&self) -> Option<i64> {
+        self.queries
+            .values()
+            .filter(|q| !self.retired.contains(&q.query_id))
+            .filter_map(|q| {
+                let b = q.batches.values().next()?;
+                b.progress
+                    .as_ref()
+                    .and_then(|p| parse_iso_ms(&p.timestamp))
+                    .or_else(|| parse_iso_ms(&b.submitted))
+            })
+            .min()
     }
 }
 
@@ -625,6 +673,21 @@ mod tests {
             Some(1_790_330_405_500)
         );
         assert_eq!(parse_iso_ms("nope"), None);
+    }
+
+    #[test]
+    fn iso_round_trips() {
+        for s in [
+            "1970-01-01T00:00:00Z",
+            "2026-09-25T10:00:05Z",
+            "2026-02-28T23:59:59Z",
+            "2024-02-29T12:00:00Z",
+            "2026-12-31T00:00:00Z",
+        ] {
+            assert_eq!(fmt_iso_s(parse_iso_ms(s).unwrap()), s);
+        }
+        assert_eq!(fmt_iso_s(1_790_330_405_900), "2026-09-25T10:00:05Z");
+        assert_eq!(fmt_clock(1_790_330_405_900), "10:00:05");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "sparkwatch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Terminal monitor for Apache Spark applications: a Spark UI you can use over SSH"
 repository = "https://github.com/VishnuRaman/sparkwatch"

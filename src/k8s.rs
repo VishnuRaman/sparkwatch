@@ -211,9 +211,16 @@ impl LogStream {
         container: Option<&str>,
         previous: bool,
         tail: usize,
+        since: Option<&str>,
     ) -> Result<Self> {
         let mut cmd = kube.cmd();
-        cmd.args(["logs", "-f", &format!("--tail={tail}")]);
+        cmd.args(["logs", "-f"]);
+        // From a point in time (RFC 3339) rather than the last `tail` lines;
+        // both together would keep only the tail of what's after `since`.
+        match since {
+            Some(t) => cmd.arg(format!("--since-time={t}")),
+            None => cmd.arg(format!("--tail={tail}")),
+        };
         if previous {
             cmd.arg("--previous");
         }

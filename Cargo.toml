@@ -1,13 +1,16 @@
 [package]
 name = "sparkwatch"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "Terminal monitor for Apache Spark applications: a Spark UI you can use over SSH"
 repository = "https://github.com/VishnuRaman/sparkwatch"
+license = "Apache-2.0"
 readme = "README.md"
 keywords = ["spark", "tui", "monitoring", "kubernetes"]
 categories = ["command-line-utilities"]
 rust-version = "1.88"
+# Only what `cargo install` needs; the demo job is its own crate.
+exclude = [".github/", "dev/", "streaming-job/", "dsign.md", "install.sh"]
 
 # Small, fast binaries for the release assets; debug builds are unaffected.
 [profile.release]

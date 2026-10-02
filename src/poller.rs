@@ -8,8 +8,8 @@
 use crate::k8s::{self, Kube, LogStream, PortForward};
 use crate::logview::LogTarget;
 use crate::spark::{
-    ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot, SparkClient, StageDetail,
-    ThreadStackTrace, logs,
+    ApplicationEnvironmentInfo, ApplicationInfo, ExecutionData, RddStorageInfo, Snapshot,
+    SparkClient, StageDetail, TaskMetricDistributions, ThreadStackTrace, logs,
 };
 use crate::streaming::{Progress, ProgressParser};
 use anyhow::{Context, Result};
@@ -37,7 +37,18 @@ pub enum Request {
     /// One-shot thread dump.
     FetchThreads(String),
     /// Start following the driver log for streaming progress (idempotent).
-    TapProgress,
+    /// `since_ms`: where the oldest listed batch starts, so the tap can read
+    /// from there; `None` lets the poller work it out from its SQL cache.
+    TapProgress {
+        since_ms: Option<i64>,
+    },
+    /// `taskSummary` for these stage attempts (the summary's slowest stages).
+    FetchStageSummaries(Vec<(i64, i64)>),
+    /// Log tails for the dump bundle: the driver and these executors.
+    DumpLogs {
+        executors: Vec<String>,
+        lines: usize,
+    },
     /// Tear down (kills any port-forward) and exit.
     Shutdown,
 }
@@ -73,8 +84,16 @@ pub enum Message {
     },
     /// A micro-batch's progress from the driver log tap.
     Progress(Progress),
+    /// `GET /environment`, once per app.
+    Environment(Result<ApplicationEnvironmentInfo, String>),
+    StageSummaries(Vec<((i64, i64), Option<TaskMetricDistributions>)>),
+    /// `(file name, lines)` per log, for the bundle.
+    LogDump(Vec<(String, Vec<String>)>),
     /// What the tap is doing, or why it can't.
     ProgressStatus(String),
+    /// Timestamp (epoch ms) of the first driver log line the tap could read:
+    /// batches before it can't get progress from the log.
+    ProgressLogStart(i64),
 }
 
 #[derive(Debug)]
@@ -101,6 +120,9 @@ pub enum DetailData {
 #[derive(Default)]
 struct AppState {
     sql: SqlCache,
+    /// The environment is static: fetched once per app, re-fetched on `r`
+    /// only if the first attempt failed.
+    env_fetched: bool,
     /// The driver's stderr `executorLogs` URL (YARN/standalone), for the tap.
     driver_log_url: Option<String>,
     /// Failed-task count already fetched per stage attempt, so the error
@@ -448,7 +470,32 @@ impl Poller {
                 }
             }
             Request::CloseLogs => self.close_logs(),
-            Request::TapProgress => {
+            Request::FetchStageSummaries(keys) => {
+                let mut out = Vec::new();
+                if let Some(key) = self.watch.clone()
+                    && let Ok((client, spark_id)) = self.source.resolve(&key).await
+                {
+                    for (id, attempt) in keys {
+                        let d = client
+                            .task_summary(&spark_id, id, attempt)
+                            .await
+                            .ok()
+                            .flatten();
+                        out.push(((id, attempt), d));
+                    }
+                }
+                let _ = self.msg_tx.send(Message::StageSummaries(out)).await;
+            }
+            Request::DumpLogs { executors, lines } => {
+                let dump = match self.source.log_source() {
+                    Ok(src) => {
+                        collect_log_tails(src, &self.state.driver_log_url, &executors, lines).await
+                    }
+                    Err(_) => Vec::new(),
+                };
+                let _ = self.msg_tx.send(Message::LogDump(dump)).await;
+            }
+            Request::TapProgress { since_ms } => {
                 if self.tap.as_ref().is_some_and(|h| !h.is_finished()) {
                     return false; // already tapping
                 }
@@ -458,7 +505,11 @@ impl Poller {
                 match self.source.log_source() {
                     Ok(src) => {
                         let driver_url = self.state.driver_log_url.clone();
-                        self.tap = Some(tokio::spawn(run_tap(src, driver_url, tx)));
+                        let now = now_ms();
+                        let since = since_ms
+                            .map(|t| (t - 1000).max(now - TAP_MAX_BACK_MS))
+                            .or_else(|| tap_since(&self.state.sql, now));
+                        self.tap = Some(tokio::spawn(run_tap(src, driver_url, since, tx)));
                     }
                     Err(e) => {
                         let _ = tx.send(Message::ProgressStatus(format!("{e:#}"))).await;
@@ -488,6 +539,61 @@ impl Poller {
         }
         false
     }
+}
+
+/// One-shot tails of the driver's and each executor's log, for `--dump`.
+async fn collect_log_tails(
+    src: LogSource,
+    driver_url: &Option<String>,
+    executors: &[String],
+    lines: usize,
+) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    match src {
+        LogSource::Kube {
+            kube,
+            spark_app_id,
+            driver_pod,
+        } => {
+            match k8s::log_tail(&kube, &driver_pod, k8s::DRIVER_CONTAINER, lines).await {
+                Ok(l) => out.push(("driver.log".into(), l)),
+                Err(e) => out.push(("driver.log".into(), vec![format!("<not available: {e:#}>")])),
+            }
+            for id in executors {
+                let name = format!("executor-{id}.log");
+                match k8s::find_executor_pod(&kube, &spark_app_id, id).await {
+                    Ok(Some(pod)) => match k8s::log_tail(&kube, &pod, k8s::EXECUTOR_CONTAINER, lines).await {
+                        Ok(l) => out.push((name, l)),
+                        Err(e) => out.push((name, vec![format!("<not available: {e:#}>")])),
+                    },
+                    Ok(None) => out.push((name, vec!["<pod gone — set spark.kubernetes.executor.deleteOnTermination=false to keep executor logs>".into()])),
+                    Err(e) => out.push((name, vec![format!("<not available: {e:#}>")])),
+                }
+            }
+        }
+        LogSource::Http(client) => {
+            // Only the driver's URL is known here; executors' come with the
+            // snapshot, which the UI has — it passes them as ids, so for HTTP
+            // sources the dump carries the driver tail only.
+            if let Some(url) = driver_url {
+                match client.fetch_text(&logs::with_tail(url)).await {
+                    Ok(body) => {
+                        let mut l: Vec<String> = logs::extract_log_text(&body)
+                            .lines()
+                            .map(str::to_string)
+                            .collect();
+                        let keep = l.len().saturating_sub(lines);
+                        l.drain(..keep);
+                        out.push(("driver.log".into(), l));
+                    }
+                    Err(e) => {
+                        out.push(("driver.log".into(), vec![format!("<not available: {e:#}>")]))
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------- log streams
@@ -531,17 +637,29 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
             // First without -c; a pod with sidecars makes kubectl refuse,
             // and then we name Spark's container.
             let mut container: Option<&str> = None;
+            let since = target.since_ms.map(crate::streaming::fmt_iso_s);
             loop {
-                let mut stream =
-                    match LogStream::start(&kube, &pod, container, target.previous, LOG_TAIL).await
-                    {
-                        Ok(s) => s,
-                        Err(e) => return status(format!("{e:#}")).await,
-                    };
+                let mut stream = match LogStream::start(
+                    &kube,
+                    &pod,
+                    container,
+                    target.previous,
+                    LOG_TAIL,
+                    since.as_deref(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return status(format!("{e:#}")).await,
+                };
                 status(format!(
-                    "streaming pod/{pod}{}{}",
+                    "streaming pod/{pod}{}{}{}",
                     container.map(|c| format!(" -c {c}")).unwrap_or_default(),
-                    if target.previous { " --previous" } else { "" }
+                    if target.previous { " --previous" } else { "" },
+                    since
+                        .as_ref()
+                        .map(|s| format!(" --since-time={s}"))
+                        .unwrap_or_default()
                 ))
                 .await;
                 let ended = pump(&mut stream, &tx).await;
@@ -594,13 +712,57 @@ async fn run_logs(src: LogSource, target: LogTarget, tx: mpsc::Sender<Message>) 
     }
 }
 
-/// How far back the tap reads on start: enough for a few hundred batches
-/// of pretty-printed progress.
+/// How far back the tap reads on start when it can't tell where the
+/// batches begin (no SQL executions yet, or an HTTP source).
 const TAP_TAIL: usize = 10_000;
+
+/// Never read more driver log than this on start, whatever the batch list
+/// says: a day of a chatty driver is gigabytes through the API server.
+const TAP_MAX_BACK_MS: i64 = 6 * 3600 * 1000;
+/// Pause between reconnects of the tap, and how many consecutive failures
+/// to start `kubectl logs` (pod gone?) before the tap gives up.
+const TAP_RETRY: Duration = Duration::from_secs(2);
+const TAP_MAX_START_FAILURES: u32 = 15;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Where the tap should start reading the driver log: the submission time
+/// of the oldest micro-batch the batch list can show (per query, its newest
+/// `MAX_BATCHES`), minus a margin. A line-count tail is a couple of minutes
+/// of a chatty driver, and every batch before it would show durations only.
+fn tap_since(sql: &SqlCache, now: i64) -> Option<i64> {
+    let mut per_query: HashMap<String, Vec<i64>> = HashMap::new();
+    for e in sql.by_id.values() {
+        if let Some(b) = crate::streaming::batch_from_sql(e)
+            && let Some(t) = crate::streaming::parse_iso_ms(&e.submission_time)
+        {
+            per_query.entry(b.query_id).or_default().push(t);
+        }
+    }
+    let oldest = per_query
+        .values_mut()
+        .filter_map(|ts| {
+            ts.sort_unstable_by(|a, b| b.cmp(a));
+            ts.get(crate::streaming::MAX_BATCHES - 1)
+                .or(ts.last())
+                .copied()
+        })
+        .min()?;
+    Some((oldest - 1000).max(now - TAP_MAX_BACK_MS))
+}
 const TAP_HTTP_REFRESH: Duration = Duration::from_secs(5);
 
 /// Follow the driver log and forward only parsed progress events.
-async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Message>) {
+async fn run_tap(
+    src: LogSource,
+    driver_url: Option<String>,
+    since_ms: Option<i64>,
+    tx: mpsc::Sender<Message>,
+) {
     let status = |s: String| {
         let tx = tx.clone();
         async move {
@@ -613,14 +775,66 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
             kube, driver_pod, ..
         } => {
             let mut container: Option<&str> = None;
+            let since = since_ms.map(crate::streaming::fmt_iso_s);
+            let mut since = since;
+            let mut since_ms = since_ms;
+            // The stream ends whenever the kubelet rotates the log file or
+            // the API connection drops; a tap that stays dead after that is
+            // what "no progress events" looks like twenty minutes in. So:
+            // reconnect from the last line seen, and give up only when the
+            // pod itself is unreachable for a while.
+            let mut last_seen_ms: Option<i64> = None;
+            let mut start_failures = 0;
             loop {
-                let mut stream =
-                    match LogStream::start(&kube, &driver_pod, container, false, TAP_TAIL).await {
-                        Ok(s) => s,
-                        Err(e) => return status(format!("{e:#}")).await,
-                    };
-                status(format!("following pod/{driver_pod}")).await;
+                let mut stream = match LogStream::start(
+                    &kube,
+                    &driver_pod,
+                    container,
+                    false,
+                    TAP_TAIL,
+                    since.as_deref(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        start_failures += 1;
+                        if start_failures > TAP_MAX_START_FAILURES {
+                            return status(format!("{e:#}")).await;
+                        }
+                        status(format!("{e:#} — retrying")).await;
+                        tokio::time::sleep(TAP_RETRY).await;
+                        continue;
+                    }
+                };
+                let following = match &since {
+                    Some(s) => format!("following pod/{driver_pod} since {s}"),
+                    None => format!("following pod/{driver_pod} (last {TAP_TAIL} lines)"),
+                };
+                status(following.clone()).await;
+                let mut first_seen = false;
                 while let Ok(Some(line)) = stream.lines.next_line().await {
+                    if let Some(t) = crate::logview::line_time_ms(&line) {
+                        last_seen_ms = Some(t);
+                    }
+                    // The kubelet serves only the container's current log
+                    // file: once it has rotated (10 MiB by default), the
+                    // log starts later than asked and the batches before
+                    // that can't get their rates. Say so rather than leave
+                    // a column of dashes unexplained.
+                    if !first_seen && let Some(t) = crate::logview::line_time_ms(&line) {
+                        first_seen = true;
+                        let _ = tx.send(Message::ProgressLogStart(t)).await;
+                        if let Some(want) = since_ms
+                            && t > want + 60_000
+                        {
+                            status(format!(
+                                "{following} — the log only reaches back to {} (rotated by the kubelet; raise containerLogMaxSize/containerLogMaxFiles), so batches before that show durations only",
+                                crate::streaming::fmt_clock(t)
+                            ))
+                            .await;
+                        }
+                    }
                     if let Some(p) = parser.feed(&line)
                         && tx.send(Message::Progress(p)).await.is_err()
                     {
@@ -632,7 +846,27 @@ async fn run_tap(src: LogSource, driver_url: Option<String>, tx: mpsc::Sender<Me
                     container = Some(k8s::DRIVER_CONTAINER);
                     continue;
                 }
-                return status(format!("driver log ended: {reason}")).await;
+                if tx.is_closed() {
+                    return;
+                }
+                // Resume just after the last line we saw; the second of
+                // overlap re-feeds at most one progress block, which the
+                // app ignores as a duplicate.
+                let resume = last_seen_ms.or(since_ms).unwrap_or_else(now_ms);
+                since_ms = Some(resume);
+                since = Some(crate::streaming::fmt_iso_s(resume));
+                start_failures = 0;
+                status(format!(
+                    "driver log stream ended ({}) — reconnecting from {}",
+                    if reason.is_empty() {
+                        "rotated or connection dropped".to_string()
+                    } else {
+                        reason
+                    },
+                    crate::streaming::fmt_clock(resume)
+                ))
+                .await;
+                tokio::time::sleep(TAP_RETRY).await;
             }
         }
         LogSource::Http(client) => {
@@ -756,6 +990,7 @@ async fn fetch(
     if let Ok(tail) = sql_tail {
         state.sql.merge(tail);
     }
+    let mut msgs_extra: Vec<Message> = Vec::new();
     let snapshot = match snapshot {
         Ok(mut s) => {
             s.sql = state.sql.view();
@@ -764,6 +999,11 @@ async fn fetch(
                 .iter()
                 .find(|e| e.id == "driver")
                 .and_then(|e| e.log_url("stderr"));
+            if !state.env_fetched {
+                let env = client.environment(&spark_id).await.map_err(err);
+                state.env_fetched = env.is_ok();
+                msgs_extra.push(Message::Environment(env));
+            }
             // Needs the stage list, so it runs after the snapshot, not with it.
             s.failed_tasks = fetch_failed_tasks(&client, &spark_id, &s, state).await;
             Ok(s)
@@ -777,5 +1017,57 @@ async fn fetch(
     if let Some((detail, result)) = detail {
         msgs.push(Message::Detail { detail, result });
     }
+    msgs.extend(msgs_extra);
     msgs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(id: i64, query: &str, submitted: &str) -> ExecutionData {
+        ExecutionData {
+            id,
+            description: format!("{query}\nid = {query}\nrunId = r1\nbatch = {id}"),
+            submission_time: submitted.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tap_starts_at_the_oldest_listed_batch_with_a_margin() {
+        let mut sql = SqlCache::default();
+        for (i, t) in [
+            (1, "2026-10-01T21:24:34.000Z"),
+            (2, "2026-10-01T21:24:44.000Z"),
+            (3, "2026-10-01T21:25:00.000Z"),
+        ] {
+            sql.by_id.insert(i, batch(i, "orders-agg", t));
+        }
+        // A plain query (no batch description) doesn't count.
+        sql.by_id.insert(
+            9,
+            ExecutionData {
+                id: 9,
+                description: "SELECT 1".into(),
+                submission_time: "2026-10-01T20:00:00.000Z".into(),
+                ..Default::default()
+            },
+        );
+        let now = crate::streaming::parse_iso_ms("2026-10-01T21:40:00Z").unwrap();
+        assert_eq!(
+            tap_since(&sql, now),
+            Some(crate::streaming::parse_iso_ms("2026-10-01T21:24:33Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn tap_since_is_bounded_and_absent_without_batches() {
+        let mut sql = SqlCache::default();
+        sql.by_id
+            .insert(1, batch(1, "q", "2026-10-01T01:00:00.000Z"));
+        let now = crate::streaming::parse_iso_ms("2026-10-01T21:40:00Z").unwrap();
+        assert_eq!(tap_since(&sql, now), Some(now - TAP_MAX_BACK_MS));
+        assert_eq!(tap_since(&SqlCache::default(), now), None);
+    }
 }

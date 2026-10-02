@@ -166,6 +166,12 @@ SQL = [
               400, running=[7], submitted="2026-09-25T10:08:44.000GMT"),
 ]
 SQL_ENABLED = "--no-sql" not in sys.argv
+if "--many-queries" in sys.argv:
+    # Twenty streaming queries, one micro-batch each, to exercise the Streaming tab's query list.
+    for i in range(20):
+        SQL.append(execution(100 + i, "COMPLETED",
+                             "stream-%02d\nid = q%02d\nrunId = r%02d\nbatch = %d" % (i, i, i, 10 + i),
+                             500 + i * 10, ok=[200 + i], submitted="2026-09-25T10:09:%02d.000GMT" % i))
 
 def logs_for(eid):
     return {"stdout": "http://127.0.0.1:4040/node/containerlogs/container_%s/vishnu/stdout?start=-4096" % eid,
@@ -278,8 +284,98 @@ RDDS = [
      "partitions": []},
 ]
 
+ENVIRONMENT = {
+    "runtime": {"javaVersion": "17.0.16 (Eclipse Adoptium)", "javaHome": "/opt/java/openjdk", "scalaVersion": "version 2.13.16"},
+    "sparkProperties": [
+        ["spark.app.id", "app-20260923-0001"], ["spark.app.name", "etl-nightly"],
+        ["spark.executor.memory", "4g"], ["spark.executor.cores", "4"], ["spark.executor.memoryOverhead", "512m"],
+        ["spark.executor.instances", "2"], ["spark.driver.memory", "2g"],
+        ["spark.sql.shuffle.partitions", "200"], ["spark.sql.adaptive.enabled", "true"],
+        ["spark.dynamicAllocation.enabled", "false"], ["spark.memory.fraction", "0.6"],
+        ["spark.sql.streaming.checkpointLocation", "s3a://bucket/checkpoints"],
+        ["spark.eventLog.enabled", "true"], ["spark.eventLog.dir", "s3a://bucket/spark-events"],
+        ["spark.kubernetes.executor.deleteOnTermination", "false"],
+        ["spark.serializer", "org.apache.spark.serializer.KryoSerializer"],
+        ["spark.master", "k8s://https://10.96.0.1:443"], ["spark.submit.deployMode", "cluster"],
+    ],
+    "hadoopProperties": [["fs.s3a.connection.maximum", "96"], ["fs.s3a.endpoint", "s3.eu-west-1.amazonaws.com"]],
+    "systemProperties": [["java.version", "17.0.16"], ["user.timezone", "UTC"], ["SPARK_SUBMIT", "true"]],
+    "metricsProperties": [["*.sink.servlet.class", "org.apache.spark.metrics.sink.MetricsServlet"]],
+    "classpathEntries": [["/opt/spark/conf", "System Classpath"], ["/opt/spark/jars/spark-core_2.13-4.0.1.jar", "System Classpath"]],
+    "resourceProfiles": [{"id": 0,
+                          "executorResources": {"memory": {"resourceName": "memory", "amount": 4096},
+                                                "memoryOverhead": {"resourceName": "memoryOverhead", "amount": 512},
+                                                "offHeap": {"resourceName": "offHeap", "amount": 0},
+                                                "cores": {"resourceName": "cores", "amount": 4}},
+                          "taskResources": {"cpus": {"resourceName": "cpus", "amount": 1.0}}}],
+}
+
+PEAK = {"JVMHeapMemory": 3 * GiB, "JVMOffHeapMemory": 180 * MiB, "OnHeapExecutionMemory": 900 * MiB,
+        "OffHeapExecutionMemory": 0, "OnHeapStorageMemory": 1536 * MiB, "OffHeapStorageMemory": 0,
+        "OnHeapUnifiedMemory": 2300 * MiB, "OffHeapUnifiedMemory": 0, "DirectPoolMemory": 64 * MiB,
+        "MappedPoolMemory": 0, "ProcessTreeJVMRSSMemory": 3700 * MiB, "ProcessTreeJVMVMemory": 6 * GiB,
+        "ProcessTreePythonRSSMemory": 0, "ProcessTreePythonVMemory": 0, "ProcessTreeOtherRSSMemory": 0,
+        "ProcessTreeOtherVMemory": 0, "MinorGCCount": 420, "MinorGCTime": 180000, "MajorGCCount": 6,
+        "MajorGCTime": 60000, "ConcurrentGCCount": 0, "ConcurrentGCTime": 0, "TotalGCTime": 240000}
+MEMORY = {"usedOnHeapStorageMemory": 1536 * MiB, "usedOffHeapStorageMemory": 0,
+          "totalOnHeapStorageMemory": 2300 * MiB, "totalOffHeapStorageMemory": 0}
+
 # Completed-task counters tick up on every poll so the sparklines move.
 TICK = {"n": 0}
+
+
+def metrics_json(n):
+    """The driver's Dropwizard registry (/metrics/json/): an app source
+    ("OrdersPipeline") next to Spark's built-ins. Counters grow with n."""
+    p = ETL["id"] + ".driver."
+    hist = lambda count, mean, p95, mx: {"count": count, "max": mx, "mean": mean, "min": 1, "p50": mean,
+                                         "p75": mean * 1.3, "p95": p95, "p98": p95 * 1.2, "p99": mx * 0.8,
+                                         "p999": mx, "stddev": mean / 2}
+    timer = dict(hist(5000 + n, 2.3, 9.0, 1500.0), m1_rate=3.2, m5_rate=3.1, m15_rate=3.0, mean_rate=3.0,
+                 duration_units="milliseconds", rate_units="calls/second")
+    return {
+        "version": "4.0.0",
+        "gauges": {
+            p + "OrdersPipeline.lag-seconds": {"value": 42.5 + (n % 7)},
+            p + "OrdersPipeline.source-topic": {"value": "orders-v2"},
+            p + "OrdersPipeline.in-flight": {"value": 3 + (n % 3)},
+            p + "DAGScheduler.stage.runningStages": {"value": 1},
+            p + "DAGScheduler.stage.waitingStages": {"value": 0},
+            p + "DAGScheduler.stage.failedStages": {"value": 1},
+            p + "DAGScheduler.job.activeJobs": {"value": 1},
+            p + "BlockManager.memory.memUsed_MB": {"value": 1536},
+            p + "BlockManager.memory.remainingMem_MB": {"value": 2560},
+            p + "BlockManager.disk.diskSpaceUsed_MB": {"value": 0},
+            p + "LiveListenerBus.queue.appStatus.size": {"value": 12},
+            p + "ExecutorMetrics.JVMHeapMemory": {"value": 900 * MiB},
+            p + "jvm.heap.used": {"value": 1100 * MiB},
+            p + "spark.streaming.orders-agg.inputRate-total": {"value": 2000.0},
+            p + "spark.streaming.orders-agg.processingRate-total": {"value": 1800.0},
+            p + "spark.streaming.orders-agg.latency": {"value": 410},
+            p + "spark.streaming.orders-agg.states-rowsTotal": {"value": 2000},
+            ETL["id"] + ".1.executor.threadpool.activeTasks": {"value": 3},
+        },
+        "counters": {
+            p + "OrdersPipeline.records-rejected": {"count": 120 + 3 * n},
+            p + "OrdersPipeline.records-ok": {"count": 90000 + 2000 * n},
+            p + "LiveListenerBus.numEventsPosted": {"count": 400000 + 50 * n},
+            p + "LiveListenerBus.queue.appStatus.numDroppedEvents": {"count": 7},
+            p + "LiveListenerBus.queue.executorManagement.numDroppedEvents": {"count": 0},
+            p + "JVMCPUTime.jvmCpuTime": {"count": int(2.5e9 * n)},
+            p + "HiveExternalCatalog.fileCacheHits": {"count": 0},
+        },
+        "meters": {
+            p + "OrdersPipeline.orders-seen": {"count": 90000 + 2000 * n, "m1_rate": 1990.0, "m5_rate": 1950.0,
+                                              "m15_rate": 1900.0, "mean_rate": 1980.0, "units": "events/second"},
+        },
+        "histograms": {
+            p + "CodeGenerator.compilationTime": hist(31 + n // 5, 120.5, 400, 900),
+            p + "CodeGenerator.generatedClassSize": hist(31 + n // 5, 24000, 90000, 180000),
+        },
+        "timers": {
+            p + "DAGScheduler.messageProcessingTime": timer,
+        },
+    }
 
 
 class H(BaseHTTPRequestHandler):
@@ -323,10 +419,16 @@ class H(BaseHTTPRequestHandler):
         if rest.startswith("executors/") and rest.endswith("/threads"):
             eid = rest.split("/")[1]
             return THREADS if eid in ("1", "3", "driver") else None
+        if rest == "environment":
+            return ENVIRONMENT
         if rest == "allexecutors":
             TICK["n"] += 1
             execs = json.loads(json.dumps(EXECS))
             execs[1]["completedTasks"] += TICK["n"] * 7
+            for e in execs:
+                if e["id"] != "driver":
+                    e["memoryMetrics"] = MEMORY
+                    e["peakMemoryMetrics"] = PEAK
             return execs
         return None
 
@@ -362,7 +464,10 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(log_page(eid, stream).encode())
             return
-        body = self.route(path)
+        if path.rstrip("/") == "/metrics/json":
+            body = metrics_json(TICK["n"])
+        else:
+            body = self.route(path)
         self.send_response(200 if body is not None else 404)
         self.send_header("Content-Type", "application/json")
         self.end_headers()

@@ -2,11 +2,11 @@
 //! micro-batch SQL executions, since the REST API does not expose it.
 
 use crate::spark::ExecutionData;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// One `StreamingQueryProgress`, as logged by `ProgressReporter`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Progress {
     pub id: String,
@@ -28,7 +28,7 @@ pub struct Progress {
     pub sink: SinkProgress,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StateOperator {
     pub operator_name: String,
@@ -38,7 +38,7 @@ pub struct StateOperator {
     pub num_rows_dropped_by_watermark: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SourceProgress {
     pub description: String,
@@ -47,7 +47,7 @@ pub struct SourceProgress {
     pub processed_rows_per_second: f64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SinkProgress {
     pub description: String,
@@ -95,6 +95,21 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
         .trim_end_matches("GMT")
         .trim_end_matches("UTC");
     let (date, time) = s.split_once('T')?;
+    // A numeric offset (`+02:00`, `+0000`, `-05:00`), as log4j's JSON
+    // layout writes: strip it and shift the result back to UTC.
+    let (time, offset_ms) = match time.rfind(['+', '-']) {
+        Some(i) => {
+            let (t, off) = time.split_at(i);
+            let digits: String = off[1..].chars().filter(char::is_ascii_digit).collect();
+            let (h, m) = (
+                digits.get(0..2)?.parse::<i64>().ok()?,
+                digits.get(2..4)?.parse::<i64>().ok()?,
+            );
+            let sign = if off.starts_with('-') { -1 } else { 1 };
+            (t, sign * (h * 60 + m) * 60 * 1000)
+        }
+        None => (time, 0),
+    };
     let mut d = date.split('-').map(|p| p.parse::<i64>());
     let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
     let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
@@ -110,12 +125,63 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    Some(((days * 24 + h) * 60 + mi) * 60 * 1000 + sec * 1000 + millis)
+    Some(((days * 24 + h) * 60 + mi) * 60 * 1000 + sec * 1000 + millis - offset_ms)
+}
+
+/// Epoch millis → `2026-09-25T10:00:00Z` (the inverse of [`parse_iso_ms`],
+/// to the second), for `kubectl logs --since-time`.
+pub fn fmt_iso_s(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    // Civil from days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        sod % 3600 / 60,
+        sod % 60
+    )
+}
+
+/// `HH:MM:SS` (UTC) of an epoch-millis instant, for titles.
+pub fn fmt_clock(ms: i64) -> String {
+    let sod = ms.div_euclid(1000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", sod / 3600, sod % 3600 / 60, sod % 60)
 }
 
 // ---------------------------------------------------------------- parsing
 
 const MARKER: &str = "Streaming query made progress:";
+
+/// A structured-logging line (`{"ts":…,"level":…,"msg":…}`) → its `msg`.
+/// Cheap rejection first: nearly every line isn't one.
+pub fn structured_msg(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    if !t.starts_with('{') || !t.contains("\"msg\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    v.get("msg")?.as_str().map(str::to_string)
+}
+
+/// A structured-logging line's `ts` as epoch millis.
+pub fn structured_ts_ms(line: &str) -> Option<i64> {
+    let t = line.trim_start();
+    if !t.starts_with('{') || !t.contains("\"ts\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    parse_iso_ms(v.get("ts")?.as_str()?)
+}
 
 /// Finds progress blocks in a stream of log lines. Spark pretty-prints the
 /// JSON over many lines, so lines are buffered until the braces balance.
@@ -132,6 +198,19 @@ impl ProgressParser {
     }
 
     pub fn feed(&mut self, line: &str) -> Option<Progress> {
+        // Spark 4 structured logging (`log4j2-json-layout`): one JSON object
+        // per line with the message, newlines and all, in `msg`. Unwrap it
+        // and read the message as if it had been logged as text.
+        if let Some(msg) = structured_msg(line) {
+            if !msg.contains(MARKER) {
+                return None;
+            }
+            let mut out = None;
+            for l in msg.lines() {
+                out = self.feed(l).or(out);
+            }
+            return out;
+        }
         if let Some(i) = line.find(MARKER) {
             // A new block; whatever was buffered was truncated.
             self.buf.clear();
@@ -183,11 +262,16 @@ pub struct SqlBatch {
 }
 
 pub fn batch_from_sql(e: &ExecutionData) -> Option<SqlBatch> {
+    parse_description(&e.description)
+}
+
+/// The same, from any job/stage/execution description.
+pub fn parse_description(description: &str) -> Option<SqlBatch> {
     let mut query_id = None;
     let mut run_id = None;
     let mut batch_id = None;
     let mut name = None;
-    for line in e.description.lines().map(str::trim) {
+    for line in description.lines().map(str::trim) {
         if let Some(v) = line.strip_prefix("id = ") {
             query_id = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("runId = ") {
@@ -208,26 +292,49 @@ pub fn batch_from_sql(e: &ExecutionData) -> Option<SqlBatch> {
 
 // ------------------------------------------------------------------ model
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Batch {
     pub batch_id: i64,
     pub duration_ms: i64,
     /// From the SQL execution: RUNNING | COMPLETED | FAILED; empty if only
     /// the log reported it.
     pub status: String,
+    /// The SQL execution's submission time, when known.
+    pub submitted: String,
     pub progress: Option<Progress>,
+}
+
+impl Batch {
+    /// When the batch ran, with a second of slack either side, for slicing
+    /// the driver log. From the progress event when there is one, else from
+    /// the SQL execution.
+    pub fn window_ms(&self) -> Option<(i64, i64)> {
+        let (start, len) = match &self.progress {
+            Some(p) => (
+                parse_iso_ms(&p.timestamp)?,
+                p.trigger_ms().max(self.duration_ms),
+            ),
+            None => (parse_iso_ms(&self.submitted)?, self.duration_ms),
+        };
+        Some((start - 1000, start + len.max(0) + 1000))
+    }
 }
 
 /// Batches kept per query; a day of 5 s micro-batches would be 17k, so
 /// this is a window, not a history.
 pub const MAX_BATCHES: usize = 300;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct QueryHistory {
     pub query_id: String,
     pub run_id: String,
     pub name: Option<String>,
     pub batches: BTreeMap<i64, Batch>,
+    /// Runs this query has moved on from. The SQL list keeps the old run's
+    /// executions for a while and is re-ingested every poll; without this
+    /// they would flip the query back to the old run each time, wiping the
+    /// batches (and the progress attached to them) every two seconds.
+    pub past_runs: std::collections::HashSet<String>,
 }
 
 impl QueryHistory {
@@ -238,13 +345,21 @@ impl QueryHistory {
     }
 
     /// A restarted query gets a new run id; its old batches are history.
-    fn on_run(&mut self, run_id: &str) {
-        if self.run_id != run_id {
-            if !self.run_id.is_empty() {
-                self.batches.clear();
-            }
-            self.run_id = run_id.to_string();
+    /// Returns false for a run already superseded, whose data must be
+    /// ignored rather than allowed to roll the query back.
+    fn on_run(&mut self, run_id: &str) -> bool {
+        if self.run_id == run_id {
+            return true;
         }
+        if self.past_runs.contains(run_id) {
+            return false;
+        }
+        if !self.run_id.is_empty() {
+            self.batches.clear();
+            self.past_runs.insert(std::mem::take(&mut self.run_id));
+        }
+        self.run_id = run_id.to_string();
+        true
     }
 
     fn trim(&mut self) {
@@ -254,9 +369,31 @@ impl QueryHistory {
     }
 }
 
+impl Streaming {
+    /// When the oldest batch still listed for any live query ran: where the
+    /// log tap should start so every listed batch gets its progress.
+    pub fn oldest_batch_ms(&self) -> Option<i64> {
+        self.queries
+            .values()
+            .filter(|q| !self.retired.contains(&q.query_id))
+            .filter_map(|q| {
+                let b = q.batches.values().next()?;
+                b.progress
+                    .as_ref()
+                    .and_then(|p| parse_iso_ms(&p.timestamp))
+                    .or_else(|| parse_iso_ms(&b.submitted))
+            })
+            .min()
+    }
+}
+
 #[derive(Default)]
 pub struct Streaming {
     pub queries: BTreeMap<String, QueryHistory>,
+    /// Query name → the query id currently carrying it.
+    current: HashMap<String, String>,
+    /// Query ids superseded by a restart; their (cached) data is stale.
+    retired: std::collections::HashSet<String>,
     /// How many progress events the log tap has delivered.
     pub progress_events: usize,
     /// Batches seen only through SQL executions (no log tap).
@@ -268,9 +405,54 @@ impl Streaming {
         self.queries.is_empty()
     }
 
+    /// Queries in display order (by name), the order the tab's list and
+    /// its selection index use.
+    pub fn sorted(&self) -> Vec<&QueryHistory> {
+        let mut v: Vec<&QueryHistory> = self.queries.values().collect();
+        v.sort_by_key(|q| q.label());
+        v
+    }
+
+    /// A query restarted from a fresh checkpoint gets a new query id but
+    /// keeps its name, and Spark allows only one active query per name, so
+    /// a same-named query under a different id is the same logical query.
+    /// Returns whether data for `id` should be ingested: the current id
+    /// always; a never-seen id takes over (batches start again, as with a
+    /// new run); an id that was superseded is stale and is ignored — the SQL
+    /// cache and the HTTP log tail keep re-presenting old incarnations.
+    fn admit(&mut self, id: &str, name: Option<&str>) -> bool {
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return !self.retired.contains(id);
+        };
+        match self.current.get(name) {
+            Some(cur) if cur == id => true,
+            _ if self.retired.contains(id) => false,
+            Some(cur) => {
+                let old = cur.clone();
+                self.retired.insert(old.clone());
+                if let Some(mut q) = self.queries.remove(&old) {
+                    q.query_id = id.to_string();
+                    q.run_id.clear();
+                    q.batches.clear();
+                    q.past_runs.clear();
+                    self.queries.insert(id.to_string(), q);
+                }
+                self.current.insert(name.to_string(), id.to_string());
+                true
+            }
+            None => {
+                self.current.insert(name.to_string(), id.to_string());
+                true
+            }
+        }
+    }
+
     /// Returns false for a duplicate (same run and batch already known
     /// with progress), which the HTTP re-fetch produces constantly.
     pub fn ingest_progress(&mut self, p: Progress) -> bool {
+        if !self.admit(&p.id, p.name.as_deref()) {
+            return false;
+        }
         let q = self
             .queries
             .entry(p.id.clone())
@@ -278,7 +460,9 @@ impl Streaming {
                 query_id: p.id.clone(),
                 ..Default::default()
             });
-        q.on_run(&p.run_id);
+        if !q.on_run(&p.run_id) {
+            return false;
+        }
         if p.name.is_some() {
             q.name = p.name.clone();
         }
@@ -297,10 +481,17 @@ impl Streaming {
     }
 
     pub fn ingest_sql(&mut self, execs: &[ExecutionData]) {
-        for e in execs {
+        // Oldest first, so the newest incarnation of a restarted query is the
+        // one that ends up current.
+        let mut ordered: Vec<&ExecutionData> = execs.iter().collect();
+        ordered.sort_by_key(|e| e.id);
+        for e in ordered {
             let Some(sb) = batch_from_sql(e) else {
                 continue;
             };
+            if !self.admit(&sb.query_id, sb.name.as_deref()) {
+                continue;
+            }
             let q = self
                 .queries
                 .entry(sb.query_id.clone())
@@ -308,7 +499,9 @@ impl Streaming {
                     query_id: sb.query_id.clone(),
                     ..Default::default()
                 });
-            q.on_run(&sb.run_id);
+            if !q.on_run(&sb.run_id) {
+                continue;
+            }
             if q.name.is_none() {
                 q.name = sb.name;
             }
@@ -320,6 +513,9 @@ impl Streaming {
                 }
             });
             b.status = e.status.clone();
+            if !e.submission_time.is_empty() {
+                b.submitted = e.submission_time.clone();
+            }
             if b.progress.is_none() {
                 b.duration_ms = e.duration;
             }
@@ -347,6 +543,14 @@ pub struct QueryStats<'a> {
     pub input_series: Vec<u64>,
     pub processed_series: Vec<u64>,
     pub state_series: Vec<u64>,
+    /// `addBatch` ms per batch: the actual work.
+    pub add_batch_series: Vec<u64>,
+    /// Everything else in `durationMs` (planning, offsets, commits): overhead.
+    pub overhead_series: Vec<u64>,
+    /// Watermark lag ms per batch (0 when unknown).
+    pub lag_series: Vec<u64>,
+    /// Rows dropped by the watermark per batch.
+    pub dropped_series: Vec<u64>,
 }
 
 /// `behind` needs this many of the last `BEHIND_WINDOW` batches slow.
@@ -424,6 +628,23 @@ impl<'a> QueryStats<'a> {
             input_series: series(&|p| p.input_rows_per_second.max(0.0).round() as u64),
             processed_series: series(&|p| p.processed_rows_per_second.max(0.0).round() as u64),
             state_series: series(&|p| p.state_rows().max(0) as u64),
+            add_batch_series: series(&|p| {
+                p.duration_ms.get("addBatch").copied().unwrap_or(0).max(0) as u64
+            }),
+            overhead_series: series(&|p| {
+                p.duration_ms
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "addBatch" && k.as_str() != "triggerExecution")
+                    .map(|(_, v)| v.max(&0))
+                    .sum::<i64>() as u64
+            }),
+            lag_series: series(&|p| p.watermark_lag_ms().unwrap_or(0).max(0) as u64),
+            dropped_series: series(&|p| {
+                p.state_operators
+                    .iter()
+                    .map(|o| o.num_rows_dropped_by_watermark.max(0))
+                    .sum::<i64>() as u64
+            }),
         }
     }
 }
@@ -522,6 +743,97 @@ mod tests {
     }
 
     #[test]
+    fn iso_offsets_shift_to_utc() {
+        let utc = parse_iso_ms("2026-09-25T10:00:05.000Z").unwrap();
+        assert_eq!(parse_iso_ms("2026-09-25T10:00:05.000+0000"), Some(utc));
+        assert_eq!(parse_iso_ms("2026-09-25T12:00:05.000+02:00"), Some(utc));
+        assert_eq!(parse_iso_ms("2026-09-25T05:00:05-05:00"), Some(utc));
+    }
+
+    #[test]
+    fn structured_log_lines_are_unwrapped() {
+        let progress = r#"{\n  \"id\" : \"q1\",\n  \"runId\" : \"r1\",\n  \"name\" : \"orders\",\n  \"timestamp\" : \"2026-09-25T10:00:05.000Z\",\n  \"batchId\" : 7,\n  \"numInputRows\" : 20,\n  \"inputRowsPerSecond\" : 2.0,\n  \"processedRowsPerSecond\" : 4.0,\n  \"durationMs\" : { \"addBatch\" : 300, \"triggerExecution\" : 400 },\n  \"stateOperators\" : [ ],\n  \"sources\" : [ ],\n  \"sink\" : { \"description\" : \"x\", \"numOutputRows\" : 20 }\n}"#;
+        let line = format!(
+            r#"{{"ts":"2026-09-25T10:00:05.123+0000","level":"INFO","msg":"Streaming query made progress: {progress}","logger":"MicroBatchExecution"}}"#
+        );
+        let mut p = ProgressParser::new();
+        assert!(p.feed(r#"{"ts":"2026-09-25T10:00:04.000Z","level":"INFO","msg":"Committed offsets for batch 7","logger":"MicroBatchExecution"}"#).is_none());
+        let got = p
+            .feed(&line)
+            .expect("progress parsed from a structured line");
+        assert_eq!(got.batch_id, 7);
+        assert_eq!(got.num_input_rows, 20);
+        assert_eq!(
+            structured_ts_ms(&line),
+            parse_iso_ms("2026-09-25T10:00:05.123Z")
+        );
+        assert_eq!(structured_msg("26/10/01 18:03:15 INFO plain line"), None);
+    }
+
+    #[test]
+    fn iso_round_trips() {
+        for s in [
+            "1970-01-01T00:00:00Z",
+            "2026-09-25T10:00:05Z",
+            "2026-02-28T23:59:59Z",
+            "2024-02-29T12:00:00Z",
+            "2026-12-31T00:00:00Z",
+        ] {
+            assert_eq!(fmt_iso_s(parse_iso_ms(s).unwrap()), s);
+        }
+        assert_eq!(fmt_iso_s(1_790_330_405_900), "2026-09-25T10:00:05Z");
+        assert_eq!(fmt_clock(1_790_330_405_900), "10:00:05");
+    }
+
+    #[test]
+    fn old_run_executions_replayed_each_poll_do_not_wipe_the_new_run() {
+        let exec = |id: i64, run: &str, batch: i64| ExecutionData {
+            id,
+            status: "COMPLETED".into(),
+            description: format!("orders-raw\nid = q1\nrunId = {run}\nbatch = {batch}"),
+            submission_time: "2026-10-02T00:01:50.000Z".into(),
+            ..Default::default()
+        };
+        // The driver retains the old run's executions alongside the new
+        // run's; sparkwatch re-ingests the whole list every poll.
+        let list = vec![
+            exec(1, "old", 1510),
+            exec(2, "old", 1511),
+            exec(3, "new", 1512),
+            exec(4, "new", 1513),
+        ];
+        let mut s = Streaming::default();
+        s.ingest_sql(&list);
+        let progress = Progress {
+            id: "q1".into(),
+            run_id: "new".into(),
+            name: Some("orders-raw".into()),
+            timestamp: "2026-10-02T00:01:50.500Z".into(),
+            batch_id: 1513,
+            num_input_rows: 10_000,
+            ..Default::default()
+        };
+        assert!(s.ingest_progress(progress.clone()));
+        // Next poll: same list again.
+        s.ingest_sql(&list);
+        let q = s.queries.get("q1").unwrap();
+        assert_eq!(q.run_id, "new");
+        assert_eq!(q.batches.len(), 2, "old run's batches must not come back");
+        assert!(
+            q.batches[&1513].progress.is_some(),
+            "progress attached to the new run must survive the re-ingest"
+        );
+        // A late progress event from the old run is ignored, not applied.
+        let stale = Progress {
+            run_id: "old".into(),
+            batch_id: 1511,
+            ..progress
+        };
+        assert!(!s.ingest_progress(stale));
+        assert_eq!(s.queries["q1"].run_id, "new");
+    }
+
+    #[test]
     fn sql_description_yields_batch() {
         let e = ExecutionData {
             description: "orders-agg\nid = q1\nrunId = r1\nbatch = 42".into(),
@@ -602,5 +914,73 @@ mod tests {
         p.run_id = "r2".into();
         s.ingest_progress(p);
         assert_eq!(s.queries["q"].batches.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn p(id: &str, run: &str, name: &str, batch: i64) -> Progress {
+        Progress {
+            id: id.into(),
+            run_id: run.into(),
+            name: Some(name.into()),
+            batch_id: batch,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_data_for_a_superseded_id_is_ignored() {
+        let mut s = Streaming::default();
+        s.ingest_progress(p("q1", "r1", "orders-poison", 4));
+        s.ingest_progress(p("q2", "r2", "orders-poison", 0));
+        // The HTTP tail / SQL cache re-present the old incarnation every poll.
+        assert!(!s.ingest_progress(p("q1", "r1", "orders-poison", 4)));
+        assert_eq!(s.queries.len(), 1);
+        assert!(s.queries.contains_key("q2"));
+        assert_eq!(
+            s.queries["q2"].batches.len(),
+            1,
+            "q2's batches survive the stale replay"
+        );
+
+        // SQL executions arrive newest-first; the newest id must still win.
+        let exec = |id: i64, qid: &str, batch: i64| ExecutionData {
+            id,
+            description: format!("orders-poison\nid = {qid}\nrunId = r\nbatch = {batch}"),
+            status: "COMPLETED".into(),
+            ..Default::default()
+        };
+        let mut s2 = Streaming::default();
+        s2.ingest_sql(&[exec(30, "new", 1), exec(29, "new", 0), exec(12, "old", 4)]);
+        assert_eq!(s2.queries.len(), 1);
+        assert!(s2.queries.contains_key("new"));
+        assert_eq!(
+            s2.queries["new"]
+                .batches
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        // and the same list again changes nothing
+        s2.ingest_sql(&[exec(30, "new", 1), exec(29, "new", 0), exec(12, "old", 4)]);
+        assert_eq!(s2.queries["new"].batches.len(), 2);
+    }
+
+    #[test]
+    fn same_name_new_id_is_one_query_not_two() {
+        let mut s = Streaming::default();
+        s.ingest_progress(p("q1", "r1", "orders-poison", 4));
+        s.ingest_progress(p("q2", "r2", "orders-poison", 0)); // fresh checkpoint restart
+        s.ingest_progress(p("q2", "r2", "orders-poison", 1));
+        assert_eq!(s.queries.len(), 1, "one logical query");
+        let q = &s.queries["q2"];
+        assert_eq!(q.batches.keys().copied().collect::<Vec<_>>(), [0, 1]);
+        // Differently named queries stay separate.
+        s.ingest_progress(p("q3", "r3", "orders-raw", 9));
+        assert_eq!(s.queries.len(), 2);
     }
 }

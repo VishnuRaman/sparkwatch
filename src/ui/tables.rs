@@ -2,8 +2,8 @@
 
 use super::fmt_millis;
 use super::{
-    display_name, fmt_bytes, header_row, mini_bar, selected_style, short_time, status_style,
-    table_block, warn_if,
+    Labels, display_name, fmt_bytes, header_row, mini_bar, selected_style, short_time,
+    status_style, table_block, warn_if,
 };
 use crate::spark::{ExecutionData, ExecutorSummary, JobData, StageData};
 use ratatui::{
@@ -19,6 +19,7 @@ pub fn draw_jobs(
     area: Rect,
     jobs: &[&JobData],
     title: String,
+    labels: &Labels,
     state: &mut TableState,
 ) {
     let rows: Vec<Row> = jobs
@@ -27,12 +28,10 @@ pub fn draw_jobs(
             Row::new(vec![
                 Cell::from(j.job_id.to_string()),
                 Cell::from(j.status.clone()).style(status_style(&j.status)),
-                Cell::from(
-                    display_name(&j.name, j.description.as_deref())
-                        .chars()
-                        .take(48)
-                        .collect::<String>(),
-                ),
+                Cell::from(labels.with_run(
+                    display_name(&j.name, j.description.as_deref(), labels.job(j.job_id)),
+                    j.description.as_deref(),
+                )),
                 Cell::from(short_time(&j.submission_time)),
                 Cell::from(format!("{}/{}", j.num_completed_tasks, j.num_tasks)),
                 Cell::from(j.num_failed_tasks.to_string()).style(warn_if(j.num_failed_tasks)),
@@ -77,6 +76,7 @@ pub fn draw_stages(
     area: Rect,
     stages: &[&StageData],
     title: String,
+    labels: &Labels,
     state: &mut TableState,
 ) {
     let rows: Vec<Row> = stages
@@ -94,12 +94,14 @@ pub fn draw_stages(
                     }
                 )),
                 Cell::from(st.status.clone()).style(status_style(&st.status)),
-                Cell::from(
-                    display_name(&st.name, st.description.as_deref())
-                        .chars()
-                        .take(40)
-                        .collect::<String>(),
-                ),
+                Cell::from(labels.with_run(
+                    display_name(
+                        &st.name,
+                        st.description.as_deref(),
+                        labels.stage(st.stage_id),
+                    ),
+                    st.description.as_deref(),
+                )),
                 Cell::from(format!("{}/{}", st.num_complete_tasks, st.num_tasks)),
                 Cell::from(fmt_bytes(st.input_bytes)),
                 Cell::from(fmt_bytes(st.shuffle_read_bytes)),
@@ -198,6 +200,11 @@ pub fn draw_executors(
                     Style::default()
                 }),
                 Cell::from(fmt_bytes(e.total_shuffle_read)),
+                Cell::from(executor_age(e)).style(if e.is_active {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Red)
+                }),
             ])
         })
         .collect();
@@ -214,16 +221,34 @@ pub fn draw_executors(
             Constraint::Length(11),
             Constraint::Length(7),
             Constraint::Length(10),
+            Constraint::Length(12),
         ],
     )
     .header(header_row(&[
-        "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R",
+        "EXEC", "STATE", "HOST", "TASKS", "FAILED", "STORAGE", "MEM", "GC", "SHUF R", "AGE",
     ]))
     .block(table_block(title))
     .row_highlight_style(selected_style())
     .highlight_symbol("▌");
 
     f.render_stateful_widget(table, area, state);
+}
+
+/// How long the executor has been around, or how long ago it went.
+fn executor_age(e: &ExecutorSummary) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let since = |ts: &str| crate::streaming::parse_iso_ms(ts).map(|t| (now - t).max(0));
+    match (&e.remove_time, since(&e.add_time)) {
+        (Some(rt), _) => match since(rt) {
+            Some(ago) => format!("gone {}", fmt_millis(ago)),
+            None => "gone".into(),
+        },
+        (None, Some(age)) => fmt_millis(age),
+        _ => "-".into(),
+    }
 }
 
 pub fn draw_sql(
@@ -267,7 +292,7 @@ pub fn draw_sql(
             Row::new(vec![
                 Cell::from(e.id.to_string()),
                 Cell::from(e.status.clone()).style(status_style(&e.status)),
-                Cell::from(e.title().chars().take(70).collect::<String>()),
+                Cell::from(display_name(e.title(), Some(&e.description), None)),
                 Cell::from(short_time(&Some(e.submission_time.clone()))),
                 Cell::from(fmt_millis(e.duration)),
                 Cell::from(jobs).style(if e.failed_job_ids.is_empty() {

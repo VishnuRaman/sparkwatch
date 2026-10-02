@@ -58,14 +58,29 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
         return;
     }
 
-    let queries: Vec<&QueryHistory> = s.queries.values().collect();
+    // By name, so j/k and the selected index don't shift when a restarted
+    // query comes back under a new (random) id.
+    let mut queries: Vec<&QueryHistory> = s.queries.values().collect();
+    queries.sort_by_key(|q| q.label());
     let sel = selected.min(queries.len() - 1);
     let others = queries.len().saturating_sub(1);
 
     // Selected query gets the panel; the rest one summary row each.
+    // The list never takes more than a third of the screen; it scrolls so
+    // the selected query is always in view.
+    let list_rows = if others > 0 {
+        queries.len().min((area.height as usize / 3).max(3))
+    } else {
+        0
+    };
+    let list_scroll = sel.saturating_sub(list_rows.saturating_sub(1));
     let [panel, list, foot] = Layout::vertical([
-        Constraint::Min(14),
-        Constraint::Length(if others > 0 { others as u16 + 2 } else { 0 }),
+        Constraint::Min(20),
+        Constraint::Length(if list_rows > 0 {
+            list_rows as u16 + 2
+        } else {
+            0
+        }),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -102,12 +117,20 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Streaming, status: Option<&str>, sele
                 line
             })
             .collect();
+        let title = if list_rows < queries.len() {
+            format!(
+                " Queries ({}) · showing {}-{} · j/k select ",
+                queries.len(),
+                list_scroll + 1,
+                (list_scroll + list_rows).min(queries.len())
+            )
+        } else {
+            format!(" Queries ({}) · j/k select ", queries.len())
+        };
         f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Queries ({}) · j/k select ", queries.len())),
-            ),
+            Paragraph::new(lines)
+                .scroll((list_scroll as u16, 0))
+                .block(Block::default().borders(Borders::ALL).title(title)),
             list,
         );
     }
@@ -131,12 +154,15 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [head, charts, detail] = Layout::vertical([
+    let [head, charts, charts2, detail, recent] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(7),
-        Constraint::Min(3),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Min(4),
     ])
     .areas(inner);
+    draw_charts2(f, charts2, &st);
 
     // ---- header: latest batch and the verdict
     let latest = st.latest;
@@ -341,15 +367,176 @@ fn draw_query(f: &mut Frame, area: Rect, q: &QueryHistory) {
             p.timestamp.clone().into(),
         ]));
     } else {
-        lines.push(Line::from("latest batches: ".dark_gray()));
-        for b in q.batches.values().rev().take(5) {
-            lines.push(Line::from(vec![
-                format!("  batch {} ", b.batch_id).into(),
-                fmt_millis(b.duration_ms).into(),
-                "  ".into(),
-                Span::styled(b.status.clone(), super::status_style(&b.status)),
-            ]));
-        }
+        lines.push(Line::from(
+            "no progress event for the latest batch — rates and breakdown need the driver log"
+                .dark_gray(),
+        ));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
+
+    draw_recent_batches(f, recent, q, &st);
+}
+
+/// Second row of charts: where the time goes, and the watermark's story.
+fn draw_charts2(f: &mut Frame, area: Rect, st: &QueryStats) {
+    let [a, b, c, d] = Layout::horizontal([Constraint::Percentage(25); 4]).areas(area);
+    let w = |r: Rect| r.width.saturating_sub(2) as usize;
+    let last = |v: &[u64]| v.last().copied().unwrap_or(0);
+    let max = |v: &[u64]| v.iter().max().copied().unwrap_or(0);
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.add_batch_series, w(a)))
+            .style(Style::default().fg(Color::Cyan))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " addBatch (the work) · {} · max {} ",
+                fmt_millis(last(&st.add_batch_series) as i64),
+                fmt_millis(max(&st.add_batch_series) as i64)
+            ))),
+        a,
+    );
+    let overhead_hot =
+        last(&st.overhead_series) > last(&st.add_batch_series) && last(&st.overhead_series) > 0;
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.overhead_series, w(b)))
+            .style(Style::default().fg(if overhead_hot {
+                Color::Red
+            } else {
+                Color::Blue
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " planning + offsets + commits · {}{} ",
+                fmt_millis(last(&st.overhead_series) as i64),
+                if overhead_hot {
+                    " · more than the work: driver-side overhead"
+                } else {
+                    ""
+                }
+            ))),
+        b,
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.lag_series, w(c)))
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " watermark lag · {} ",
+                if last(&st.lag_series) > 0 {
+                    fmt_millis(last(&st.lag_series) as i64)
+                } else {
+                    "-".into()
+                }
+            ))),
+        c,
+    );
+    let dropped_total: u64 = st.dropped_series.iter().sum();
+    f.render_widget(
+        Sparkline::default()
+            .data(tail(&st.dropped_series, w(d)))
+            .style(Style::default().fg(if dropped_total > 0 {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " rows dropped by watermark · {} in window ",
+                fmt_num(dropped_total as i64)
+            ))),
+        d,
+    );
+}
+
+/// One row per batch, newest first: the per-batch history that the
+/// Structured Streaming UI page has and the REST API does not.
+fn draw_recent_batches(f: &mut Frame, area: Rect, q: &QueryHistory, st: &QueryStats) {
+    use ratatui::widgets::{Cell, Row, Table};
+
+    let rows: Vec<Row> =
+        q.batches
+            .values()
+            .rev()
+            .take(area.height.saturating_sub(3) as usize)
+            .map(|b| {
+                let p = b.progress.as_ref();
+                let status = if b.status.is_empty() {
+                    "-"
+                } else {
+                    b.status.as_str()
+                };
+                let slow = st.p95_ms > 0 && b.duration_ms > st.p95_ms;
+                let behind = p.is_some_and(|p| {
+                    p.num_input_rows > 0 && p.processed_rows_per_second < p.input_rows_per_second
+                });
+                let row = Row::new(vec![
+                    Cell::from(b.batch_id.to_string()),
+                    Cell::from(status).style(super::status_style(status)),
+                    Cell::from(fmt_millis(b.duration_ms)).style(if slow {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    }),
+                    Cell::from(p.map_or("-".into(), |p| fmt_num(p.num_input_rows))),
+                    Cell::from(p.map_or("-".into(), |p| fmt_rate(p.input_rows_per_second))),
+                    Cell::from(p.map_or("-".into(), |p| fmt_rate(p.processed_rows_per_second)))
+                        .style(if behind {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        }),
+                    Cell::from(p.map_or("-".into(), |p| fmt_num(p.state_rows()))),
+                    Cell::from(p.map_or("-".into(), |p| {
+                        p.duration_ms
+                            .get("addBatch")
+                            .map(|v| fmt_millis(*v))
+                            .unwrap_or_else(|| "-".into())
+                    })),
+                    Cell::from(p.map_or("-".into(), |p| {
+                        p.watermark_lag_ms()
+                            .map(fmt_millis)
+                            .unwrap_or_else(|| "-".into())
+                    })),
+                    Cell::from(p.map_or(String::new(), |p| {
+                        p.timestamp.chars().skip(11).take(8).collect::<String>()
+                    })),
+                ]);
+                if status == "FAILED" {
+                    row.style(Style::default().fg(Color::Red))
+                } else {
+                    row
+                }
+            })
+            .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(8),
+        ],
+    )
+    .header(super::header_row(&[
+        "BATCH",
+        "STATUS",
+        "TRIGGER",
+        "INPUT ROWS",
+        "IN/S",
+        "PROCESSED/S",
+        "STATE ROWS",
+        "ADDBATCH",
+        "WM LAG",
+        "AT",
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Recent batches ({} kept) · yellow trigger = above p95 · red rate = behind ",
+        q.batches.len()
+    )));
+    f.render_widget(table, area);
 }

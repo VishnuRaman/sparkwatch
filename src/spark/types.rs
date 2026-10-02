@@ -4,10 +4,10 @@
 //! older/newer Spark release degrades to a zero value instead of failing the
 //! whole deserialization.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ApplicationInfo {
     pub id: String,
@@ -15,7 +15,7 @@ pub struct ApplicationInfo {
     pub attempts: Vec<Attempt>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Attempt {
     pub attempt_id: Option<String>,
@@ -28,7 +28,7 @@ pub struct Attempt {
     pub app_spark_version: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct JobData {
     pub job_id: i64,
@@ -59,7 +59,7 @@ impl JobData {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StageData {
     /// ACTIVE | COMPLETE | FAILED | PENDING | SKIPPED
@@ -78,7 +78,9 @@ pub struct StageData {
     pub submission_time: Option<String>,
     pub completion_time: Option<String>,
     pub input_bytes: i64,
+    pub input_records: i64,
     pub output_bytes: i64,
+    pub output_records: i64,
     pub shuffle_read_bytes: i64,
     pub shuffle_write_bytes: i64,
     pub memory_bytes_spilled: i64,
@@ -116,7 +118,7 @@ impl StageData {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExecutorSummary {
     pub id: String,
@@ -149,9 +151,29 @@ pub struct ExecutorSummary {
     pub is_blacklisted: bool,
     /// `stdout` / `stderr` → URL, on YARN and standalone. Empty on Kubernetes.
     pub executor_logs: HashMap<String, String>,
+    /// Storage memory split on/off heap (Spark 2.1+).
+    pub memory_metrics: Option<MemoryMetrics>,
+    /// Peak values per metric name (`JVMHeapMemory`, `OnHeapExecutionMemory`,
+    /// `ProcessTreePythonRSSMemory`, `MajorGCTime`, …); needs
+    /// `spark.executor.processTreeMetrics.enabled` for the ProcessTree ones.
+    pub peak_memory_metrics: Option<HashMap<String, i64>>,
+    pub resource_profile_id: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryMetrics {
+    pub used_on_heap_storage_memory: i64,
+    pub used_off_heap_storage_memory: i64,
+    pub total_on_heap_storage_memory: i64,
+    pub total_off_heap_storage_memory: i64,
 }
 
 impl ExecutorSummary {
+    pub fn peak(&self, name: &str) -> Option<i64> {
+        self.peak_memory_metrics.as_ref()?.get(name).copied()
+    }
+
     pub fn log_url(&self, stream: &str) -> Option<String> {
         self.executor_logs.get(stream).cloned()
     }
@@ -168,7 +190,7 @@ impl ExecutorSummary {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExecutorStageSummary {
     pub task_time: i64,
@@ -196,7 +218,7 @@ impl ExecutorStageSummary {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskData {
     pub task_id: i64,
@@ -226,7 +248,7 @@ impl TaskData {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskMetrics {
     pub executor_deserialize_time: i64,
@@ -244,21 +266,21 @@ pub struct TaskMetrics {
     pub shuffle_write_metrics: ShuffleWriteMetrics,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InputMetrics {
     pub bytes_read: i64,
     pub records_read: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OutputMetrics {
     pub bytes_written: i64,
     pub records_written: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShuffleReadMetrics {
     pub remote_blocks_fetched: i64,
@@ -276,7 +298,7 @@ impl ShuffleReadMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShuffleWriteMetrics {
     pub bytes_written: i64,
@@ -286,7 +308,7 @@ pub struct ShuffleWriteMetrics {
 
 /// Per-metric quantiles from `taskSummary`. Every vector is parallel to
 /// `quantiles`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TaskMetricDistributions {
     pub quantiles: Vec<f64>,
@@ -304,21 +326,21 @@ pub struct TaskMetricDistributions {
     pub shuffle_write_metrics: ShuffleWriteMetricDistributions,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InputMetricDistributions {
     pub bytes_read: Vec<f64>,
     pub records_read: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OutputMetricDistributions {
     pub bytes_written: Vec<f64>,
     pub records_written: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShuffleReadMetricDistributions {
     pub read_bytes: Vec<f64>,
@@ -327,7 +349,7 @@ pub struct ShuffleReadMetricDistributions {
     pub remote_bytes_read: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShuffleWriteMetricDistributions {
     pub write_bytes: Vec<f64>,
@@ -335,8 +357,63 @@ pub struct ShuffleWriteMetricDistributions {
     pub write_time: Vec<f64>,
 }
 
+/// `GET /environment`: everything the Environment tab shows. The property
+/// lists are `[key, value]` pairs.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ApplicationEnvironmentInfo {
+    pub runtime: RuntimeInfo,
+    pub spark_properties: Vec<(String, String)>,
+    pub hadoop_properties: Vec<(String, String)>,
+    pub system_properties: Vec<(String, String)>,
+    pub metrics_properties: Vec<(String, String)>,
+    pub classpath_entries: Vec<(String, String)>,
+    pub resource_profiles: Vec<ResourceProfileInfo>,
+}
+
+impl ApplicationEnvironmentInfo {
+    pub fn spark(&self, key: &str) -> Option<&str> {
+        self.spark_properties
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuntimeInfo {
+    pub java_version: String,
+    pub java_home: String,
+    pub scala_version: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResourceProfileInfo {
+    pub id: i64,
+    /// `memory`, `memoryOverhead`, `offHeap`, `cores`, `gpu`, … → amount
+    pub executor_resources: HashMap<String, ExecutorResourceRequest>,
+    pub task_resources: HashMap<String, TaskResourceRequest>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutorResourceRequest {
+    pub resource_name: String,
+    /// MiB for memory-type resources, a count otherwise.
+    pub amount: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TaskResourceRequest {
+    pub resource_name: String,
+    pub amount: f64,
+}
+
 /// A cached RDD / DataFrame from `storage/rdd`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RddStorageInfo {
     pub id: i64,
@@ -362,7 +439,7 @@ impl RddStorageInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RddDataDistribution {
     /// `host:port` of the block manager (the executor).
@@ -374,7 +451,7 @@ pub struct RddDataDistribution {
     pub off_heap_memory_used: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RddPartitionInfo {
     pub block_name: String,
@@ -385,7 +462,7 @@ pub struct RddPartitionInfo {
 }
 
 /// One thread from `executors/{id}/threads`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ThreadStackTrace {
     pub thread_id: i64,
@@ -420,7 +497,7 @@ impl ThreadStackTrace {
 
 /// Spark 3.x serialises `StackTrace(elems)` as `{"elems": [...]}`; some
 /// builds flatten it to an array, and 2.x sent one string. Accept all three.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StackTrace {
     Wrapped { elems: Vec<String> },
@@ -435,7 +512,7 @@ impl Default for StackTrace {
 }
 
 /// One Spark SQL execution (a query, or a micro-batch of a streaming query).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExecutionData {
     pub id: i64,
@@ -462,7 +539,7 @@ impl ExecutionData {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SqlNode {
     pub node_id: i64,
@@ -472,7 +549,7 @@ pub struct SqlNode {
 }
 
 /// Values arrive pre-formatted by Spark ("1,234,567", "2.1 GiB", "12.3 s").
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SqlMetric {
     pub name: String,
@@ -480,7 +557,7 @@ pub struct SqlMetric {
 }
 
 /// Everything the stage drill-down shows, fetched together.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StageDetail {
     pub stage: StageData,
     /// `None` until at least one task has completed (Spark 404s before that).
@@ -491,7 +568,7 @@ pub struct StageDetail {
 }
 
 /// One consistent poll of everything the UI displays.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub app: ApplicationInfo,
     pub jobs: Vec<JobData>,
@@ -505,6 +582,9 @@ pub struct Snapshot {
     pub failed_tasks: Vec<((i64, i64), Vec<TaskData>)>,
     /// Cached RDDs / DataFrames, largest first.
     pub rdds: Vec<RddStorageInfo>,
+    /// The driver's metrics registry (`/metrics/json/`): `None` when the
+    /// endpoint doesn't serve it (History Server, servlet sink disabled).
+    pub metrics: Option<Vec<crate::metrics::Metric>>,
 }
 
 #[cfg(test)]
@@ -619,6 +699,41 @@ mod tests {
         let e = &s.executor_summary["1"];
         assert_eq!(e.tasks(), 100);
         assert!(e.excluded());
+    }
+
+    #[test]
+    fn parses_environment_and_memory_metrics() {
+        let env: ApplicationEnvironmentInfo = serde_json::from_str(r#"{
+            "runtime":{"javaVersion":"17.0.16 (Eclipse Adoptium)","javaHome":"/opt/java/openjdk","scalaVersion":"version 2.13.16"},
+            "sparkProperties":[["spark.app.id","spark-1"],["spark.executor.memory","1g"]],
+            "hadoopProperties":[["fs.s3a.connection.maximum","96"]],
+            "systemProperties":[["java.version","17.0.16"]],
+            "metricsProperties":[],
+            "classpathEntries":[["/opt/spark/conf","System Classpath"]],
+            "resourceProfiles":[{"id":0,"executorResources":{"memory":{"resourceName":"memory","amount":1024},
+                "memoryOverhead":{"resourceName":"memoryOverhead","amount":256},"cores":{"resourceName":"cores","amount":1}},
+                "taskResources":{"cpus":{"resourceName":"cpus","amount":1.0}}}]
+        }"#).unwrap();
+        assert_eq!(env.spark("spark.executor.memory"), Some("1g"));
+        assert_eq!(env.runtime.scala_version, "version 2.13.16");
+        assert_eq!(
+            env.resource_profiles[0].executor_resources["memoryOverhead"].amount,
+            256
+        );
+
+        let e: Vec<ExecutorSummary> = serde_json::from_str(r#"[{"id":"1",
+            "memoryMetrics":{"usedOnHeapStorageMemory":795535637,"usedOffHeapStorageMemory":0,
+                             "totalOnHeapStorageMemory":434031820,"totalOffHeapStorageMemory":0},
+            "peakMemoryMetrics":{"JVMHeapMemory":734003200,"OnHeapExecutionMemory":12582912,"MajorGCTime":1200}}]"#).unwrap();
+        assert_eq!(
+            e[0].memory_metrics
+                .as_ref()
+                .unwrap()
+                .used_on_heap_storage_memory,
+            795535637
+        );
+        assert_eq!(e[0].peak("JVMHeapMemory"), Some(734003200));
+        assert_eq!(e[0].peak("nope"), None);
     }
 
     #[test]

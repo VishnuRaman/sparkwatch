@@ -4,7 +4,9 @@ mod app;
 mod config;
 mod k8s;
 mod logview;
+mod metrics;
 mod poller;
+mod report;
 mod spark;
 mod streaming;
 mod threads;
@@ -86,6 +88,19 @@ struct Cli {
     /// List the targets in the config file and exit
     #[arg(long)]
     targets: bool,
+
+    /// Headless: connect, collect one snapshot (plus streaming progress for a
+    /// few seconds), write a bundle into --out and exit
+    #[arg(long)]
+    dump: bool,
+
+    /// Directory for bundles written by --dump and the D key
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    out: std::path::PathBuf,
+
+    /// Log lines per executor to include in a bundle (0 = no logs)
+    #[arg(long, value_name = "N", default_value_t = 2000)]
+    dump_logs: usize,
 }
 
 /// Fold a named config target into the CLI: the target supplies what the
@@ -181,8 +196,18 @@ async fn main() -> Result<()> {
         task,
     } = poller::spawn(source, watch.clone(), interval);
 
-    let mut terminal = ratatui::init();
     let mut app = App::new(endpoint, interval, watch);
+    app.dump_dir = cli.out.clone();
+    app.dump_logs = cli.dump_logs;
+
+    if cli.dump {
+        let result = run_headless(&mut app, &mut msg_rx, &req_tx).await;
+        let _ = req_tx.send(Request::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        return result;
+    }
+
+    let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &mut msg_rx, &req_tx).await;
     ratatui::restore();
 
@@ -230,6 +255,9 @@ async fn run(
                 Message::Snapshot { app_id, result } => {
                     if !app.paused {
                         app.apply_snapshot(&app_id, result);
+                        if let Some(keys) = app.maybe_auto_summary() {
+                            send(req_tx, Request::FetchStageSummaries(keys)).await;
+                        }
                     }
                 }
                 Message::Detail { detail, result } => {
@@ -240,7 +268,11 @@ async fn run(
                 Message::Log(event) => app.apply_log(event),
                 Message::Threads { executor_id, result } => app.apply_threads(&executor_id, result),
                 Message::Progress(p) => app.apply_progress(p),
+                Message::Environment(result) => app.apply_environment(result),
+                Message::StageSummaries(v) => app.apply_stage_summaries(v),
+                Message::LogDump(logs) => app.write_dump(logs),
                 Message::ProgressStatus(s) => app.streaming_status = Some(s),
+            Message::ProgressLogStart(t) => app.progress_log_start = Some(t),
             },
             _ = tick.tick() => {}
         }
@@ -248,6 +280,7 @@ async fn run(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>) {
+    app.notice = None;
     // Typing a filter: every key is text until Enter/Esc.
     if app.filter_input_key(key.code) {
         return;
@@ -263,6 +296,23 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
         KeyCode::Up | KeyCode::Char('k') => return app.move_selection(-1),
         KeyCode::PageDown => return app.move_selection(10),
         KeyCode::PageUp => return app.move_selection(-10),
+        // A bundle from anywhere: ask the poller for log tails, write on reply.
+        KeyCode::Char('D') => {
+            if app.dump_logs == 0 {
+                app.write_dump(Vec::new());
+            } else {
+                app.notice = Some("collecting log tails for the bundle…".into());
+                send(
+                    req_tx,
+                    Request::DumpLogs {
+                        executors: app.dump_executor_ids(),
+                        lines: app.dump_logs,
+                    },
+                )
+                .await;
+            }
+            return;
+        }
         KeyCode::Char('g') | KeyCode::Home => return app.select_edge(false),
         KeyCode::Char('G') | KeyCode::End => return app.select_edge(true),
         // Waking the poller early: it is parked in a select! on this channel.
@@ -318,6 +368,38 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
             }
             _ => {}
         },
+        View::Summary => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_summary(),
+            _ => {}
+        },
+        View::ExecutorMemory => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_executor_memory(),
+            KeyCode::Char('L') => open_logs(app, req_tx, App::open_logs_selected_executor).await,
+            KeyCode::Char('t') => {
+                if let Some(id) = app.open_threads_selected_executor() {
+                    send(req_tx, Request::FetchThreads(id)).await;
+                }
+            }
+            _ => {}
+        },
+        View::Batches => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_batches(),
+            KeyCode::Enter => {
+                app.open_batch();
+            }
+            _ => {}
+        },
+        View::Batch => match key.code {
+            KeyCode::Esc | KeyCode::Backspace => app.close_batch(),
+            KeyCode::Enter => {
+                if let Some(target) = app.open_batch_stage() {
+                    send(req_tx, Request::SetDetail(Some(target))).await;
+                    send(req_tx, Request::RefreshNow).await;
+                }
+            }
+            KeyCode::Char('L') => open_logs(app, req_tx, App::open_batch_logs).await,
+            _ => {}
+        },
         View::Alert => match key.code {
             KeyCode::Esc | KeyCode::Backspace => app.close_alert(),
             KeyCode::Char('s') => open_alert_stage(app, req_tx).await,
@@ -331,7 +413,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 send(req_tx, Request::CloseLogs).await;
             }
             KeyCode::Char('/') => app.logs.start_filter(),
-            KeyCode::Char('c') => app.logs.clear_filter(),
+            KeyCode::Char('c') => open_logs(app, req_tx, App::logs_widen).await,
             KeyCode::Char('w') => app.logs.wrap = !app.logs.wrap,
             KeyCode::Char('F') => app.logs.scroll_to_end(),
             KeyCode::Char('P') => open_logs(app, req_tx, App::logs_toggle_previous).await,
@@ -388,6 +470,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 }
                 app::Tab::Jobs => app.filter_stages_by_selected_job(),
                 app::Tab::Failures => app.open_alert(),
+                app::Tab::Metrics => app.toggle_metric_pin(),
+                app::Tab::Streaming => {
+                    app.open_batches();
+                }
                 app::Tab::Storage => {
                     if let Some(target) = app.open_rdd_detail() {
                         send(req_tx, Request::SetDetail(Some(target))).await;
@@ -397,6 +483,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 _ => {}
             },
             KeyCode::Char('x') => app.alerts.acknowledge(),
+            KeyCode::Char('S') => {
+                let keys = app.open_summary();
+                if !keys.is_empty() {
+                    send(req_tx, Request::FetchStageSummaries(keys)).await;
+                }
+            }
             KeyCode::Char('s') if app.tab == app::Tab::Failures => {
                 open_alert_stage(app, req_tx).await;
             }
@@ -411,6 +503,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                     send(req_tx, Request::FetchThreads(id)).await;
                 }
             }
+            KeyCode::Char('m') if app.tab == app::Tab::Executors => app.open_executor_memory(),
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 app.tab = app.tab.next();
                 tap_if_streaming(app, req_tx).await;
@@ -419,7 +512,8 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 app.tab = app.tab.prev();
                 tap_if_streaming(app, req_tx).await;
             }
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char('0') => app.tab = app::Tab::Metrics,
+            KeyCode::Char(c @ '1'..='9') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
                 tap_if_streaming(app, req_tx).await;
             }
@@ -441,11 +535,119 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
     }
 }
 
+/// `--dump`: no terminal. Wait for a snapshot and the environment, give the
+/// streaming tap a few seconds if the app has micro-batches, fetch the
+/// slowest stages' quantiles and the log tails, write the bundle, exit.
+async fn run_headless(
+    app: &mut App,
+    msg_rx: &mut mpsc::Receiver<Message>,
+    req_tx: &mpsc::Sender<Request>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut have_snapshot = false;
+    let mut have_env = false;
+    let mut tap_started: Option<tokio::time::Instant> = None;
+    let mut asked = false;
+    let mut have_summaries = false;
+    let mut have_logs = false;
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let msg = match tokio::time::timeout(remaining, msg_rx.recv()).await {
+            Ok(Some(m)) => m,
+            _ => break,
+        };
+        match msg {
+            Message::Apps(result) => {
+                if let Some(id) = app.apply_apps(result) {
+                    send(req_tx, Request::WatchApp(id)).await;
+                } else if app.watching.is_none() {
+                    anyhow::bail!(
+                        "{} applications listed; pick one with --app <id> (or the name under --k8s)",
+                        app.apps.len()
+                    );
+                }
+            }
+            Message::Snapshot { app_id, result } => {
+                app.apply_snapshot(&app_id, result);
+                have_snapshot = app.snapshot.is_some();
+                if let Some(e) = &app.last_error
+                    && !have_snapshot
+                {
+                    anyhow::bail!("{e}");
+                }
+                // Streaming app: tap the driver log for progress events.
+                if tap_started.is_none() && !app.streaming.is_empty() {
+                    let since_ms = app.streaming.oldest_batch_ms();
+                    send(req_tx, Request::TapProgress { since_ms }).await;
+                    tap_started = Some(tokio::time::Instant::now());
+                }
+            }
+            Message::Environment(result) => {
+                app.apply_environment(result);
+                have_env = true;
+            }
+            Message::Progress(p) => app.apply_progress(p),
+            Message::ProgressStatus(s) => app.streaming_status = Some(s),
+            Message::ProgressLogStart(t) => app.progress_log_start = Some(t),
+            Message::StageSummaries(v) => {
+                app.apply_stage_summaries(v);
+                have_summaries = true;
+            }
+            Message::LogDump(logs) => {
+                app.write_dump(logs);
+                have_logs = true;
+            }
+            _ => {}
+        }
+
+        let tap_done = tap_started.is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
+        if have_snapshot && have_env && !asked {
+            if tap_started.is_some() && !tap_done {
+                // Keep polling; the loop wakes on the next snapshot/progress.
+                continue;
+            }
+            asked = true;
+            let keys = app.stages_needing_summaries();
+            if keys.is_empty() {
+                have_summaries = true;
+            } else {
+                send(req_tx, Request::FetchStageSummaries(keys)).await;
+            }
+            if app.dump_logs == 0 {
+                app.write_dump(Vec::new());
+                have_logs = true;
+            } else {
+                send(
+                    req_tx,
+                    Request::DumpLogs {
+                        executors: app.dump_executor_ids(),
+                        lines: app.dump_logs,
+                    },
+                )
+                .await;
+            }
+        }
+        if asked && have_summaries && have_logs {
+            break;
+        }
+    }
+    match app.notice.take() {
+        Some(n) if n.starts_with("wrote ") => {
+            println!("{n}");
+            Ok(())
+        }
+        Some(n) => anyhow::bail!("{n}"),
+        None => anyhow::bail!("timed out before a snapshot and the environment arrived"),
+    }
+}
+
 /// The first visit to the Streaming tab starts the driver log tap, which
 /// then runs for as long as this app is watched.
 async fn tap_if_streaming(app: &mut App, req_tx: &mpsc::Sender<Request>) {
     if app.tab == app::Tab::Streaming && app.want_tap() {
-        send(req_tx, Request::TapProgress).await;
+        let since_ms = app.streaming.oldest_batch_ms();
+        send(req_tx, Request::TapProgress { since_ms }).await;
     }
 }
 

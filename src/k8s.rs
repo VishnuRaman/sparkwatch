@@ -211,9 +211,16 @@ impl LogStream {
         container: Option<&str>,
         previous: bool,
         tail: usize,
+        since: Option<&str>,
     ) -> Result<Self> {
         let mut cmd = kube.cmd();
-        cmd.args(["logs", "-f", &format!("--tail={tail}")]);
+        cmd.args(["logs", "-f"]);
+        // From a point in time (RFC 3339) rather than the last `tail` lines;
+        // both together would keep only the tail of what's after `since`.
+        match since {
+            Some(t) => cmd.arg(format!("--since-time={t}")),
+            None => cmd.arg(format!("--tail={tail}")),
+        };
         if previous {
             cmd.arg("--previous");
         }
@@ -244,6 +251,40 @@ impl LogStream {
         }
         err.trim().to_string()
     }
+}
+
+/// The last `lines` lines of a pod's log, in one shot (no follow). Retries
+/// with Spark's container name if the pod has sidecars.
+pub async fn log_tail(
+    kube: &Kube,
+    pod: &str,
+    default_container: &str,
+    lines: usize,
+) -> Result<Vec<String>> {
+    for container in [None, Some(default_container)] {
+        let mut cmd = kube.cmd();
+        cmd.args(["logs", &format!("--tail={lines}")]);
+        if let Some(c) = container {
+            cmd.args(["-c", c]);
+        }
+        let out = cmd
+            .arg(format!("pod/{pod}"))
+            .output()
+            .await
+            .context("running kubectl logs (is kubectl on PATH?)")?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect());
+        }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if container.is_none() && needs_container_name(&err) {
+            continue;
+        }
+        anyhow::bail!("kubectl logs {pod}: {err}");
+    }
+    unreachable!()
 }
 
 /// kubectl's message when a pod has several containers and none was named.

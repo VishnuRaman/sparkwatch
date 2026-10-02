@@ -25,6 +25,9 @@ can't see. The narrative version is [README.md](README.md).
 -t, --timeout <S>      HTTP timeout, default 5
     --config <PATH>    config file (default ~/.config/sparkwatch.toml)
     --targets          list configured targets and exit
+    --dump             headless: one snapshot (+10 s of streaming) → bundle in --out, exit
+    --out <DIR>        where bundles go (default .)
+    --dump-logs <N>    log lines per executor in a bundle (default 2000, 0 = none)
 ```
 
 ### How `--k8s` finds things
@@ -86,8 +89,10 @@ isn't a target name is used as-is; a typo in the file is a hard error naming the
 | `4` | Executors | — (`L` logs, `t` thread dump) |
 | `5` | SQL | physical plan + node metrics |
 | `6` | Failures | full error text (`s` open its stage, `L` its executor's log) |
-| `7` | Streaming | — (`j`/`k` pick the query) |
+| `7` | Streaming | batch list of the selected query → `Enter` again: batch drill-down |
 | `8` | Storage | one RDD's distribution across executors |
+| `9` | Env | — (`/` searches keys and values; key settings pinned at the top) |
+| `0` | Metrics | pin / unpin the metric to a sparkline (up to 4; `/` filters by source or name) |
 | `Tab` `Shift-Tab` `←` `→` `h` `l` | next / previous tab | |
 
 ### On any table
@@ -99,6 +104,9 @@ isn't a target name is used as-is; a typo in the file is a hard error naming the
 | `x` | acknowledge new failures (clears the red strip; the log is kept) |
 | `L` | logs — Executors tab: selected executor; Failures tab: the alert's executor |
 | `t` | thread dump of the selected executor (Executors tab) |
+| `m` | executor memory view: peak heap / off-heap / RSS / GC per executor, against the budget (Executors tab) |
+| `S` | summary: what happened since the app started (auto-opens for a finished app) |
+| `D` | write a bundle (summary.md, snapshot/failures/streaming/environment JSON, log tails) into `--out` — works on any screen |
 
 What `/` matches: Jobs id/status/name · Stages id/status/name · Executors id/host/state (`up`,
 `dead`, `excluded`)/removal reason · SQL id/status/query text/error · Failures kind/title/detail ·
@@ -111,6 +119,14 @@ Storage id/name/level. Title shows `Stages (12 of 340) · filter: writer`.
 | `j` `k` | move in the task table |
 | `L` | logs of the selected task's executor, pre-filtered to its exception |
 | `Esc` | back |
+
+### Batch list / batch drill-down (`Enter` on the Streaming tab)
+| Key | |
+|---|---|
+| `j` `k` | move: batches in the list, stages in the drill-down |
+| `Enter` | list → batch drill-down; drill-down → stage drill-down (`Esc` returns to the batch) |
+| `L` | driver log sliced to this batch's time window — under `--k8s` the stream starts at the batch (`--since-time`), so early batches work too; `c` in the viewer widens back to the whole log |
+| `Esc` | back one level |
 
 ### SQL drill-down
 | Key | |
@@ -156,7 +172,8 @@ Storage id/name/level. Title shows `Stages (12 of 340) · filter: writer`.
 - **Cluster**: jobs running/failed/total · executors active/total · cores and tasks running ·
   storage memory used/max · shuffle read · **GC time and its share of task time — red above 10 %**
   (a GC-bound cluster; check executor memory or the aggregation's spill).
-- **Sparklines**: tasks/s (peak) and active tasks over the last ~4 min. Tasks/s dropping to zero
+- **Sparklines**: tasks/s (peak), active tasks and executors alive over the last ~4 min (executors
+  red with a count when some were removed in the window — a step down is a lost node or a scale-in). Tasks/s dropping to zero
   while active tasks stay high = stuck tasks; active tasks far below cores = idle cluster
   (too few partitions, or the driver is the bottleneck).
 - **Running jobs**: one gauge per RUNNING job. Empty between micro-batches on a streaming app.
@@ -194,7 +211,41 @@ in that stage)**, progress bar.
 id, state (`up` green / `dead` red / `excl` magenta = scheduler excluded it after failures), host —
 **a dead executor shows its `removeReason` next to the host** (`Container killed on request. Exit
 code is 137…` = OOM-killed by Kubernetes/YARN) — tasks running/cores, failed tasks (red), storage
-memory used/max with bar, **GC % (red above 10 %)**, shuffle read. `L` logs, `t` thread dump.
+memory used/max with bar, **GC % (red above 10 %)**, shuffle read, age (`gone 12m` for a dead one).
+`L` logs, `t` thread dump, `m` memory.
+
+### Summary (`S`, or automatic for a finished app)
+Failures by kind + top reasons · slowest stages (task time, shuffle, spill, `SKEW metric ×N`) ·
+executors lost/excluded, worst GC, heap near max · storage · streaming per query (batch timing,
+FALLING BEHIND, watermark lag, failed batches, slowest batches) · key settings. `D` from here writes
+it as `summary.md` in a bundle with everything else.
+
+### Executor memory (`m` on Executors)
+Per executor: peak JVM heap and its share of `spark.executor.memory` (red ≥ 90 %), off-heap,
+execution, storage, direct buffers, JVM and Python RSS, GC time. Selected executor: each peak as a bar
+against the resource profile's budget (heap + overhead + off-heap = container) and a verdict — heap
+near max → raise `spark.executor.memory` / add partitions; RSS near the container while the heap isn't
+→ native/off-heap: raise `spark.executor.memoryOverhead`. The two faces of exit code 137.
+
+### `9` Env
+Key settings pinned (executor memory/overhead/cores/instances, off-heap, memory fraction, driver
+memory, shuffle partitions, AQE, broadcast threshold, dynamic allocation, checkpoint location, state
+store, event log, serializer, speculation, deleteOnTermination), then runtime, resource profiles, and
+all Spark / Hadoop / system / metrics properties and the classpath. `/` searches keys and values.
+
+### `0` Metrics
+The driver's metrics registry (`/metrics/json/`, the `MetricsServlet` sink Spark enables by default):
+every source the application registered with `SparkEnv.get.metricsSystem` — gauges, counters, meters,
+histograms, timers — listed first and tagged `· app`, then Spark's own sources. Counters show their
+rate since the last poll; meters their 1m/5m/mean rates; histograms and timers count · mean · p50 ·
+p95 · max. **Driver health** above the list: listener events dropped (red when > 0 — the UI and REST
+API have missed events; raise `spark.scheduler.listenerbus.eventqueue.capacity`), scheduler message
+time p95, stages running/waiting/failed, BlockManager memory, codegen compile time, driver CPU cores.
+`Enter` pins a metric to a sparkline strip at the top (gauge value, counter rate, meter 1m rate,
+histogram/timer mean; up to 4); `/` filters by source or name. Not on the History Server (the registry
+lives in the driver). Sources registered on executors don't reach the driver servlet — they only leave
+through a sink (Prometheus, Graphite…). `spark.sql.streaming.metricsEnabled=true` adds
+`spark.streaming.<query>.*` (input/processing rate, latency, state rows) here.
 
 ### `5` SQL
 One row per SQL execution (a query, or a micro-batch of a streaming query), newest first: id, status
@@ -223,18 +274,32 @@ executor's log; `x` = acknowledge. Works even while the endpoint is unreachable.
 Structured Streaming has **no REST API**, so this is rebuilt from two sources, merged per
 `(runId, batchId)`:
 1. the **driver log** — every micro-batch's `Streaming query made progress: {…}` (started on the first
-   visit and kept for the app's lifetime; `kubectl logs -f` under `--k8s`, the driver's stderr page on
-   YARN/standalone). Needs the driver logging at INFO for `org.apache.spark.sql.execution.streaming`.
+   visit and kept for the app's lifetime). Under `--k8s` it is `kubectl logs -f --since-time=<oldest
+   listed batch>` (capped at 6 h back), so every batch in the list gets its rates; on YARN/standalone
+   it is the driver's stderr page — a tail, so only recent batches do. Needs the driver logging at
+   INFO for `org.apache.spark.sql.execution.streaming`. The tab's status line says which
+   (`following pod/x since …`); a batch with `-` in the rate columns is one the log didn't cover — the
+   batch list title counts them (`· 27 before the driver log's start at 21:58:43 have durations only`).
 2. the **SQL executions** — each micro-batch's description carries query id / run id / batch number:
    batch ids, status and durations everywhere, History Server included, but no rates or watermark.
 
 Per query: latest batch, trigger duration with **mean / p95 / max over the last 300 batches** and
 batches/min, `input rows/s` vs `processed rows/s` — **`▲ FALLING BEHIND` when processing was slower
 than input in ≥ 3 of the last 5 batches** — watermark lag, state rows and memory. Sparklines:
-trigger duration, input vs processed rate (stacked, same scale), state size. Then the latest batch's
+trigger duration, input vs processed rate (stacked, same scale), state size; a second row with
+`addBatch` (the work), planning + offsets + commits (red when it exceeds the work: driver-side
+overhead), watermark lag, rows dropped by the watermark. Then the latest batch's
 `durationMs` breakdown — `addBatch` (the actual work), `getBatch`, `latestOffset`, `queryPlanning`,
-`walCommit`, `commitOffsets` — its sources (rows, rates) and sink. A restarted query (new runId)
-drops its old window. Several queries: `j`/`k` select, the rest show one summary line each.
+`walCommit`, `commitOffsets` — its sources (rows, rates) and sink; and a **Recent batches** table,
+newest first: status, trigger (yellow above p95), input rows, in/s, processed/s (red when behind),
+state rows, `addBatch`, watermark lag, time; failed batches red. A restarted query (new runId, or a
+fresh checkpoint = new query id with the same name) keeps one entry and starts its window over;
+stale data from the old id is ignored, and its jobs/stages get a `· run xxxxxxxx` suffix. Several
+queries: a name-sorted list under the panel (≤ ⅓ of the screen, scrolls with the selection), `j`/`k`.
+
+**Batch drill-down** (`Enter`, `Enter`): one batch's numbers (trigger vs the query's mean/p95, rows,
+rates, lag, state, `durationMs`), the stages that ran for it (matched by run id + batch number;
+`Enter` → stage drill-down), its failures, and `L` → the driver log for its time window.
 
 Reading it: trigger ≈ trigger interval and growing = the batch can't finish in time; `addBatch`
 dominating = executor-side work (go to `3`); `queryPlanning`/`walCommit` dominating = driver-side
@@ -258,6 +323,10 @@ and the source status — `streaming pod/x`, `tail of http://… refreshed every
 `no log URLs reported by this executor`, `kubectl logs ended: …`. Buffer is the last 20 000 lines.
 Sources: `--k8s` → `kubectl logs -f --tail=2000` (driver pod, or the executor's pod); YARN/standalone →
 the `executorLogs` page, 256 KiB tail, re-fetched every 3 s; History Server → none.
+From a batch (`L` in the batch drill-down) the title shows `batch window HH:MM:SS–HH:MM:SS`; under
+`--k8s` the stream is `--since-time=<window start>` and stops ingesting past the window's end, so the
+slice can't be pushed out of the buffer. An empty window says why (the available log starts after the
+batch — a YARN tail, or a restarted container — or has no timestamps); `c` re-opens the whole log.
 
 ### Thread dump (`t`)
 `GET /executors/{id}/threads`, grouped: **BLOCKED** first (with `blocked by #id (owner)` and what each
@@ -273,15 +342,23 @@ you what it's waiting for. Not available through the History Server or for a dea
 | Question | Go to |
 |---|---|
 | Is the app healthy right now? | `1`: GC share, tasks/s vs active tasks, running-job gauges; the strip |
+| Is the *driver* healthy? Are my own counters moving? | `0`: listener events dropped, scheduler message time, driver CPU; your sources at the top, `Enter` to chart one |
 | A job is slow — which stage? | `2`, `Enter` on the job → its stages, active first; look at spill and task counts |
 | A stage is slow — why? | `3`, `Enter`: `⚠ ×N` skew rows → hot key; a red executor with `×N stage avg` → bad node; stragglers in the task list |
 | A task failed — with what error? | `6` (persistent), or `3` `Enter` `f`; `L` for the executor's log at that moment |
 | An executor died — why? | `4`: `removeReason` next to the host (137 = OOM-killed); `6` has it too; `L` then `P` for the previous container's log |
 | An executor is stuck? | `4` `t`: BLOCKED threads and who holds the lock |
 | How long do micro-batches take? Keeping up? | `7`: trigger mean/p95/max, in vs processed rows/s, `FALLING BEHIND`, watermark lag |
-| Where does a batch's time go? | `7`: `durationMs` breakdown; `5` `Enter`: per-operator metrics |
+| Where does a batch's time go? | `7`: `durationMs` breakdown; `7` `Enter` `Enter`: that batch's stages, failures and log; `5` `Enter`: per-operator metrics |
+| One batch was slow/failed — what happened in it? | `7` `Enter` (batch list, yellow trigger / red status) `Enter`: its stages (`Enter` → drill-down), its failures, `L` → driver log at that moment |
 | Which operator spills / is heavy? | `5` `Enter`: node metrics (spill, peak memory, output rows) |
 | Storage memory full? | `8`: used vs max, fullest executor, partial caches, disk spill |
+| Executor died with exit code 137 — heap or overhead? | `4` `m`: peak heap vs `spark.executor.memory`, RSS vs the container; the verdict line says which to raise |
+| What is this app actually configured with? | `9`: key settings pinned; `/` `shuffle` or `/` `memory` to search everything |
+| Executors disappearing / dynamic allocation thrashing? | `1`: executors sparkline (red with a count when some were removed); `4`: AGE column (`gone 12m`), removal reason next to the host |
+| Where does a micro-batch's time go, over time? | `7`: second chart row — `addBatch` vs planning+commits (red = driver-side overhead), watermark lag, rows dropped |
+| Tasks slow because data is far away? | `3` `Enter`: locality line (`ANY` in the majority → yellow) |
+| What happened overnight / since the app started? | `S` (opens by itself on the History Server); `D` to bundle it for a ticket |
 | Something failed while I wasn't looking? | `6` — nothing is dropped; the strip counts what's new |
 
 Typical drill: `7` (batches slow) → `5` `Enter` (which operator) → `3` `Enter` (which partition /
@@ -300,10 +377,27 @@ executor) → `L` (its log, pre-filtered) → `t` if it's hung.
 
 Same thing from the other end: `3`, `Enter` on a `✗` stage (opens on its failed tasks), `j`/`k`, `L`.
 
+### Walk-through: from a slow or failed batch to its cause
+1. `7` — Streaming tab; `j`/`k` onto the query (the list under the panel; `FALLING BEHIND` and a red
+   `Streaming ▲` title tell you which one).
+2. `Enter` — its batch list, newest first. A yellow trigger is above the query's p95; a red status
+   is a failed batch; a red processed/s rate means that batch fell behind. `j`/`k` onto the one.
+3. `Enter` — the batch drill-down. Top: how far off normal it was (`3.0× the query's mean`), the
+   `durationMs` breakdown (`addBatch` big → executor work; `queryPlanning`/`walCommit` big → driver
+   or checkpoint store), rows, rates, watermark lag, state.
+4. Middle: the stages that ran for this batch. The one with the task time, spill or failed tasks is
+   the suspect — `Enter` opens its drill-down (skew `⚠ ×N`, flagged executors, stragglers, failed
+   tasks); `Esc` comes back to the batch.
+5. Bottom: the failures of this batch, if any — task attempts with their exception, the stage, the
+   job, the SQL execution.
+6. `L` — the driver log for exactly this batch's seconds (continuations included). `/` to narrow
+   further, `c` to widen back to the whole log, `Esc` back to the batch.
+7. `Esc`, `Esc` — back to the Streaming tab.
+
 ## 5. Glossary (the Spark words on these screens)
 | Term | Meaning | Where it shows |
 |---|---|---|
-| **Job** | one action (`count`, `write`, a micro-batch); made of stages | `2` |
+| **Job** | one action (`count`, `write`, a micro-batch); made of stages. Named from its description (`orders-agg · batch 4123`), else its SQL execution (`sql #12 · SELECT …`), else the call site (`run at <unknown>:0` = no user code on the driver's stack, e.g. Spark Connect) | `2` |
 | **Stage** | a set of identical tasks between two shuffles; `9.0` = stage 9, attempt 0 (retries make new attempts) | `3` |
 | **Task** | one stage's work on one partition, run on one executor core | drill-down task table |
 | **Shuffle** | data moved between executors when a stage needs rows regrouped by key (joins, groupBy, repartition); "shuffle write" leaves a stage, "shuffle read" enters the next | Stages, drill-down, SQL `Exchange` nodes |
@@ -339,7 +433,10 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 - **History Server**: no logs, no thread dumps, no storage; SQL and stages are fine; the Streaming tab
   shows batch durations only (from SQL executions).
 - **Streaming rates / watermark** need the driver log at INFO; with log4j at WARN the tab keeps the
-  SQL-derived durations and says so.
+  SQL-derived durations and says so. Both log formats are read: the classic pattern layout
+  (`yy/MM/dd HH:mm:ss INFO …`) and Spark 4's structured JSON lines (`{"ts":…,"level":…,"msg":…}`).
+  They also need a log at all: `--k8s` (pod logs) or YARN/standalone (`executorLogs` page); a plain
+  URL to a driver on Kubernetes has neither, so only the SQL-derived columns fill.
 - **Logs on YARN/standalone** are a re-fetched tail, not a stream; **on Kubernetes** a dead executor's
   pod is deleted unless `spark.kubernetes.executor.deleteOnTermination=false`.
 - **Thread dumps** only for live executors reachable from the driver.
@@ -358,6 +455,7 @@ Works with any Spark ≥ 3.0 (driver or History Server; YARN, standalone, Kubern
 | Picker shows the app but `Enter` sits on `Connecting` | the driver UI isn't answering on 4040 inside the pod (`spark.ui.enabled`, or a different port) |
 | `a container name must be specified` | handled automatically (retries with Spark's container name) |
 | `pod gone — set …deleteOnTermination=false` | the executor's pod was deleted; only its driver-side `removeReason` survives |
+| Streaming: older batches show `-` for rows/rates; tap status says `the log only reaches back to HH:MM:SS (rotated by the kubelet…)` | the kubelet rotates a container's log at `containerLogMaxSize` (10 MiB default) and `kubectl logs` only serves the current file; a chatty driver (~750 lines / 10 s here) rotates every ~15 min. Raise it on the nodes (kind: `kubeletExtraArgs` / `kubeadmConfigPatches` with `containerLogMaxSize: 200Mi`), or quieten the driver — `log4j2` `org.apache.spark.sql.execution` at WARN, keeping `org.apache.spark.sql.execution.streaming` at INFO |
 | Keys ignored right after start | still on the picker / "Connecting" screen; wait for `LIVE` |
 | Anything odd with input | `SPARKWATCH_KEYLOG=/tmp/keys.log sparkwatch …` logs every key press with a timestamp |
 
@@ -420,7 +518,7 @@ kubectl describe sparkconnect spark-connect | tail -30
 ## 10. Development
 ```bash
 cargo test                            # unit tests
-python3 dev/mock_spark.py --single &  # fake Spark API on :4040 (also --no-sql; no flag = two apps → picker)
+python3 dev/mock_spark.py --single &  # fake Spark API on :4040 (also --no-sql, --many-queries; no flag = two apps → picker)
 cargo run
 # headless smoke test: pty + terminal-emulator replay (pip install pyte)
 (sleep 5; printf '6'; sleep 1; printf 'q') | script -q out.txt sh -c 'stty cols 170 rows 50; ./target/debug/sparkwatch'
@@ -429,3 +527,4 @@ python3 dev/screens.py out.txt 170 50 'Failures (11, 11 new)' '!ERROR'
 CI runs `cargo fmt --check`, `clippy -D warnings`, tests on Linux/macOS/Windows, and builds the demo job.
 Release: bump `version` in `Cargo.toml`, then `git tag vX.Y.Z && git push origin vX.Y.Z` — binaries
 for macOS (arm64/x86_64), Linux (x86_64/arm64, static), Windows, with `SHA256SUMS`; `install.sh` fetches them.
+Then `cargo publish` from the same commit so `cargo install sparkwatch` matches the release.

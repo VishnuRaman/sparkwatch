@@ -1,6 +1,7 @@
 //! The log viewer.
 
 use crate::logview::{LogView, Severity, severity};
+use crate::streaming::fmt_clock;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,6 +24,13 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
     if t.http_url.is_some() {
         title.push_str(&format!("· {} ", t.stream.name()));
     }
+    if let Some((ws, we)) = logs.window {
+        title.push_str(&format!(
+            "· batch window {}–{} ",
+            fmt_clock(ws),
+            fmt_clock(we)
+        ));
+    }
     title.push_str(&format!(
         "· {}-{} of {} lines",
         start + 1,
@@ -44,7 +52,7 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
     let [body, bar] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     *viewport_rows = body.height as usize;
 
-    let lines: Vec<Line> = win
+    let mut lines: Vec<Line> = win
         .iter()
         .map(|l| {
             let style = match severity(l) {
@@ -55,8 +63,34 @@ pub fn draw(f: &mut Frame, area: Rect, logs: &LogView, viewport_rows: &mut usize
             Line::from(Span::styled(l.to_string(), style))
         })
         .collect();
+    // An empty batch window needs saying why, or it reads as "no logs".
+    if let Some((ws, we)) = logs.window
+        && shown == 0
+        && logs.received > 0
+    {
+        let why = match logs.time_span() {
+            Some((first, _)) if first > we => format!(
+                "the log available starts at {}, after this batch — the source only keeps a tail (on YARN/standalone the executorLogs page; under --k8s the container's current log file, which the kubelet rotates at 10 MiB by default)",
+                fmt_clock(first)
+            ),
+            Some((_, last)) if last < ws => format!(
+                "the log received so far ends at {}, before this batch — still catching up",
+                fmt_clock(last)
+            ),
+            Some(_) => "no lines carry a timestamp inside this batch's window".into(),
+            None => "no line in the log carries a timestamp sparkwatch can read (expected `yy/MM/dd HH:mm:ss` or ISO-8601 at the start of the line)".into(),
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "No driver log lines between {} and {}: {why}. `c` shows the whole log.",
+                fmt_clock(ws),
+                fmt_clock(we)
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     let mut para = Paragraph::new(lines);
-    if logs.wrap {
+    if logs.wrap || shown == 0 {
         para = para.wrap(Wrap { trim: false });
     }
     f.render_widget(para, body);

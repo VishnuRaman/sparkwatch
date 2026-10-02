@@ -13,7 +13,13 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot, history: &VecDeque<Sample>) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    s: &Snapshot,
+    history: &VecDeque<Sample>,
+    labels: &super::Labels,
+) {
     let [top, trend, bottom] = Layout::vertical([
         Constraint::Length(9),
         Constraint::Length(5),
@@ -125,12 +131,49 @@ pub fn draw(f: &mut Frame, area: Rect, s: &Snapshot, history: &VecDeque<Sample>)
     );
 
     draw_trends(f, trend, history);
-    draw_active_gauges(f, bottom, s);
+    draw_active_gauges(f, bottom, s, labels);
 }
 
 /// Task completion rate and concurrency over the last few minutes.
 fn draw_trends(f: &mut Frame, area: Rect, history: &VecDeque<Sample>) {
-    let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
+    let [left, right, execs] = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .areas(area);
+
+    // Executors alive over the window: dynamic-allocation churn or a node
+    // dying shows up as a step; removals are counted in the title.
+    let alive: Vec<u64> = history
+        .iter()
+        .map(|h| h.alive_executors.max(0) as u64)
+        .collect();
+    let now_alive = alive.last().copied().unwrap_or(0);
+    let peak_alive = alive.iter().max().copied().unwrap_or(0);
+    let removed_in_window = match (history.front(), history.back()) {
+        (Some(a), Some(b)) => (b.removed_executors - a.removed_executors).max(0),
+        _ => 0,
+    };
+    f.render_widget(
+        Sparkline::default()
+            .data(fit(&alive, execs.width))
+            .max(peak_alive.max(1))
+            .style(Style::default().fg(if removed_in_window > 0 {
+                Color::Red
+            } else {
+                Color::Cyan
+            }))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " Executors: {now_alive} alive (peak {peak_alive}){} ",
+                if removed_in_window > 0 {
+                    format!(" · {removed_in_window} removed")
+                } else {
+                    String::new()
+                }
+            ))),
+        execs,
+    );
 
     // Completed tasks are cumulative; the rate is the delta between polls.
     // Stored in tenths so a slow 0.4 tasks/s stage still draws a bar.
@@ -184,7 +227,7 @@ fn fit(data: &[u64], width: u16) -> Vec<u64> {
 }
 
 /// One gauge per running job, showing task completion.
-fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot) {
+fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot, labels: &super::Labels) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Running jobs ");
@@ -210,11 +253,12 @@ fn draw_active_gauges(f: &mut Frame, area: Rect, s: &Snapshot) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 format!("#{} ", job.job_id).cyan(),
-                super::display_name(&job.name, job.description.as_deref())
-                    .chars()
-                    .take(60)
-                    .collect::<String>()
-                    .into(),
+                super::display_name(
+                    &job.name,
+                    job.description.as_deref(),
+                    labels.job(job.job_id),
+                )
+                .into(),
                 format!("  {}/{} tasks", job.num_completed_tasks, job.num_tasks).dark_gray(),
             ])),
             label,

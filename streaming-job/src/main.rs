@@ -278,13 +278,43 @@ fn clone_cli(c: &Cli) -> Cli {
     }
 }
 
+/// `lastProgress` without the crash: spark-connect-rs 0.0.2 unwraps the
+/// first element of `recentProgress`, which is empty for a query that has
+/// not completed a batch yet (just started, or just restarted after the
+/// poison). Catch that panic and report "no progress yet" instead, and keep
+/// the panic hook from printing a stack trace for it every report.
+async fn last_progress_safe(q: &StreamingQuery) -> Result<serde_json::Value, String> {
+    use futures::FutureExt;
+    use std::sync::Once;
+    static QUIET: Once = Once::new();
+    QUIET.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let in_client = info
+                .location()
+                .is_some_and(|l| l.file().contains("spark-connect-rs"));
+            if !in_client {
+                default(info);
+            }
+        }));
+    });
+    match std::panic::AssertUnwindSafe(q.last_progress())
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("no progress yet".into()),
+    }
+}
+
 /// One line per query from `lastProgress`: the same numbers sparkwatch's
 /// Streaming tab derives from the driver log.
 async fn report(queries: &[StreamingQuery]) {
     for q in queries {
         let name = q.name().unwrap_or_else(|| q.id());
         let active = q.is_active().await.unwrap_or(false);
-        match q.last_progress().await {
+        match last_progress_safe(q).await {
             Ok(p) if !p.is_null() => {
                 let n = |k: &str| p.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
                 let f = |k: &str| p.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);

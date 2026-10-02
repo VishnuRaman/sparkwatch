@@ -56,7 +56,7 @@ Prebuilt binaries (macOS arm64/x86_64, Linux x86_64/arm64 as static musl,
 Windows x86_64) are attached to every
 [release](https://github.com/VishnuRaman/sparkwatch/releases). The install
 script above verifies the SHA256 and installs to `~/.local/bin` (or
-`/usr/local/bin` as root); `SPARKWATCH_VERSION=v0.1.1` pins a version,
+`/usr/local/bin` as root); `SPARKWATCH_VERSION=v0.1.2` pins a version,
 `SPARKWATCH_INSTALL_DIR` changes the location. On Windows, unzip the
 `x86_64-pc-windows-msvc` asset somewhere on your `PATH`.
 
@@ -174,7 +174,7 @@ it found.
 | Key | Action |
 |---|---|
 | `Tab` `→` `l` / `Shift-Tab` `←` `h` | Next / previous tab |
-| `1`–`9` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming / Storage / Env |
+| `1`–`9`, `0` | Jump to Overview / Jobs / Stages / Executors / SQL / Failures / Streaming / Storage / Env / Metrics |
 | `j` `k` `↓` `↑` · `PgUp` `PgDn` · `g` `G` | Move selection · by 10 · first / last |
 | `Enter` | Picker: watch · Jobs: show that job's stages · Stages / SQL / Streaming query / batch: open the drill-down · Failures: full error text |
 | `Esc` | Back: closes a drill-down, then the table filter, then the job filter, then quits |
@@ -224,6 +224,15 @@ stays on screen and the message appears in the footer.
   memory / overhead / cores, shuffle partitions, AQE, dynamic allocation,
   checkpoint location…), then every Spark / Hadoop / system property. `/`
   searches keys and values.
+- **Metrics** (`0`) — the driver's metrics registry (`/metrics/json/`, on by
+  default): the sources your application registered with
+  `SparkEnv.get.metricsSystem` — gauges, counters (shown as rates), meters,
+  histograms, timers — listed first, then Spark's own. A **driver health**
+  block on top flags dropped listener events (the UI and REST API are then
+  missing data), slow scheduler message handling, failed stages, full block
+  manager memory, driver CPU. `Enter` pins any metric to a sparkline.
+  Executor-side registries only leave through a sink, so they aren't here;
+  neither is anything on the History Server.
 
 `/` on any table filters by what you'd expect for the tab (name and status,
 executor id/host/reason, query text and error…), case-insensitively; the
@@ -311,7 +320,7 @@ happened while I was away" view.
 
 `D` writes the same summary as `summary.md` into
 `sparkwatch-<app>-<timestamp>/` under `--out`, with `snapshot.json`,
-`failures.json`, `streaming.json`, `environment.json` and
+`failures.json`, `streaming.json`, `environment.json`, `metrics.json` and
 `logs/driver.log` + `logs/executor-N.log` tails (`--dump-logs`). That's what
 to attach to a ticket. Headless, for cron or CI:
 

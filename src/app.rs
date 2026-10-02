@@ -25,10 +25,11 @@ pub enum Tab {
     Streaming,
     Storage,
     Environment,
+    Metrics,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 10] = [
         Tab::Overview,
         Tab::Jobs,
         Tab::Stages,
@@ -38,6 +39,7 @@ impl Tab {
         Tab::Streaming,
         Tab::Storage,
         Tab::Environment,
+        Tab::Metrics,
     ];
 
     /// Tabs whose table `/` can narrow.
@@ -51,6 +53,7 @@ impl Tab {
                 | Tab::Failures
                 | Tab::Storage
                 | Tab::Environment
+                | Tab::Metrics
         )
     }
 
@@ -65,6 +68,7 @@ impl Tab {
             Tab::Streaming => "Streaming",
             Tab::Storage => "Storage",
             Tab::Environment => "Env",
+            Tab::Metrics => "Metrics",
         }
     }
 
@@ -179,6 +183,8 @@ pub struct Sample {
 /// How many samples the sparklines keep. At the default 2 s poll that is
 /// four minutes of history, which is about what fits on a wide terminal.
 pub const HISTORY_LEN: usize = 120;
+/// Sparklines that fit across the Metrics tab.
+const MAX_METRIC_PINS: usize = 4;
 
 /// Stages tab narrowed to one job's stages (Enter on the Jobs tab).
 #[derive(Debug, Clone)]
@@ -450,6 +456,18 @@ pub struct App {
     /// Lines the Environment tab rendered at the last draw; scroll bound.
     pub env_lines: usize,
 
+    /// Metrics tab: the selected metric (an index over metric rows, headers
+    /// skipped), how many there were at the last draw, the keys pinned to
+    /// sparklines, their sampled series, and the previous poll's registry
+    /// so counters show as rates.
+    pub metrics_sel: usize,
+    pub metrics_rows: usize,
+    pub metric_pins: Vec<String>,
+    pub metric_series: HashMap<String, VecDeque<(Instant, f64)>>,
+    pub metrics_prev: Option<(Instant, Vec<crate::metrics::Metric>)>,
+    /// When the current snapshot's metrics were taken.
+    pub metrics_at: Option<Instant>,
+
     /// `taskSummary` of the slowest stages, for the summary's skew flags.
     pub stage_summaries: HashMap<(i64, i64), TaskMetricDistributions>,
     pub summary_scroll: u16,
@@ -525,6 +543,12 @@ impl App {
             env_error: None,
             env_scroll: 0,
             env_lines: 0,
+            metrics_sel: 0,
+            metrics_rows: 0,
+            metric_pins: Vec::new(),
+            metric_series: HashMap::new(),
+            metrics_prev: None,
+            metrics_at: None,
             stage_summaries: HashMap::new(),
             summary_scroll: 0,
             summary_lines: 0,
@@ -690,6 +714,65 @@ impl App {
                 .count() as i64,
             removed_executors: s.executors.iter().filter(|e| !e.is_active).count() as i64,
         });
+        self.record_metrics(s);
+    }
+
+    /// Sample the pinned metrics into their series and remember this
+    /// registry as "previous" so the next poll can show counter rates.
+    fn record_metrics(&mut self, s: &Snapshot) {
+        let now = Instant::now();
+        // Called before `s` replaces `self.snapshot`, so the snapshot still
+        // held is the previous poll: that is what counters are rated against.
+        let old: Option<(Instant, Vec<crate::metrics::Metric>)> = self
+            .snapshot
+            .as_ref()
+            .and_then(|o| o.metrics.clone())
+            .zip(self.metrics_at)
+            .map(|(m, at)| (at, m));
+        if let Some(ms) = &s.metrics {
+            let prev = old.as_ref().map(|(at, m)| crate::metrics::Prev {
+                at: *at,
+                metrics: m,
+            });
+            for key in &self.metric_pins {
+                if let Some(m) = ms.iter().find(|m| &m.key == key)
+                    && let Some(v) = crate::metrics::series_value(m, prev.as_ref(), now)
+                {
+                    let series = self.metric_series.entry(key.clone()).or_default();
+                    if series.len() == HISTORY_LEN {
+                        series.pop_front();
+                    }
+                    series.push_back((now, v));
+                }
+            }
+        }
+        self.metrics_prev = old;
+        self.metrics_at = Some(now);
+    }
+
+    /// The key under the cursor on the Metrics tab.
+    pub fn selected_metric_key(&self) -> Option<String> {
+        let ms = self.snapshot.as_ref()?.metrics.as_ref()?;
+        let (keep, _) = crate::metrics::rows(ms, self.filter_for(Tab::Metrics));
+        keep.get(self.metrics_sel).map(|m| m.key.clone())
+    }
+
+    /// `Enter` on the Metrics tab: pin the metric to a sparkline, or unpin
+    /// it. Four fit across a screen; a fifth replaces the oldest.
+    pub fn toggle_metric_pin(&mut self) {
+        let Some(key) = self.selected_metric_key() else {
+            return;
+        };
+        if let Some(i) = self.metric_pins.iter().position(|k| *k == key) {
+            self.metric_pins.remove(i);
+            self.metric_series.remove(&key);
+            return;
+        }
+        if self.metric_pins.len() >= MAX_METRIC_PINS {
+            let old = self.metric_pins.remove(0);
+            self.metric_series.remove(&old);
+        }
+        self.metric_pins.push(key);
     }
 
     // ------------------------------------------------------------- navigation
@@ -725,6 +808,11 @@ impl App {
             self.environment = None;
             self.env_error = None;
             self.env_scroll = 0;
+            self.metrics_sel = 0;
+            self.metric_pins.clear();
+            self.metric_series.clear();
+            self.metrics_prev = None;
+            self.metrics_at = None;
             self.stage_summaries.clear();
             self.summary_shown = false;
             self.close_detail();
@@ -1227,10 +1315,10 @@ impl App {
 
     /// Entering the Streaming tab: returns true the first time, when the
     /// driver log tap should be started.
+    /// Every visit to the Streaming tab asks for the tap; the poller ignores
+    /// the request while its tap task is alive, so this is how a tap that
+    /// died (pod unreachable for too long) gets started again.
     pub fn want_tap(&mut self) -> bool {
-        if self.tap_requested {
-            return false;
-        }
         self.tap_requested = true;
         true
     }
@@ -1474,6 +1562,9 @@ impl App {
                 if self.tab == Tab::Environment {
                     return self.env_lines;
                 }
+                if self.tab == Tab::Metrics {
+                    return self.metrics_rows;
+                }
                 let Some(s) = &self.snapshot else { return 0 };
                 let f = self.filter_for(self.tab);
                 match self.tab {
@@ -1482,7 +1573,11 @@ impl App {
                     Tab::Executors => visible_executors(s, f).len(),
                     Tab::Sql => visible_sql(s, f).map_or(0, |v| v.len()),
                     Tab::Storage => visible_rdds(s, f).len(),
-                    Tab::Overview | Tab::Failures | Tab::Streaming | Tab::Environment => 0,
+                    Tab::Overview
+                    | Tab::Failures
+                    | Tab::Streaming
+                    | Tab::Environment
+                    | Tab::Metrics => 0,
                 }
             }
         }
@@ -1513,6 +1608,7 @@ impl App {
                 Tab::Streaming => self.streaming_sel,
                 Tab::Storage => self.rdds.selected(),
                 Tab::Environment => self.env_scroll as usize,
+                Tab::Metrics => self.metrics_sel,
                 Tab::Overview => 0,
             },
         }
@@ -1618,6 +1714,10 @@ impl App {
                     self.env_scroll = index.min(self.env_lines.saturating_sub(1)) as u16;
                     return;
                 }
+                if self.tab == Tab::Metrics {
+                    self.metrics_sel = index.min(self.metrics_rows.saturating_sub(1));
+                    return;
+                }
                 let Self {
                     snapshot,
                     tab,
@@ -1642,7 +1742,11 @@ impl App {
                     }
                     Tab::Sql => sql.select(index, &visible_sql(s, f).unwrap_or_default(), |e| e.id),
                     Tab::Storage => rdds.select(index, &visible_rdds(s, f), |r| r.id),
-                    Tab::Overview | Tab::Failures | Tab::Streaming | Tab::Environment => {}
+                    Tab::Overview
+                    | Tab::Failures
+                    | Tab::Streaming
+                    | Tab::Environment
+                    | Tab::Metrics => {}
                 }
             }
         }

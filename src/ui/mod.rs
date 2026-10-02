@@ -6,6 +6,7 @@ pub mod environment;
 mod exec_memory;
 mod failures;
 mod logs;
+mod metrics;
 mod overview;
 mod picker;
 pub mod sql_detail;
@@ -311,6 +312,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         env_error,
         env_scroll,
         env_lines,
+        metrics_sel,
+        metrics_rows,
+        metric_pins,
+        metric_series,
+        metrics_prev,
         summary_scroll,
         summary_lines,
         ..
@@ -464,6 +470,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         );
         return;
     }
+    if *tab == Tab::Metrics {
+        let fl = filters.get(&Tab::Metrics).map(String::as_str);
+        let ms = snapshot.as_ref().and_then(|s| s.metrics.as_deref());
+        let prev = metrics_prev.as_ref().map(|(at, m)| crate::metrics::Prev {
+            at: *at,
+            metrics: m,
+        });
+        *metrics_rows = metrics::draw(
+            f,
+            body,
+            metrics::Props {
+                metrics: ms,
+                prev: prev.as_ref(),
+                filter: fl,
+                selected: *metrics_sel,
+                pins: metric_pins,
+                series: metric_series,
+                on_history_server: snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.app.attempts.iter().all(|a| a.completed)),
+            },
+        );
+        return;
+    }
     if *tab == Tab::Environment {
         let fl = filters.get(&Tab::Environment).map(String::as_str);
         *env_lines = environment
@@ -541,7 +571,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             );
             storage::draw_list(f, body, snap, &rows, title, &mut rdds.state)
         }
-        Tab::Failures | Tab::Streaming | Tab::Environment => unreachable!("handled above"),
+        Tab::Failures | Tab::Streaming | Tab::Environment | Tab::Metrics => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -709,6 +741,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         View::Main if app.tab == Tab::Environment => {
             " q quit · tab/←→ switch · j/k PgUp/PgDn scroll · / search · c clear · a apps · r refresh "
+        }
+        View::Main if app.tab == Tab::Metrics => {
+            " q quit · tab/←→ switch · j/k move · / filter · c clear · Enter pin/unpin sparkline · a apps · r refresh "
         }
         View::Main if app.tab == Tab::Storage => {
             " q quit · tab/←→ switch · j/k move · / filter · Enter distribution · a apps · r refresh · p pause "

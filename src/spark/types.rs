@@ -582,6 +582,9 @@ pub struct Snapshot {
     pub failed_tasks: Vec<((i64, i64), Vec<TaskData>)>,
     /// Cached RDDs / DataFrames, largest first.
     pub rdds: Vec<RddStorageInfo>,
+    /// The driver's metrics registry (`/metrics/json/`): `None` when the
+    /// endpoint doesn't serve it (History Server, servlet sink disabled).
+    pub metrics: Option<Vec<crate::metrics::Metric>>,
 }
 
 #[cfg(test)]

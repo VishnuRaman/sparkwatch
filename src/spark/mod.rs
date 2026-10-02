@@ -79,13 +79,14 @@ impl SparkClient {
             format!("/applications/{id}/storage/rdd"),
         );
 
-        let (app, jobs, stages, executors, rdds) = tokio::try_join!(
+        let (app, jobs, stages, executors, rdds, metrics) = tokio::try_join!(
             self.get::<ApplicationInfo>(&app_path),
             self.get::<Vec<JobData>>(&jobs_path),
             self.get::<Vec<StageData>>(&stages_path),
             self.get::<Vec<ExecutorSummary>>(&execs_path),
             // The History Server has no storage data; a 404 is "nothing cached".
             self.get_opt::<Vec<RddStorageInfo>>(&rdd_path),
+            self.metrics(),
         )?;
         let mut rdds = rdds.unwrap_or_default();
         rdds.sort_by_key(|r| -(r.memory_used + r.disk_used));
@@ -103,6 +104,35 @@ impl SparkClient {
             sql: None,                // filled in by the poller from its SQL cache
             failed_tasks: Vec::new(), // likewise, once it knows which stages grew
             rdds,
+            metrics,
+        })
+    }
+
+    /// The driver's metrics registry, served by the `MetricsServlet` sink
+    /// at `/metrics/json/` (not under `/api/v1`). A 404 means the sink is
+    /// off or this is a History Server; neither is an error. A registry
+    /// with no `driver.` keys (a History Server's own) reads as absent too.
+    pub async fn metrics(&self) -> Result<Option<Vec<crate::metrics::Metric>>> {
+        let url = format!("{}/metrics/json/", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("reading {url}"))?;
+        let metrics =
+            crate::metrics::parse(&body).with_context(|| format!("decoding metrics from {url}"))?;
+        Ok(if metrics.is_empty() {
+            None
+        } else {
+            Some(metrics)
         })
     }
 

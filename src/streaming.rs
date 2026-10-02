@@ -330,6 +330,11 @@ pub struct QueryHistory {
     pub run_id: String,
     pub name: Option<String>,
     pub batches: BTreeMap<i64, Batch>,
+    /// Runs this query has moved on from. The SQL list keeps the old run's
+    /// executions for a while and is re-ingested every poll; without this
+    /// they would flip the query back to the old run each time, wiping the
+    /// batches (and the progress attached to them) every two seconds.
+    pub past_runs: std::collections::HashSet<String>,
 }
 
 impl QueryHistory {
@@ -340,13 +345,21 @@ impl QueryHistory {
     }
 
     /// A restarted query gets a new run id; its old batches are history.
-    fn on_run(&mut self, run_id: &str) {
-        if self.run_id != run_id {
-            if !self.run_id.is_empty() {
-                self.batches.clear();
-            }
-            self.run_id = run_id.to_string();
+    /// Returns false for a run already superseded, whose data must be
+    /// ignored rather than allowed to roll the query back.
+    fn on_run(&mut self, run_id: &str) -> bool {
+        if self.run_id == run_id {
+            return true;
         }
+        if self.past_runs.contains(run_id) {
+            return false;
+        }
+        if !self.run_id.is_empty() {
+            self.batches.clear();
+            self.past_runs.insert(std::mem::take(&mut self.run_id));
+        }
+        self.run_id = run_id.to_string();
+        true
     }
 
     fn trim(&mut self) {
@@ -421,6 +434,7 @@ impl Streaming {
                     q.query_id = id.to_string();
                     q.run_id.clear();
                     q.batches.clear();
+                    q.past_runs.clear();
                     self.queries.insert(id.to_string(), q);
                 }
                 self.current.insert(name.to_string(), id.to_string());
@@ -446,7 +460,9 @@ impl Streaming {
                 query_id: p.id.clone(),
                 ..Default::default()
             });
-        q.on_run(&p.run_id);
+        if !q.on_run(&p.run_id) {
+            return false;
+        }
         if p.name.is_some() {
             q.name = p.name.clone();
         }
@@ -483,7 +499,9 @@ impl Streaming {
                     query_id: sb.query_id.clone(),
                     ..Default::default()
                 });
-            q.on_run(&sb.run_id);
+            if !q.on_run(&sb.run_id) {
+                continue;
+            }
             if q.name.is_none() {
                 q.name = sb.name;
             }
@@ -765,6 +783,54 @@ mod tests {
         }
         assert_eq!(fmt_iso_s(1_790_330_405_900), "2026-09-25T10:00:05Z");
         assert_eq!(fmt_clock(1_790_330_405_900), "10:00:05");
+    }
+
+    #[test]
+    fn old_run_executions_replayed_each_poll_do_not_wipe_the_new_run() {
+        let exec = |id: i64, run: &str, batch: i64| ExecutionData {
+            id,
+            status: "COMPLETED".into(),
+            description: format!("orders-raw\nid = q1\nrunId = {run}\nbatch = {batch}"),
+            submission_time: "2026-10-02T00:01:50.000Z".into(),
+            ..Default::default()
+        };
+        // The driver retains the old run's executions alongside the new
+        // run's; sparkwatch re-ingests the whole list every poll.
+        let list = vec![
+            exec(1, "old", 1510),
+            exec(2, "old", 1511),
+            exec(3, "new", 1512),
+            exec(4, "new", 1513),
+        ];
+        let mut s = Streaming::default();
+        s.ingest_sql(&list);
+        let progress = Progress {
+            id: "q1".into(),
+            run_id: "new".into(),
+            name: Some("orders-raw".into()),
+            timestamp: "2026-10-02T00:01:50.500Z".into(),
+            batch_id: 1513,
+            num_input_rows: 10_000,
+            ..Default::default()
+        };
+        assert!(s.ingest_progress(progress.clone()));
+        // Next poll: same list again.
+        s.ingest_sql(&list);
+        let q = s.queries.get("q1").unwrap();
+        assert_eq!(q.run_id, "new");
+        assert_eq!(q.batches.len(), 2, "old run's batches must not come back");
+        assert!(
+            q.batches[&1513].progress.is_some(),
+            "progress attached to the new run must survive the re-ingest"
+        );
+        // A late progress event from the old run is ignored, not applied.
+        let stale = Progress {
+            run_id: "old".into(),
+            batch_id: 1511,
+            ..progress
+        };
+        assert!(!s.ingest_progress(stale));
+        assert_eq!(s.queries["q1"].run_id, "new");
     }
 
     #[test]

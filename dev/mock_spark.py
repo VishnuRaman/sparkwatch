@@ -324,6 +324,60 @@ MEMORY = {"usedOnHeapStorageMemory": 1536 * MiB, "usedOffHeapStorageMemory": 0,
 TICK = {"n": 0}
 
 
+def metrics_json(n):
+    """The driver's Dropwizard registry (/metrics/json/): an app source
+    ("OrdersPipeline") next to Spark's built-ins. Counters grow with n."""
+    p = ETL["id"] + ".driver."
+    hist = lambda count, mean, p95, mx: {"count": count, "max": mx, "mean": mean, "min": 1, "p50": mean,
+                                         "p75": mean * 1.3, "p95": p95, "p98": p95 * 1.2, "p99": mx * 0.8,
+                                         "p999": mx, "stddev": mean / 2}
+    timer = dict(hist(5000 + n, 2.3, 9.0, 1500.0), m1_rate=3.2, m5_rate=3.1, m15_rate=3.0, mean_rate=3.0,
+                 duration_units="milliseconds", rate_units="calls/second")
+    return {
+        "version": "4.0.0",
+        "gauges": {
+            p + "OrdersPipeline.lag-seconds": {"value": 42.5 + (n % 7)},
+            p + "OrdersPipeline.source-topic": {"value": "orders-v2"},
+            p + "OrdersPipeline.in-flight": {"value": 3 + (n % 3)},
+            p + "DAGScheduler.stage.runningStages": {"value": 1},
+            p + "DAGScheduler.stage.waitingStages": {"value": 0},
+            p + "DAGScheduler.stage.failedStages": {"value": 1},
+            p + "DAGScheduler.job.activeJobs": {"value": 1},
+            p + "BlockManager.memory.memUsed_MB": {"value": 1536},
+            p + "BlockManager.memory.remainingMem_MB": {"value": 2560},
+            p + "BlockManager.disk.diskSpaceUsed_MB": {"value": 0},
+            p + "LiveListenerBus.queue.appStatus.size": {"value": 12},
+            p + "ExecutorMetrics.JVMHeapMemory": {"value": 900 * MiB},
+            p + "jvm.heap.used": {"value": 1100 * MiB},
+            p + "spark.streaming.orders-agg.inputRate-total": {"value": 2000.0},
+            p + "spark.streaming.orders-agg.processingRate-total": {"value": 1800.0},
+            p + "spark.streaming.orders-agg.latency": {"value": 410},
+            p + "spark.streaming.orders-agg.states-rowsTotal": {"value": 2000},
+            ETL["id"] + ".1.executor.threadpool.activeTasks": {"value": 3},
+        },
+        "counters": {
+            p + "OrdersPipeline.records-rejected": {"count": 120 + 3 * n},
+            p + "OrdersPipeline.records-ok": {"count": 90000 + 2000 * n},
+            p + "LiveListenerBus.numEventsPosted": {"count": 400000 + 50 * n},
+            p + "LiveListenerBus.queue.appStatus.numDroppedEvents": {"count": 7},
+            p + "LiveListenerBus.queue.executorManagement.numDroppedEvents": {"count": 0},
+            p + "JVMCPUTime.jvmCpuTime": {"count": int(2.5e9 * n)},
+            p + "HiveExternalCatalog.fileCacheHits": {"count": 0},
+        },
+        "meters": {
+            p + "OrdersPipeline.orders-seen": {"count": 90000 + 2000 * n, "m1_rate": 1990.0, "m5_rate": 1950.0,
+                                              "m15_rate": 1900.0, "mean_rate": 1980.0, "units": "events/second"},
+        },
+        "histograms": {
+            p + "CodeGenerator.compilationTime": hist(31 + n // 5, 120.5, 400, 900),
+            p + "CodeGenerator.generatedClassSize": hist(31 + n // 5, 24000, 90000, 180000),
+        },
+        "timers": {
+            p + "DAGScheduler.messageProcessingTime": timer,
+        },
+    }
+
+
 class H(BaseHTTPRequestHandler):
     def route(self, path):
         query = self.query
@@ -410,7 +464,10 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(log_page(eid, stream).encode())
             return
-        body = self.route(path)
+        if path.rstrip("/") == "/metrics/json":
+            body = metrics_json(TICK["n"])
+        else:
+            body = self.route(path)
         self.send_response(200 if body is not None else 404)
         self.send_header("Content-Type", "application/json")
         self.end_headers()

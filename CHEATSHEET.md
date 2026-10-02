@@ -92,6 +92,7 @@ isn't a target name is used as-is; a typo in the file is a hard error naming the
 | `7` | Streaming | batch list of the selected query → `Enter` again: batch drill-down |
 | `8` | Storage | one RDD's distribution across executors |
 | `9` | Env | — (`/` searches keys and values; key settings pinned at the top) |
+| `0` | Metrics | pin / unpin the metric to a sparkline (up to 4; `/` filters by source or name) |
 | `Tab` `Shift-Tab` `←` `→` `h` `l` | next / previous tab | |
 
 ### On any table
@@ -232,6 +233,20 @@ memory, shuffle partitions, AQE, broadcast threshold, dynamic allocation, checkp
 store, event log, serializer, speculation, deleteOnTermination), then runtime, resource profiles, and
 all Spark / Hadoop / system / metrics properties and the classpath. `/` searches keys and values.
 
+### `0` Metrics
+The driver's metrics registry (`/metrics/json/`, the `MetricsServlet` sink Spark enables by default):
+every source the application registered with `SparkEnv.get.metricsSystem` — gauges, counters, meters,
+histograms, timers — listed first and tagged `· app`, then Spark's own sources. Counters show their
+rate since the last poll; meters their 1m/5m/mean rates; histograms and timers count · mean · p50 ·
+p95 · max. **Driver health** above the list: listener events dropped (red when > 0 — the UI and REST
+API have missed events; raise `spark.scheduler.listenerbus.eventqueue.capacity`), scheduler message
+time p95, stages running/waiting/failed, BlockManager memory, codegen compile time, driver CPU cores.
+`Enter` pins a metric to a sparkline strip at the top (gauge value, counter rate, meter 1m rate,
+histogram/timer mean; up to 4); `/` filters by source or name. Not on the History Server (the registry
+lives in the driver). Sources registered on executors don't reach the driver servlet — they only leave
+through a sink (Prometheus, Graphite…). `spark.sql.streaming.metricsEnabled=true` adds
+`spark.streaming.<query>.*` (input/processing rate, latency, state rows) here.
+
 ### `5` SQL
 One row per SQL execution (a query, or a micro-batch of a streaming query), newest first: id, status
 (RUNNING / COMPLETED / FAILED), query text or call site, submitted, duration, jobs `▶running
@@ -327,6 +342,7 @@ you what it's waiting for. Not available through the History Server or for a dea
 | Question | Go to |
 |---|---|
 | Is the app healthy right now? | `1`: GC share, tasks/s vs active tasks, running-job gauges; the strip |
+| Is the *driver* healthy? Are my own counters moving? | `0`: listener events dropped, scheduler message time, driver CPU; your sources at the top, `Enter` to chart one |
 | A job is slow — which stage? | `2`, `Enter` on the job → its stages, active first; look at spill and task counts |
 | A stage is slow — why? | `3`, `Enter`: `⚠ ×N` skew rows → hot key; a red executor with `×N stage avg` → bad node; stragglers in the task list |
 | A task failed — with what error? | `6` (persistent), or `3` `Enter` `f`; `L` for the executor's log at that moment |

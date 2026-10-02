@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod k8s;
 mod logview;
+mod metrics;
 mod poller;
 mod report;
 mod spark;
@@ -469,6 +470,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 }
                 app::Tab::Jobs => app.filter_stages_by_selected_job(),
                 app::Tab::Failures => app.open_alert(),
+                app::Tab::Metrics => app.toggle_metric_pin(),
                 app::Tab::Streaming => {
                     app.open_batches();
                 }
@@ -510,6 +512,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, req_tx: &mpsc::Sender<Request>
                 app.tab = app.tab.prev();
                 tap_if_streaming(app, req_tx).await;
             }
+            KeyCode::Char('0') => app.tab = app::Tab::Metrics,
             KeyCode::Char(c @ '1'..='9') => {
                 app.tab = app::Tab::ALL[c as usize - '1' as usize];
                 tap_if_streaming(app, req_tx).await;

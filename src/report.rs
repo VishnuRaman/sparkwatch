@@ -306,6 +306,41 @@ pub fn summarize(inp: &Inputs) -> Vec<Section> {
         });
     }
 
+    // ---- driver metrics: the health headline, then the app's own sources
+    if let Some(ms) = inp.snapshot.and_then(|s| s.metrics.as_deref()) {
+        let now = std::time::Instant::now();
+        let mut lines: Vec<String> = crate::metrics::headline(ms, None, now)
+            .into_iter()
+            .map(|(label, value, warn)| {
+                format!("{label}: {value}{}", if warn { "  ⚠" } else { "" })
+            })
+            .collect();
+        for (source, n) in crate::metrics::sources(ms) {
+            if crate::metrics::is_builtin(source) {
+                continue;
+            }
+            lines.push(format!("app source {source} ({n} metrics):"));
+            for m in ms.iter().filter(|m| m.source == source).take(12) {
+                let (v, d) = crate::metrics::display(m, None, now);
+                lines.push(format!(
+                    "  {} = {v}{}",
+                    m.name,
+                    if d.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({d})")
+                    }
+                ));
+            }
+        }
+        if !lines.is_empty() {
+            out.push(Section {
+                title: "Metrics".into(),
+                lines,
+            });
+        }
+    }
+
     // ---- key settings
     if let Some(env) = inp.environment {
         let lines: Vec<String> = crate::ui::environment::KEY_SETTINGS
@@ -396,6 +431,9 @@ pub fn write_bundle(
     )?;
     if let Some(env) = inp.environment {
         write("environment.json", serde_json::to_string_pretty(env)?)?;
+    }
+    if let Some(ms) = inp.snapshot.and_then(|s| s.metrics.as_ref()) {
+        write("metrics.json", serde_json::to_string_pretty(ms)?)?;
     }
     for (name, lines) in logs {
         std::fs::write(bundle.join("logs").join(name), lines.join("\n") + "\n")

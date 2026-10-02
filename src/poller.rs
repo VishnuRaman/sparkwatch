@@ -719,6 +719,10 @@ const TAP_TAIL: usize = 10_000;
 /// Never read more driver log than this on start, whatever the batch list
 /// says: a day of a chatty driver is gigabytes through the API server.
 const TAP_MAX_BACK_MS: i64 = 6 * 3600 * 1000;
+/// Pause between reconnects of the tap, and how many consecutive failures
+/// to start `kubectl logs` (pod gone?) before the tap gives up.
+const TAP_RETRY: Duration = Duration::from_secs(2);
+const TAP_MAX_START_FAILURES: u32 = 15;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -772,6 +776,15 @@ async fn run_tap(
         } => {
             let mut container: Option<&str> = None;
             let since = since_ms.map(crate::streaming::fmt_iso_s);
+            let mut since = since;
+            let mut since_ms = since_ms;
+            // The stream ends whenever the kubelet rotates the log file or
+            // the API connection drops; a tap that stays dead after that is
+            // what "no progress events" looks like twenty minutes in. So:
+            // reconnect from the last line seen, and give up only when the
+            // pod itself is unreachable for a while.
+            let mut last_seen_ms: Option<i64> = None;
+            let mut start_failures = 0;
             loop {
                 let mut stream = match LogStream::start(
                     &kube,
@@ -784,7 +797,15 @@ async fn run_tap(
                 .await
                 {
                     Ok(s) => s,
-                    Err(e) => return status(format!("{e:#}")).await,
+                    Err(e) => {
+                        start_failures += 1;
+                        if start_failures > TAP_MAX_START_FAILURES {
+                            return status(format!("{e:#}")).await;
+                        }
+                        status(format!("{e:#} — retrying")).await;
+                        tokio::time::sleep(TAP_RETRY).await;
+                        continue;
+                    }
                 };
                 let following = match &since {
                     Some(s) => format!("following pod/{driver_pod} since {s}"),
@@ -793,6 +814,9 @@ async fn run_tap(
                 status(following.clone()).await;
                 let mut first_seen = false;
                 while let Ok(Some(line)) = stream.lines.next_line().await {
+                    if let Some(t) = crate::logview::line_time_ms(&line) {
+                        last_seen_ms = Some(t);
+                    }
                     // The kubelet serves only the container's current log
                     // file: once it has rotated (10 MiB by default), the
                     // log starts later than asked and the batches before
@@ -822,7 +846,27 @@ async fn run_tap(
                     container = Some(k8s::DRIVER_CONTAINER);
                     continue;
                 }
-                return status(format!("driver log ended: {reason}")).await;
+                if tx.is_closed() {
+                    return;
+                }
+                // Resume just after the last line we saw; the second of
+                // overlap re-feeds at most one progress block, which the
+                // app ignores as a duplicate.
+                let resume = last_seen_ms.or(since_ms).unwrap_or_else(now_ms);
+                since_ms = Some(resume);
+                since = Some(crate::streaming::fmt_iso_s(resume));
+                start_failures = 0;
+                status(format!(
+                    "driver log stream ended ({}) — reconnecting from {}",
+                    if reason.is_empty() {
+                        "rotated or connection dropped".to_string()
+                    } else {
+                        reason
+                    },
+                    crate::streaming::fmt_clock(resume)
+                ))
+                .await;
+                tokio::time::sleep(TAP_RETRY).await;
             }
         }
         LogSource::Http(client) => {
